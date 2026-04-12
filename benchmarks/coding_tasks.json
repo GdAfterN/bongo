@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "description": "Fixed benchmark tasks for Agent Harness v1. Fresh copies of each fixture repo are required for every run.",
+  "tasks": [
+    {
+      "id": "readme_intro_locked",
+      "prompt": "In the README fixture, replace the placeholder opening sentence with 'This fixture is a locked benchmark workspace.'",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md opening sentence is locked benchmark workspace text",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'This fixture is a locked benchmark workspace.' in text\"",
+      "category": "documentation"
+    },
+    {
+      "id": "readme_schema_note",
+      "prompt": "Replace the first README bullet with a sentence that says the benchmark schema and baseline are fixed.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md contains the schema and baseline note",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'schema and baseline are fixed' in text\"",
+      "category": "documentation"
+    },
+    {
+      "id": "readme_ordering_note",
+      "prompt": "Replace the second README bullet with a sentence about deterministic file ordering.",
+      "fixture_repo": "tests/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md contains the deterministic file ordering note",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'deterministic file ordering' in text.lower()\"",
+      "category": "documentation"
+    },
+    {
+      "id": "sample_beta_locked",
+      "prompt": "In sample.txt, replace beta with beta-locked.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt contains beta-locked",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'beta-locked' in text and '\\nbeta\\n' not in text\"",
+      "category": "text-edit"
+    },
+    {
+      "id": "sample_gamma_locked",
+      "prompt": "In sample.txt, replace gamma with gamma-locked.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt contains gamma-locked",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'gamma-locked' in text\"",
+      "category": "text-edit"
+    },
+    {
+      "id": "sample_placeholder_delta",
+      "prompt": "In sample.txt, replace placeholder with delta.",
+      "fixture_repo": "tests/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt ends with delta",
+      "verifier": "python3 -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8').rstrip('\\n'); assert text.endswith('delta')\"",
+      "category": "text-edit"
+    }
+  ]
+}

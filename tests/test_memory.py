@@ -1,0 +1,67 @@
+from pico.memory import LayeredMemory
+
+
+def test_working_memory_tracks_summary_and_recent_files():
+    memory = LayeredMemory()
+
+    memory.set_task_summary("Investigate flaky tests")
+    memory.remember_file("README.md")
+    memory.remember_file("src/app.py")
+    memory.remember_file("README.md")
+
+    snapshot = memory.to_dict()
+
+    assert snapshot["working"]["task_summary"] == "Investigate flaky tests"
+    assert snapshot["working"]["recent_files"] == ["src/app.py", "README.md"]
+    assert snapshot["task"] == "Investigate flaky tests"
+    assert snapshot["files"] == ["src/app.py", "README.md"]
+
+
+def test_episodic_notes_append_and_retrieve_deterministically():
+    memory = LayeredMemory()
+
+    memory.append_note("Exact tag note", tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
+    memory.append_note("Keyword overlap note about memory", created_at="2026-04-07T10:01:00+00:00")
+    memory.append_note("Newest unrelated note", created_at="2026-04-07T10:02:00+00:00")
+    memory.append_note("Older unrelated note", created_at="2026-04-07T09:59:00+00:00")
+
+    snapshot = memory.to_dict()
+    assert [note["text"] for note in snapshot["episodic_notes"]] == [
+        "Exact tag note",
+        "Keyword overlap note about memory",
+        "Newest unrelated note",
+        "Older unrelated note",
+    ]
+    assert snapshot["notes"] == [
+        "Exact tag note",
+        "Keyword overlap note about memory",
+        "Newest unrelated note",
+        "Older unrelated note",
+    ]
+
+    lines = [line for line in memory.retrieval_view("recall memory", limit=4).splitlines() if line.startswith("- ")]
+    assert lines == [
+        "- Exact tag note",
+        "- Keyword overlap note about memory",
+    ]
+
+
+def test_file_summaries_use_canonical_paths_and_freshness(tmp_path):
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("alpha\n", encoding="utf-8")
+    memory = LayeredMemory(workspace_root=tmp_path)
+
+    memory.set_file_summary("./sample.txt", "sample.txt: alpha")
+    memory.remember_file("./sample.txt")
+    snapshot = memory.to_dict()["file_summaries"]["sample.txt"]
+
+    assert snapshot["summary"] == "sample.txt: alpha"
+    assert snapshot["freshness"]
+
+    assert "sample.txt: alpha" in memory.render_memory_text()
+    file_path.write_text("beta\n", encoding="utf-8")
+    assert "sample.txt: alpha" not in memory.render_memory_text()
+
+    memory.invalidate_file_summary("sample.txt")
+
+    assert "sample.txt" not in memory.to_dict()["file_summaries"]
