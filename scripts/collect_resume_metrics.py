@@ -8,13 +8,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pico.metrics import collect_resume_metrics, render_resume_metrics_markdown
+from bongo.metrics import collect_resume_metrics, render_resume_metrics_markdown
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Collect pico resume metrics from benchmark and run artifacts.")
+    parser = argparse.ArgumentParser(description="Collect bongo resume metrics from benchmark and run artifacts.")
     parser.add_argument("--benchmark-artifact", required=True, help="Path to benchmark artifact JSON.")
-    parser.add_argument("--runs-root", required=True, help="Path to .pico/runs root.")
+    parser.add_argument("--runs-root", required=True, help="Path to .bongo/runs root.")
     parser.add_argument("--provider-experiments", default=None, help="Optional provider experiments JSON.")
     parser.add_argument("--experiment-mode", choices=("synthetic", "real"), default="synthetic", help="Whether to use deterministic synthetic experiments or real model runs.")
     parser.add_argument("--real-provider", choices=("gpt", "claude"), default="gpt", help="Provider to use for real experiment mode.")

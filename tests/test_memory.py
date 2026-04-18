@@ -1,4 +1,4 @@
-from pico.memory import LayeredMemory
+from bongo.memory import LayeredMemory
 
 
 def test_working_memory_tracks_summary_and_recent_files():

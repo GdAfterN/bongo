@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from pico.evaluator import (
+from bongo.evaluator import (
     BenchmarkEvaluator,
     load_benchmark,
     run_fixed_benchmark,

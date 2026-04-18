@@ -31,7 +31,7 @@ htmlcov/
 # Local scratch space
 tmp/
 .worktrees/
-.pico/
+.bongo/
 artifacts/
 readme_intro_locked/
 
@@ -42,4 +42,4 @@ docs/
 .DS_Store
 
 # Packaging metadata
-pico.egg-info/
+bongo.egg-info/

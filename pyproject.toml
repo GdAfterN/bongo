@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pico"
+name = "bongo"
 version = "0.1.0"
 description = "Small local coding agent for Ollama and OpenAI-compatible models"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-pico = "pico.cli:main"
+bongo = "bongo.cli:main"
 
 [dependency-groups]
 dev = [
@@ -19,4 +19,4 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["pico"]
+packages = ["bongo"]

@@ -1,5 +1,5 @@
-from pico import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
-from pico.context_manager import ContextManager
+from bongo import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
+from bongo.context_manager import ContextManager
 
 
 def build_workspace(tmp_path):
@@ -9,7 +9,7 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".bongo" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
     return MiniAgent(
         model_client=FakeModelClient(outputs),
