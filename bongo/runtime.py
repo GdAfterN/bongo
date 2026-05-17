@@ -18,7 +18,7 @@ from pathlib import Path
 from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
-from .task_state import TaskState
+from .task_status import TaskStatus
 from . import tools as toolkit
 from .workspace import MAX_HISTORY, WorkspaceContext, clip, now
 
@@ -85,10 +85,10 @@ class bongo:
         session=None,  # 当前会话数据，用于恢复之前的对话状态
         run_store=None,  # 运行日志
         approval_policy="ask",  # 审批策略，控制危险操作的执行方式
-        max_steps=6,  # 单次请求的最大步数(ReAct)
+        max_steps=20,  # 单次请求的最大步数(ReAct)
         max_new_tokens=512,  # 单次输出的最大token，防止输出过长
         depth=0,  # 当前嵌套深度（用于递归调用）
-        max_depth=1,
+        max_depth=10,
         read_only=False,  # 是否为只读模式
         shell_env_allowlist=None,  # 允许访问的shell环境变量白名单作用：限制AI可以访问的系统环境信息
         secret_env_names=None,  # 需要隐藏的敏感环境变量名列表
@@ -127,7 +127,7 @@ class bongo:
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
         self.session_path = self.session_store.save(self.session)
-        self.current_task_state = None
+        self.current_task_status = None
         self.current_run_dir = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
@@ -402,12 +402,12 @@ class bongo:
     # 这个方法是"运行轨迹记录器"，
     # 它的作用是将 bongo 智能体在执行任务过程中的每一个关键事件（如思考、工具调用、输出等）都记录下来，
     # 形成一个完整的执行时间线，用于调试、监控和审计。
-    def emit_trace(self, task_state, event, payload=None):
+    def emit_trace(self, task_status, event, payload=None):
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
         payload["created_at"] = now()
         # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
-        self.run_store.append_trace(task_state, payload)
+        self.run_store.append_trace(task_status, payload)
         return payload
 
     def update_memory_after_tool(self, name, args, result):
@@ -470,16 +470,16 @@ class bongo:
         run_started_at = time.monotonic()  # 返回单调时间,便于计算所用时间
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
-        task_state = TaskState.create(
+        task_status = TaskStatus.create(
             run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
-        self.current_task_state = task_state
-        self.current_run_dir = self.run_store.start_run(task_state)
+        self.current_task_status = task_status
+        self.current_run_dir = self.run_store.start_run(task_status)
         # 记录运行开始的轨迹时间
         self.emit_trace(
-            task_state,
+            task_status,
             "run_started",
             {
-                "task_id": task_state.task_id,
+                "task_id": task_status.task_id,
                 "user_request": clip(user_message, 300),
             },
         )
@@ -492,17 +492,17 @@ class bongo:
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
         # 2. 决策：让模型返回一个工具调用，或一个最终答案
         # 3. 行动：如果是工具调用，就执行工具
-        # 4. 记录：把结果写回 history / task_state / trace / memory
+        # 4. 记录：把结果写回 history / task_status / trace / memory
         # 然后进入下一轮，直到停机条件满足
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
-            task_state.record_attempt()
-            self.run_store.write_task_state(task_state)
+            task_status.record_attempt()
+            self.run_store.write_task_status(task_status)
             prompt_started_at = time.monotonic()
             # 关键，每轮都重新构建提示词和元数据
             prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
-                task_state,
+                task_status,
                 "prompt_built",
                 {
                     "prompt_metadata": prompt_metadata,
@@ -510,11 +510,11 @@ class bongo:
                 },
             )
             self.emit_trace(
-                task_state,
+                task_status,
                 "model_requested",
                 {
-                    "attempts": task_state.attempts,
-                    "tool_steps": task_state.tool_steps,
+                    "attempts": task_status.attempts,
+                    "tool_steps": task_status.tool_steps,
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
@@ -541,7 +541,7 @@ class bongo:
             self.last_prompt_metadata = prompt_metadata
             kind, payload = self.parse(raw)
             self.emit_trace(
-                task_state,
+                task_status,
                 "model_parsed",
                 {
                     "kind": kind,
@@ -554,7 +554,7 @@ class bongo:
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
-                task_state.record_tool(name)
+                task_status.record_tool(name)
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
                 self.record(
@@ -566,9 +566,9 @@ class bongo:
                         "created_at": now(),
                     }
                 )
-                self.run_store.write_task_state(task_state)
+                self.run_store.write_task_status(task_status)
                 self.emit_trace(
-                    task_state,
+                    task_status,
                     "tool_executed",
                     {
                         "name": name,
@@ -582,45 +582,45 @@ class bongo:
 
             if kind == "retry":
                 self.record({"role": "assistant", "content": payload, "created_at": now()})
-                self.run_store.write_task_state(task_state)
+                self.run_store.write_task_status(task_status)
                 continue
 
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
-            self.run_store.write_task_state(task_state)
+            task_status.finish_success(final)
+            self.run_store.write_task_status(task_status)
             self.emit_trace(
-                task_state,
+                task_status,
                 "run_finished",
                 {
-                    "status": task_state.status,
-                    "stop_reason": task_state.stop_reason,
+                    "status": task_status.status,
+                    "stop_reason": task_status.stop_reason,
                     "final_answer": final,
                     "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
                 },
             )
-            self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+            self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
-            task_state.stop_retry_limit(final)
+            task_status.stop_retry_limit(final)
         else:
             final = "Stopped after reaching the step limit without a final answer."
-            task_state.stop_step_limit(final)
+            task_status.stop_step_limit(final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.run_store.write_task_state(task_state)
+        self.run_store.write_task_status(task_status)
         self.emit_trace(
-            task_state,
+            task_status,
             "run_finished",
             {
-                "status": task_state.status,
-                "stop_reason": task_state.stop_reason,
+                "status": task_status.status,
+                "stop_reason": task_status.stop_reason,
                 "final_answer": final,
                 "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
             },
         )
-        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
         return final
 
     def run_tool(self, name, args):
@@ -721,20 +721,32 @@ class bongo:
     def new_run_id():
         return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
-    def build_report(self, task_state):
-        # report 是一次运行的最终摘要；
-        # 和 trace 的区别在于，trace 关注过程，report 关注结果与关键指标。
+    _EXIT_STATUS_MAP = {
+        "final_answer_returned": "success",
+        "step_limit_reached": "limit_reached",
+        "retry_limit_reached": "limit_reached",
+        "model_error": "error",
+        "tool_timeout": "error",
+        "approval_denied": "error",
+        "delegate_failed": "error",
+        "persistence_error": "error",
+        "resume_load_error": "error",
+    }
+
+    def build_report(self, task_status):
+        # report 是一次运行的最终摘要 — 谁请求的、跑了什么、结果怎样。
+        # 具体过程细节在 trace 里，这里只记关键指标。
+        stop_reason = task_status.stop_reason
+        exit_status = self._EXIT_STATUS_MAP.get(stop_reason, "error")
         return {
-            "run_id": task_state.run_id,
-            "task_id": task_state.task_id,
-            "status": task_state.status,
-            "stop_reason": task_state.stop_reason,
-            "final_answer": task_state.final_answer,
-            "tool_steps": task_state.tool_steps,
-            "attempts": task_state.attempts,
-            "task_state": task_state.to_dict(),
-            "prompt_metadata": self.last_prompt_metadata,
-            "redacted_env": self.secret_env_summary(),
+            "run_id": task_status.run_id,
+            "user_request": task_status.user_request,
+            "final_answer": task_status.final_answer,
+            "exit_status": exit_status,
+            "stop_reason": stop_reason,
+            "tools_called": task_status.tools_called,
+            "tool_call_count": task_status.tool_steps,
+            "model_call_count": task_status.attempts,
         }
 
     # 获取指定工具的使用示例，用于提示词构建时展示工具用法。

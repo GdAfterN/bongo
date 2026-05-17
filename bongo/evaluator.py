@@ -12,7 +12,7 @@ from . import memory as memorylib
 from .models import FakeModelClient
 from .runtime import bongo, SessionStore
 from .run_store import RunStore
-from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from .task_status import STOP_REASON_FINAL_ANSWER_RETURNED
 from .workspace import WorkspaceContext
 
 # ... existing code ...
@@ -349,11 +349,11 @@ class BenchmarkEvaluator:
         initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
 
         final_answer = agent.ask(task["prompt"])
-        task_state = agent.current_task_state
+        task_status = agent.current_task_status
         run_dir = Path(agent.current_run_dir)
-        task_state_path = agent.run_store.task_state_path(task_state)
-        report_path = agent.run_store.report_path(task_state)
-        report = agent.run_store.load_report(task_state.run_id)
+        task_status_path = agent.run_store.task_status_path(task_status)
+        report_path = agent.run_store.report_path(task_status)
+        report = agent.run_store.load_report(task_status.run_id)
 
         artifact_path = _artifact_path_for_task(task)
         artifact_file = fixture_copy_root / artifact_path
@@ -368,9 +368,9 @@ class BenchmarkEvaluator:
             text=True,
         )
 
-        within_budget = task_state.tool_steps <= int(task["step_budget"])
+        within_budget = task_status.tool_steps <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0
-        non_failure_stop_reason = task_state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
+        non_failure_stop_reason = task_status.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
         passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason
         failure_category = None if passed else self._failure_category(
             within_budget=within_budget,
@@ -384,9 +384,9 @@ class BenchmarkEvaluator:
             "prompt": task["prompt"],
             "fixture_repo": task["fixture_repo"],
             "fixture_copy_relpath": _workspace_relative(fixture_copy_root, self.workspace_root),
-            "run_id": task_state.run_id,
+            "run_id": task_status.run_id,
             "run_dir_relpath": _workspace_relative(run_dir, self.workspace_root),
-            "task_state_relpath": _workspace_relative(task_state_path, self.workspace_root),
+            "task_status_relpath": _workspace_relative(task_status_path, self.workspace_root),
             "report_relpath": _workspace_relative(report_path, self.workspace_root),
             "allowed_tools": list(task["allowed_tools"]),
             "step_budget": int(task["step_budget"]),
@@ -406,15 +406,15 @@ class BenchmarkEvaluator:
             "verifier_passed": verifier_passed,
             "expected_artifact_exists": expected_artifact_exists,
             "non_failure_stop_reason": non_failure_stop_reason,
-            "tool_steps": task_state.tool_steps,
-            "attempts": task_state.attempts,
+            "tool_steps": task_status.tool_steps,
+            "attempts": task_status.attempts,
             "final_answer": final_answer,
-            "stop_reason": task_state.stop_reason,
+            "stop_reason": task_status.stop_reason,
             "initial_history_empty": initial_history_empty,
             "initial_memory_empty": initial_memory_empty,
             "initial_task_summary_empty": initial_task_summary_empty,
             "initial_episodic_notes_empty": initial_episodic_notes_empty,
-            "task_state": task_state.to_dict(),
+            "task_status": task_status.to_dict(),
             "report": report,
         }
 

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from bongo import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from bongo import cli as mini_cli
-from bongo.task_state import TaskState
+from bongo.task_status import TaskStatus
 
 
 def build_workspace(tmp_path):
@@ -202,7 +202,7 @@ def test_configured_secret_env_names_are_redacted_in_trace_and_report(tmp_path):
             [],
             secret_env_names=("GITHUB_PAT", "GH_PAT"),
         )
-        state = TaskState.create(run_id="run_001", task_id="task_001", user_request="Mask configured secrets")
+        state = TaskStatus.create(run_id="run_001", task_id="task_001", user_request="Mask configured secrets")
         agent.run_store.start_run(state)
 
         assert set(agent.secret_env_summary()["secret_env_names"]) == {"GITHUB_PAT", "GH_PAT"}
@@ -216,7 +216,7 @@ def test_configured_secret_env_names_are_redacted_in_trace_and_report(tmp_path):
         agent.emit_trace(state, "tool_executed", payload)
         agent.run_store.write_report(
             state,
-            agent.redact_artifact({"task_state": state.to_dict(), "payload": payload}),
+            agent.redact_artifact({"task_status": state.to_dict(), "payload": payload}),
         )
 
     run_dir = agent.run_store.run_dir(state.run_id)

@@ -137,3 +137,169 @@ uv run bongo --provider anthropic
 ```bash
 uv run ruff check .
 ```
+
+
+## 启动服务
+
+有两种方式启动 Web 服务，推荐使用一键启动脚本。
+
+### 方式一：使用启动脚本（推荐）
+
+在项目根目录执行：
+
+```powershell
+cd D:\aiAgentStudy\bongo-main
+python scripts\start_web.py
+```
+
+
+这个脚本会自动完成以下操作：
+1. 检查 API 密钥是否已配置
+2. 启动 Flask 后端服务器（默认端口 5000）
+3. 等待 2 秒让服务器完全启动
+4. 自动在默认浏览器中打开前端页面
+
+启动成功后，终端会显示类似以下信息：
+```
+🚀 Starting Bongo Web Interface...
+📡 Starting backend server on http://localhost:5000
+🌐 Opening web interface...
+
+✅ Bongo Web Interface is running!
+   Backend: http://localhost:5000
+   Frontend: file:///D:/aiAgentStudy/bongo-main/bongo/web/index.html
+
+Press Ctrl+C to stop the server.
+```
+
+
+### 方式二：手动分别启动
+
+如果需要使用自定义配置或调试，可以分别启动前后端。
+
+**步骤 1：启动后端服务器**
+
+```powershell
+cd D:\aiAgentStudy\bongo-main\bongo\web
+python server.py
+```
+
+
+后端服务器会在 `http://0.0.0.0:5000` 上运行，监听所有网络接口。
+
+**步骤 2：访问前端页面**
+
+有两种方式访问前端：
+
+- **直接打开文件**：用浏览器打开 `D:\aiAgentStudy\bongo-main\bongo\web\index.html`
+- **通过本地服务器**（推荐，避免 CORS 问题）：
+  ```powershell
+  cd D:\aiAgentStudy\bongo-main\bongo\web
+  python -m http.server 8080
+  ```
+
+  然后在浏览器访问 `http://localhost:8080`
+
+## 访问服务
+
+服务启动后，可以通过以下方式访问：
+
+### 前端界面访问
+
+- **文件方式**：直接在浏览器地址栏输入 `file:///D:/aiAgentStudy/bongo-main/bongo/web/index.html`
+- **HTTP 方式**：如果使用 Python HTTP 服务器，访问 `http://localhost:8080`
+
+前端界面包含两个主要区域：
+- **左侧边栏**：显示所有会话历史列表，可以点击切换不同会话，顶部有"新建对话"按钮
+- **右侧主区域**：聊天窗口，显示消息历史和输入框
+
+### 后端 API 访问
+
+后端提供 RESTful API，可以通过浏览器或工具（如 Postman、curl）访问：
+
+**健康检查：**
+```
+GET http://localhost:5000/api/health
+```
+
+
+返回示例：
+```json
+{
+  "status": "healthy",
+  "workspace": "D:\\aiAgentStudy\\bongo-main",
+  "model": "qwen3.5-plus-2026-02-15",
+  "provider": "openai"
+}
+```
+
+
+**获取会话列表：**
+```
+GET http://localhost:5000/api/sessions
+```
+
+
+**获取指定会话详情：**
+```
+GET http://localhost:5000/api/sessions/{session_id}
+```
+
+
+**发送消息：**
+```
+POST http://localhost:5000/api/chat
+Content-Type: application/json
+
+{
+  "message": "你好，请帮我分析一下这个项目",
+  "session_id": "可选的会话ID，不填则创建新会话"
+}
+```
+
+
+**删除会话：**
+```
+DELETE http://localhost:5000/api/sessions/{session_id}
+```
+
+
+**查看工作记忆：**
+```
+GET http://localhost:5000/api/sessions/{session_id}/memory
+```
+
+
+## 使用流程
+
+1. **首次使用**：打开前端页面后，左侧会话列表为空。点击"新建对话"按钮或直接在下方的输入框中输入消息并发送，系统会自动创建一个新会话。
+
+2. **发送消息**：在底部输入框中输入你的问题或任务描述，按 Enter 键或点击"发送"按钮。AI 会处理你的请求并在右侧显示回复。支持 Markdown 格式和代码高亮。
+
+3. **切换会话**：点击左侧会话列表中的任意会话，即可加载该会话的历史记录并继续对话。
+
+4. **查看记忆**：在聊天窗口右上角点击"查看记忆"按钮，可以看到 AI 当前维护的工作记忆，包括任务摘要、最近访问的文件、文件摘要等信息。
+
+5. **删除会话**：点击"删除会话"按钮可以删除当前会话及其所有历史记录。
+
+6. **停止服务**：在运行启动脚本的终端中按 `Ctrl+C` 即可停止后端服务器。
+
+## 常见问题
+
+**Q: 启动时提示 "No API key found"**
+A: 需要设置 `BONGO_API_KEY` 或 `OPENAI_API_KEY` 环境变量。在 PowerShell 中使用 `$env:BONGO_API_KEY="你的密钥"` 设置。
+
+**Q: 前端页面无法连接到后端**
+A: 检查后端服务器是否正常启动（访问 http://localhost:5000/api/health），确认没有防火墙阻止 5000 端口。
+
+**Q: 会话数据保存在哪里**
+A: 所有会话数据保存在 `D:\aiAgentStudy\bongo-main\.bongo\sessions\` 目录下，以 JSON 格式存储。每次运行的详细日志保存在 `.bongo\runs\` 目录。
+
+**Q: 如何更改工作区路径**
+A: 设置 `BONGO_WORKSPACE` 环境变量为你想要的工作目录路径，例如：`$env:BONGO_WORKSPACE="D:\your\project\path"`
+
+**Q: 支持哪些模型**
+A: 支持 OpenAI 兼容接口（默认阿里云千问）、Ollama 本地模型、Anthropic Claude 等。通过设置 `BONGO_PROVIDER` 环境变量切换。
+
+**Q: 如何修改默认端口**
+A: 编辑 `bongo\web\server.py` 文件最后一行，将 `app.run(host='0.0.0.0', port=5000, debug=True)` 中的 5000 改为其他端口号。

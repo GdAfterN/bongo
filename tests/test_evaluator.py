@@ -109,7 +109,7 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")
         assert not row["run_dir_relpath"].startswith("/")
-        assert not row["task_state_relpath"].startswith("/")
+        assert not row["task_status_relpath"].startswith("/")
         assert not row["report_relpath"].startswith("/")
         assert row["status"] == "pass"
         assert row["passed"] is True

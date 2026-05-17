@@ -11,6 +11,7 @@ import shutil
 import sys
 import textwrap
 
+from .config import _config_path, load_config, save_config
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import bongo, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -56,11 +57,14 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 
 
-def _effective_model(args, provider):
+def _effective_model(args, provider, config=None):
     # 模型选择优先级：
     # 1. 用户显式传入 --model
     # 2. provider 对应的环境变量
-    # 3. 代码里的默认值
+    # 3. 持久化配置文件
+    # 4. 代码里的默认值
+    if config is None:
+        config = {}
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return explicit_model
@@ -68,12 +72,19 @@ def _effective_model(args, provider):
         model = os.environ.get("OPENAI_MODEL")
         if model:
             return model
+        if config.get("model"):
+            return config["model"]
         return DEFAULT_OPENAI_MODEL
     if provider == "anthropic":  # Claude家的
         model = os.environ.get("ANTHROPIC_MODEL")
         if model:
             return model
+        if config.get("model"):
+            return config["model"]
         return DEFAULT_ANTHROPIC_MODEL
+    model = config.get("model")
+    if model:
+        return model
     return DEFAULT_OLLAMA_MODEL
 
 
@@ -89,12 +100,21 @@ def _first_env(*names):
 
 def _build_model_client(args):
     provider = getattr(args, "provider", "openai")
+    config = load_config()
+    # 如果命令行没指定 provider，使用配置文件里的 provider
+    if not getattr(args, "provider_set", False) and config.get("provider"):
+        provider = config["provider"]
     # CLI 只负责把 provider 选择翻译成具体 client。
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
-        model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("OPENAI_API_BASE") or DEFAULT_OPENAI_BASE_URL
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        model = _effective_model(args, provider, config)
+        base_url = (
+            getattr(args, "base_url", None)
+            or os.environ.get("OPENAI_API_BASE")
+            or config.get("base_url")
+            or DEFAULT_OPENAI_BASE_URL
+        )
+        api_key = os.environ.get("OPENAI_API_KEY", "") or config.get("api_key", "")
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -103,9 +123,14 @@ def _build_model_client(args):
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
     if provider == "anthropic":
-        model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("ANTHROPIC_API_BASE") or DEFAULT_ANTHROPIC_BASE_URL
-        api_key = _first_env("ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY")
+        model = _effective_model(args, provider, config)
+        base_url = (
+            getattr(args, "base_url", None)
+            or os.environ.get("ANTHROPIC_API_BASE")
+            or config.get("base_url")
+            or DEFAULT_ANTHROPIC_BASE_URL
+        )
+        api_key = _first_env("ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY") or config.get("api_key", "")
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -114,8 +139,8 @@ def _build_model_client(args):
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
         )
 
-    model = _effective_model(args, provider)
-    host = getattr(args, "host", DEFAULT_OLLAMA_HOST)
+    model = _effective_model(args, provider, config)
+    host = getattr(args, "host", None) or config.get("base_url") or DEFAULT_OLLAMA_HOST
     return OllamaModelClient(
         model=model,
         host=host,
@@ -123,6 +148,44 @@ def _build_model_client(args):
         top_p=args.top_p,
         timeout=args.ollama_timeout,
     )
+
+def _handle_config(args):
+    """处理 bongo config 子命令：--show 查看，其他参数保存。"""
+    if args.show:
+        config = load_config()
+        if not config:
+            print("No configuration saved yet.")
+            return 0
+        print("Saved configuration:")
+        for key, value in config.items():
+            if key == "api_key" and value:
+                masked = value[:4] + "****" + value[-4:] if len(value) > 8 else "****"
+                print(f"  {key}: {masked}")
+            else:
+                print(f"  {key}: {value}")
+        return 0
+
+    # 收集要保存的字段
+    updates = {}
+    if args.provider:
+        updates["provider"] = args.provider
+    if args.api_key:
+        updates["api_key"] = args.api_key
+    if args.base_url:
+        updates["base_url"] = args.base_url
+    if args.model:
+        updates["model"] = args.model
+
+    if not updates:
+        print("Nothing to save. Use --show to view, or pass --provider/--api-key/--base-url/--model to set.")
+        return 0
+
+    config = load_config()
+    config.update(updates)
+    save_config(config)
+    print("Configuration saved to", _config_path())
+    return 0
+
 
 # 构建一个漂亮的，居中的欢迎面板
 def build_welcome(agent, model, host):
@@ -235,6 +298,17 @@ def build_arg_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Minimal coding agent for Ollama, OpenAI-compatible, or Anthropic-compatible models.",
     )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # config 子命令
+    config_parser = subparsers.add_parser("config", help="Save or show persistent configuration.")
+    config_parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default=None,
+                               help="Model backend to save.")
+    config_parser.add_argument("--api-key", default=None, help="API key to save.")
+    config_parser.add_argument("--base-url", default=None, help="API base URL to save.")
+    config_parser.add_argument("--model", default=None, help="Model name to save.")
+    config_parser.add_argument("--show", action="store_true", help="Show current saved configuration.")
+
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
     parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default="openai",
@@ -267,6 +341,17 @@ def build_arg_parser():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv) # 当 argv=None 时，argparse.parse_args() 的行为如下：自动获取 sys.argv[1:]
+
+    # 处理 config 子命令
+    if args.command == "config":
+        return _handle_config(args)
+
+    # 标记用户是否显式传了 --provider（区别于默认值）
+    args.provider_set = any(
+        arg in ("--provider",) or arg.startswith("--provider=")
+        for arg in (argv if argv is not None else sys.argv[1:])
+    )
+
     agent = build_agent(args)
     """
     sys.argv 是一个全局列表，由 Python 解释器自动填充，它永远存在于 sys 模块中。

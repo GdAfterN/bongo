@@ -777,20 +777,19 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
     assert len(run_dirs) == 1
 
     run_dir = run_dirs[0]
-    task_state = json.loads((run_dir / "task_state.json").read_text(encoding="utf-8"))
+    task_status = json.loads((run_dir / "task_status.json").read_text(encoding="utf-8"))
     report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
     trace_lines = (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
 
-    assert task_state["task_id"] != task_state["run_id"]
-    assert run_dir.name == task_state["run_id"]
-    assert (run_dir / "task_state.json").exists()
+    assert task_status["task_id"] != task_status["run_id"]
+    assert run_dir.name == task_status["run_id"]
+    assert (run_dir / "task_status.json").exists()
     assert (run_dir / "trace.jsonl").exists()
     assert (run_dir / "report.json").exists()
-    assert task_state["stop_reason"] == "final_answer_returned"
-    assert task_state["final_answer"] == "Finished."
+    assert task_status["stop_reason"] == "final_answer_returned"
+    assert task_status["final_answer"] == "Finished."
     assert report["stop_reason"] == "final_answer_returned"
-    assert report["task_state"]["stop_reason"] == "final_answer_returned"
-    assert report["run_id"] == task_state["run_id"]
+    assert report["run_id"] == task_status["run_id"]
     trace_events = [json.loads(line)["event"] for line in trace_lines]
     assert trace_events[0] == "run_started"
     assert trace_events[-1] == "run_finished"
@@ -861,7 +860,7 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
 
     trace_events = [
         json.loads(line)
-        for line in (agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines())
+        for line in (agent.run_store.trace_path(agent.current_task_status).read_text(encoding="utf-8").splitlines())
     ]
     prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
     assert prompt_events
