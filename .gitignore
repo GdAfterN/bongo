@@ -28,6 +28,9 @@ htmlcov/
 *.swo
 *~
 
+# Claude Code
+.claude/
+
 # Local scratch space
 tmp/
 .worktrees/
