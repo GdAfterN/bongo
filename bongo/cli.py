@@ -1,17 +1,19 @@
 """命令行入口。
 
-这个模块负责把“用户怎么启动 bongo”翻译成 runtime 能理解的对象：
+这个模块负责把"用户怎么启动 bongo"翻译成 runtime 能理解的对象：
 解析参数、挑模型后端、构建工作区快照、恢复或新建 session，
 最后进入 one-shot 或交互式循环。
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
 import textwrap
 
 from .config import _config_path, load_config, save_config
+from .task_status import TaskStatus
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import bongo, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -187,6 +189,43 @@ def _handle_config(args):
     return 0
 
 
+def _handle_status(args):
+    """处理 bongo status 子命令：读取最新运行的状态。"""
+    from pathlib import Path
+    from .run_store import RunStore
+
+    workspace = WorkspaceContext.build(getattr(args, "cwd", "."))
+    runs_root = Path(workspace.repo_root) / ".bongo" / "runs"
+    if not runs_root.is_dir():
+        print("No runs found.")
+        return 0
+
+    run_dirs = sorted(p for p in runs_root.iterdir() if p.is_dir())
+    if not run_dirs:
+        print("No runs found.")
+        return 0
+
+    latest_run = run_dirs[-1]
+    status_path = latest_run / "task_status.json"
+    if not status_path.is_file():
+        print(f"No task_status.json in latest run: {latest_run.name}")
+        return 0
+
+    status = TaskStatus.from_dict(json.loads(status_path.read_text(encoding="utf-8")))
+    print(f"Run:      {status.run_id}")
+    print(f"Request:  {status.user_request[:80]}")
+    print(f"Status:   {status.status}")
+    print(f"Action:   {status.current_action}")
+    print(f"Rounds:   model={status.attempts}  tool={status.tool_steps}")
+    if status.tools_called:
+        print(f"Tools:    {', '.join(status.tools_called)}")
+    if status.final_answer:
+        print(f"Answer:   {status.final_answer[:120]}")
+    if status.stop_reason:
+        print(f"Stopped:  {status.stop_reason}")
+    return 0
+
+
 # 构建一个漂亮的，居中的欢迎面板
 def build_welcome(agent, model, host):
     width = max(68, min(shutil.get_terminal_size((80, 20)).columns, 84))
@@ -239,7 +278,7 @@ def build_agent(args):
     为什么存在：
     命令行参数只是字符串和开关，runtime 需要的是已经装配好的对象图：
     model client、workspace snapshot、session store、secret 配置等。
-    这个函数负责把“启动参数”翻译成“agent 运行现场”。
+    这个函数负责把"启动参数"翻译成"agent 运行现场"。
 
     输入 / 输出：
     - 输入：`argparse` 解析后的 `args`
@@ -309,6 +348,9 @@ def build_arg_parser():
     config_parser.add_argument("--model", default=None, help="Model name to save.")
     config_parser.add_argument("--show", action="store_true", help="Show current saved configuration.")
 
+    # status 子命令
+    subparsers.add_parser("status", help="Show current agent run status.")
+
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
     parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default="openai",
@@ -345,6 +387,10 @@ def main(argv=None):
     # 处理 config 子命令
     if args.command == "config":
         return _handle_config(args)
+
+    # 处理 status 子命令
+    if args.command == "status":
+        return _handle_status(args)
 
     # 标记用户是否显式传了 --provider（区别于默认值）
     args.provider_set = any(

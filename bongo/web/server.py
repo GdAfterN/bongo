@@ -270,9 +270,9 @@ def get_session_memory(session_id):
         return jsonify({
             "memory": {
                 "working": memory.get("working", {}),
-                "episodic_notes": memory.get("episodic_notes", []),
                 "file_summaries": memory.get("file_summaries", {})
-            }
+            },
+            "relevant_notes": session_data.get("relevant_notes", [])
         })
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404

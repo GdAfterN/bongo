@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .evaluator import run_fixed_benchmark
+from . import memory as memorylib
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from .runtime import bongo, SessionStore
 from .workspace import WorkspaceContext
@@ -164,7 +165,7 @@ def measure_feature_ablation_metrics(agent, user_message):
     variants = {
         "full": {},
         "no_context_reduction": {"context_reduction": False},
-        "no_memory": {"memory": False, "relevant_memory": False},
+        "no_memory": {"memory": False, "relevant_notes": False},
     }
     results = {}
     for name, updates in variants.items():
@@ -174,7 +175,7 @@ def measure_feature_ablation_metrics(agent, user_message):
             "prompt_chars": int(metadata.get("prompt_chars", 0)),
             "memory_chars": int(metadata.get("sections", {}).get("memory", {}).get("rendered_chars", 0)),
             "history_chars": int(metadata.get("sections", {}).get("history", {}).get("rendered_chars", 0)),
-            "relevant_selected_count": int(metadata.get("relevant_memory", {}).get("selected_count", 0)),
+            "relevant_selected_count": int(metadata.get("relevant_notes", {}).get("selected_count", 0)),
             "budget_reduction_count": len(metadata.get("budget_reductions", [])),
         }
     return results
@@ -193,7 +194,8 @@ def build_stress_agent_metrics():
             approval_policy="auto",
         )
         for index in range(12):
-            agent.memory.append_note(
+            agent.session["relevant_notes"] = memorylib.append_note(
+                agent.session.get("relevant_notes", []),
                 f"stress-note-{index}-" + ("A" * 180),
                 tags=("recall",),
                 created_at=f"2026-04-08T10:{index:02d}:00+00:00",
@@ -256,9 +258,8 @@ def _build_memory_experiment_agent(workspace_root, expected_fact, filename):
     )
 
 
-def _set_irrelevant_memory(agent):
-    state = agent.memory.to_dict()
-    state["episodic_notes"] = [
+def _set_irrelevant_notes(agent):
+    agent.session["relevant_notes"] = [
         {
             "text": "team mascot is blue",
             "tags": ["unrelated"],
@@ -267,7 +268,7 @@ def _set_irrelevant_memory(agent):
             "note_index": 0,
         }
     ]
-    state["notes"] = ["team mascot is blue"]
+    state = agent.memory.to_dict()
     state["file_summaries"] = {}
     agent.memory.state = state
     agent.session["memory"] = agent.memory.to_dict()
@@ -283,9 +284,9 @@ def _run_memory_variant(mode):
 
         if mode == "memory_off":
             agent.feature_flags["memory"] = False
-            agent.feature_flags["relevant_memory"] = False
+            agent.feature_flags["relevant_notes"] = False
         elif mode == "memory_irrelevant":
-            _set_irrelevant_memory(agent)
+            _set_irrelevant_notes(agent)
 
         result = agent.ask("What color is the deploy key?")
         task_status = agent.current_task_status
@@ -353,9 +354,8 @@ def _followup_prompt(task):
     return f"What was the conclusion we already established from {task['filename']}?"
 
 
-def _set_irrelevant_memory_for_task(agent):
-    state = agent.memory.to_dict()
-    state["episodic_notes"] = [
+def _set_irrelevant_notes_for_task(agent):
+    agent.session["relevant_notes"] = [
         {
             "text": "the team mascot is blue",
             "tags": ["unrelated"],
@@ -364,7 +364,7 @@ def _set_irrelevant_memory_for_task(agent):
             "note_index": 0,
         }
     ]
-    state["notes"] = ["the team mascot is blue"]
+    state = agent.memory.to_dict()
     state["file_summaries"] = {}
     agent.memory.state = state
     agent.session["memory"] = agent.memory.to_dict()
@@ -379,9 +379,9 @@ def _run_memory_task_variant(task, variant):
         assert agent.ask(_bootstrap_prompt(task)) == "Done."
         if variant == "memory_off":
             agent.feature_flags["memory"] = False
-            agent.feature_flags["relevant_memory"] = False
+            agent.feature_flags["relevant_notes"] = False
         elif variant == "memory_irrelevant":
-            _set_irrelevant_memory_for_task(agent)
+            _set_irrelevant_notes_for_task(agent)
         result = agent.ask(_followup_prompt(task))
         task_status = agent.current_task_status
         return {
@@ -450,7 +450,8 @@ def run_context_stress_matrix(repetitions=5):
                             approval_policy="auto",
                         )
                         for index in range(note_count):
-                            agent.memory.append_note(
+                            agent.session["relevant_notes"] = memorylib.append_note(
+                                agent.session.get("relevant_notes", []),
                                 f"matrix-note-{index}-" + ("A" * 180),
                                 tags=("recall",),
                                 created_at=f"2026-04-08T10:{index:02d}:00+00:00",
@@ -826,9 +827,9 @@ def run_real_memory_experiment(provider="gpt", repetitions=1):
                     agent.ask(f"Read {task['filename']} and remember the exact line. After you know it, reply with Done only.")
                     if variant == "memory_off":
                         agent.feature_flags["memory"] = False
-                        agent.feature_flags["relevant_memory"] = False
+                        agent.feature_flags["relevant_notes"] = False
                     elif variant == "memory_irrelevant":
-                        _set_irrelevant_memory_for_task(agent)
+                        _set_irrelevant_notes_for_task(agent)
                     _inject_memory_noise(agent)
                     _truncate_read_history(agent)
                     if task["category"] == "fact_lookup":
@@ -898,7 +899,12 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                             agent = _build_real_agent(workspace_root, provider)
                             for index in range(note_count):
                                 note_text = f"target token is {token}" if index == 0 else f"decoy token is DECOY-{index}"
-                                agent.memory.append_note(note_text, tags=("token",), created_at=f"2026-04-09T10:{index:02d}:00+00:00")
+                                agent.session["relevant_notes"] = memorylib.append_note(
+                                    agent.session.get("relevant_notes", []),
+                                    note_text,
+                                    tags=("token",),
+                                    created_at=f"2026-04-09T10:{index:02d}:00+00:00",
+                                )
                             for index in range(history_count):
                                 agent.record(
                                     {

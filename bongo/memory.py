@@ -24,12 +24,9 @@ def default_memory_state():
             "task_summary": "",
             "recent_files": [],
         },
-        "episodic_notes": [],
         "file_summaries": {},
         "task": "",
         "files": [],
-        "notes": [],
-        "next_note_index": 0,
     }
 
 # 确保传入的值是列表，如果不是则转为列表
@@ -177,26 +174,6 @@ def normalize_memory_state(state, workspace_root=None):
             ]
         )[-WORKING_FILE_LIMIT:]
 
-    episodic_notes = state.get("episodic_notes")
-    if not isinstance(episodic_notes, list):
-        episodic_notes = []
-
-    if not episodic_notes and state.get("notes"):
-        episodic_notes = [
-            _normalize_note(note, index)
-            for index, note in enumerate(_ensure_list(state.get("notes", [])))
-            if str(note).strip()
-        ]
-    else:
-        normalized_notes = []
-        for index, note in enumerate(episodic_notes):
-            if isinstance(note, str) and not str(note).strip():
-                continue
-            normalized_notes.append(_normalize_note(note, index))
-        episodic_notes = normalized_notes
-    episodic_notes = episodic_notes[-EPISODIC_NOTE_LIMIT:]
-    state["episodic_notes"] = episodic_notes
-
     file_summaries = state.get("file_summaries")
     if not isinstance(file_summaries, dict):
         file_summaries = {}
@@ -221,15 +198,8 @@ def normalize_memory_state(state, workspace_root=None):
         }
     state["file_summaries"] = normalized_file_summaries
 
-    next_note_index = state.get("next_note_index")
-    if not isinstance(next_note_index, int) or next_note_index < 0:
-        next_note_index = 0
-    max_index = max([note["note_index"] for note in episodic_notes], default=-1)
-    state["next_note_index"] = max(next_note_index, max_index + 1)
-
     state["task"] = working["task_summary"]
     state["files"] = list(working["recent_files"])
-    state["notes"] = [note["text"] for note in episodic_notes]
     return state
 
 # 更新当前任务摘要
@@ -251,12 +221,11 @@ def remember_file(state, path, workspace_root=None):
     state["files"] = list(state["working"]["recent_files"])
     return state
 
-# 添加笔记
-def append_note(state, text, tags=(), source="", created_at=None, workspace_root=None):
-    state = normalize_memory_state(state, workspace_root)
+# 添加笔记到 notes 列表（独立于 memory state，直接操作 session["relevant_notes"]）
+def append_note(notes, text, tags=(), source="", created_at=None):
     text = clip(str(text).strip(), 500)
     if not text:
-        return state
+        return notes
 
     normalized_tags = _dedupe_preserve_order(
         [str(tag).strip() for tag in _ensure_list(tags) if str(tag).strip()]
@@ -266,15 +235,12 @@ def append_note(state, text, tags=(), source="", created_at=None, workspace_root
         "tags": normalized_tags,
         "source": str(source).strip(),
         "created_at": str(created_at).strip() if created_at else now(),
-        "note_index": int(state.get("next_note_index", 0)),
+        "note_index": len(notes),
     }
-    state["next_note_index"] = note["note_index"] + 1
 
-    notes = [item for item in state["episodic_notes"] if item["text"] != note["text"]]
+    notes = [item for item in notes if item["text"] != note["text"]]
     notes.append(note)
-    state["episodic_notes"] = notes[-EPISODIC_NOTE_LIMIT:]
-    state["notes"] = [item["text"] for item in state["episodic_notes"]]
-    return state
+    return notes[-EPISODIC_NOTE_LIMIT:]
 
 # 设定文件摘要
 def set_file_summary(state, path, summary, workspace_root=None):
@@ -313,13 +279,12 @@ def summarize_read_result(result, limit=180):
     summary = " | ".join(lines[:3])
     return clip(summary, limit)
 
-# 根据你当前的问题（Query），从 Agent 积累的所有笔记（Episodic Notes）中，找出最相关的几条。
+# 根据你当前的问题（Query），从笔记列表中找出最相关的几条。
 # 根据笔记的tags和query的tokens的相关度来rank
-def retrieval_candidates(state, query, limit=3, workspace_root=None):
-    state = normalize_memory_state(state, workspace_root)
+def retrieval_candidates(notes, query, limit=3):
     query_tokens = _tokenize(query)
     ranked = []
-    for note in state["episodic_notes"]:
+    for note in notes:
         # 召回逻辑故意保持简单透明：先看 tag 精确命中，
         # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
         note_tags = {tag.lower() for tag in note.get("tags", [])}
@@ -335,10 +300,10 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [note for _, note in ranked[:limit]]
 
-# 将检索到的相关记忆（Relevant Memory）格式化成一段文本，准备塞进发给大模型的 Prompt 中
-def retrieval_view(state, query, limit=3, workspace_root=None):
-    candidates = retrieval_candidates(state, query, limit=limit, workspace_root=workspace_root)
-    lines = ["Relevant memory:"]
+# 将检索到的相关笔记格式化成一段文本，准备塞进发给大模型的 Prompt 中
+def retrieval_view(notes, query, limit=3):
+    candidates = retrieval_candidates(notes, query, limit=limit)
+    lines = ["Relevant notes:"]
     if not candidates:
         lines.append("- none")
         return "\n".join(lines)
@@ -373,7 +338,6 @@ def render_memory_text(state, workspace_root=None):
     else:
         lines.append("- file_summaries: -")
 
-    lines.append(f"- episodic_notes: {len(state['episodic_notes'])}")
     return "\n".join(lines)
 
 
@@ -397,10 +361,6 @@ class LayeredMemory:
         self.state = remember_file(self.state, path, self.workspace_root)
         return self
 
-    def append_note(self, text, tags=(), source="", created_at=None):
-        self.state = append_note(self.state, text, tags=tags, source=source, created_at=created_at, workspace_root=self.workspace_root)
-        return self
-
     def set_file_summary(self, path, summary):
         self.state = set_file_summary(self.state, path, summary, self.workspace_root)
         return self
@@ -408,12 +368,6 @@ class LayeredMemory:
     def invalidate_file_summary(self, path):
         self.state = invalidate_file_summary(self.state, path, self.workspace_root)
         return self
-
-    def retrieval_candidates(self, query, limit=3):
-        return retrieval_candidates(self.state, query, limit=limit, workspace_root=self.workspace_root)
-
-    def retrieval_view(self, query, limit=3):
-        return retrieval_view(self.state, query, limit=limit, workspace_root=self.workspace_root)
 
     def render_memory_text(self):
         return render_memory_text(self.state, self.workspace_root)

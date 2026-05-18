@@ -30,6 +30,7 @@ class TaskStatus:
     task_id: str
     user_request: str
     status: str = STATUS_RUNNING
+    current_action: str = "idle"
     tool_steps: int = 0
     attempts: int = 0
     last_tool: str = ""
@@ -56,6 +57,7 @@ class TaskStatus:
             task_id=str(data.get("task_id", "")),
             user_request=str(data.get("user_request", "")),
             status=str(data.get("status", STATUS_RUNNING)),
+            current_action=str(data.get("current_action", "idle")),
             tool_steps=int(data.get("tool_steps", 0)),
             attempts=int(data.get("attempts", 0)),
             last_tool=str(data.get("last_tool", "")),
@@ -110,6 +112,7 @@ class TaskStatus:
             "task_id": self.task_id,
             "user_request": self.user_request,
             "status": self.status,
+            "current_action": self.current_action,
             "tool_steps": self.tool_steps,
             "attempts": self.attempts,
             "last_tool": self.last_tool,

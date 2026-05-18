@@ -932,7 +932,7 @@ A: 不会，因为 benchmark 用的是 `FakeModelClient`，不依赖真实模型
 
 ## C.随笔
 
-  模型每轮有三种可能的回复：
+### 1.模型每轮有三种可能的回复：
 
   ┌──────────────┬─────────┬───────────┬───────────────────────────┐
   │   模型回复   │ attempt │ tool_step │           举例            │
@@ -949,3 +949,222 @@ A: 不会，因为 benchmark 用的是 `FakeModelClient`，不依赖真实模型
   轮次1: 模型调 read_file    → attempts=1, tools=1
   轮次2: 模型调 run_shell    → attempts=2, tools=2
   轮次3: 模型给最终答案       → attempts=3, tools=2  ← 差了1
+
+### 2.记忆模块存在的价值
+
+memory中记录了该轮对话用户最初的请求，文件的相关笔记以及该轮对话中工具调用的笔记
+
+1.防止多轮react时agent丢失用户最初的请求，导致功能的实现出现偏差。提供任务摘要以供恢复会话
+
+2.减少跨轮次交互时重复读取同一文件信息的情况，将文件信息保存在memory的文件层笔记中。(relevant notes)tag 就是被读文件的路径，
+
+3.减少该轮对话中agent重复调用同一工具的情况，将工具调用结果(放在memory中)
+
+文件层笔记的召回：先根据tag查询，再将用户信息拆成最小词元和笔记做匹配
+
+ 排序权重：tag 精确命中 > 关键词重叠数 > 时间新旧 > 笔记序号
+
+### 3.上下文压缩率的计算
+
+  开启裁剪时（_render_sections + 预算循环）：
+  初始预算: prefix=3600, memory=1600, relevant_notes=1200, history=5200
+  拼起来发现 8800 > 12000上限？没超。
+  但如果超了，就开始裁剪：
+    → 先砍 relevant_notes（降到300floor）
+    → 再砍 history（降到1500floor）
+    → 再砍 memory（降到400floor）
+    → 最后砍 prefix（降到1200floor）
+    → request 永远不砍
+
+  裁剪循环的代码（context_manager.py:143-168）：
+
+  while len(prompt) > self.total_budget:
+      overflow = len(prompt) - self.total_budget
+      for section in self.reduction_order:  # relevant_notes → history → memory → prefix
+          floor = self.section_floors[section]
+          current_budget = budgets[section]
+          if current_budget <= floor:
+              continue
+          new_budget = max(floor, current_budget - overflow)
+          budgets[section] = new_budget          # 缩减这个section的预算
+          rendered = self._render_sections(...)  # 用新预算重新渲染
+          prompt = self._assemble_prompt(rendered)
+          break
+
+  12组配置的汇总就是把每种配置算出的 full_chars 和 raw_chars 取平均：
+
+  配置1: history=short(4),  notes=low(2)   → full=3800, raw=4200, ratio=9.5%
+  配置2: history=short(4),  notes=high(10) → full=4500, raw=5800, ratio=22.4%
+  配置3: history=medium(12), notes=low(2)  → full=5200, raw=6100, ratio=14.8%
+  配置4: history=medium(12), notes=high(10) → full=5800, raw=7600, ratio=23.7%
+  ...共12组
+  ─────────────────────────────
+  avg_raw  = 7082  (12组 raw_chars 的平均)
+  avg_full = 5664  (12组 full_chars 的平均)
+  avg_ratio = (7082-5664)/7082 = 16.19%
+  max_ratio = 33.28%（某组配置的压缩率最高）
+
+  所以这组数字不是跑了一次，而是 12 种历史×笔记×请求长度的组合，各跑多次取平均得出来的。
+
+
+
+### 4.不同模块的测评
+
+#### 上下文模块压缩能力的测评：
+
+取了12组不同长度组合的用户请求、history、memory以及笔记，平均压缩率……，最高压缩率……，同时保证了请求不被裁坏。
+
+#### 对记忆模块减少重复读文件及重复调用工具的测评：
+
+```
+以一个具体任务为例走完整流程。
+  
+  第一步：12个预设任务
+
+  metrics.py:322-335 里定义了 12 个任务，每个带一个事实：
+  
+  MEMORY_EXPERIMENT_TASKS = [
+      {"id": "fact_color", "category": "fact_lookup", "filename": "facts.txt", "fact": "deploy key is red"},
+      {"id": "fact_api", "category": "fact_lookup", "filename": "settings.txt", "fact": "api base path is /v1/internal"},
+      ...共12个
+  ]
+
+  第二步：每个任务跑两轮
+
+  # Bootstrap 轮：读文件，记住事实
+  agent.ask("Read facts.txt and remember the key fact.")
+  # 假模型返回: <tool>{"name":"read_file","args":{"path":"facts.txt","start":1,"end":20}}</tool>
+  #              <final>Done.</final>
+
+  # Follow-up 轮：问之前读过的内容
+  agent.ask("What color is the deploy key?")
+
+  第三步：三种模式对比
+
+  # memory_on: 正常模式
+  # → 笔记 "deploy key is red" 在 session["relevant_notes"] 里
+  # → context_manager 召回笔记，放进 prompt
+  # → 模型看到笔记直接回答 "red"，不需要再调工具
+  # → read_file 调用次数 = 0
+
+  # memory_off: 关闭记忆
+  # → feature_flags["memory"]=False, feature_flags["relevant_notes"]=False
+  # → prompt 里没有笔记
+  # → 模型不知道答案，只能再调一次 read_file
+  # → read_file 调用次数 = 1
+
+  第四步：统计重复读取
+
+```
+
+我们预设了12组预设任务，每个任务中都带有可以存进memory中笔记的部分。在开启记忆功能和关闭记忆功能俩种情况下分别运行俩次，记录第二次运行任务的工具调用次数以及重复读文件的次数。
+
+可以发现，没有开启记忆功能的时候，因为无法从文件笔记中查找到已经读过的文件信息，所以需要重复读取文件。
+
+#### 会话恢复功能的实现：
+
+```
+这里为什么不需要读取旧session里完整的历史和记忆？那这里是读取了什么来进行会话恢复？                                                                               
+
+● 其实完整的历史和记忆都读了。我之前的表述有误导。
+  
+  session_store.load(session_id) 把整个 session JSON 全部加载进来，包括完整的 history 列表和 memory 状态。区别不在于"读不读"，而在于怎么用：
+
+  # runtime.py — resume 时，session 原封不动加载回来
+  self.session = session_store.load(session_id)
+  # session["history"] 里有之前所有的 user/assistant/tool 交互
+  # session["memory"] 里有 working、file_summaries、notes
+  # session["relevant_notes"] 里有所有笔记
+
+  不用重读的是指：不需要把完整历史重新发给模型让它"回忆"之前发生了什么。
+
+  因为 context_manager.build() 组装 prompt 时会做预算裁剪：
+
+  prefix:     规则+工具定义          (3600字符预算)
+  memory:     任务摘要+文件摘要+笔记  (1600字符预算)  ← 已经提炼好的紧凑信息
+  relevant_notes: 按关键词召回top-3   (1200字符预算)
+  history:    只保留最近6轮，老的截断  (5200字符预算)  ← 大量历史被砍掉
+
+  所以真实情况是：磁盘上存了完整历史，加载时全读进内存，但组装 prompt 时只挑最重要的片段发给模型。 memory
+  区域的紧凑摘要是替代品——
+
+```
+
+**模型不需要看到完整历史，看到"当前任务是X、最近读了Y文件、摘要Z"就够了。**
+
+什么是工作区漂移？
+
+```
+❯ workspace 漂移是什么                                                                                                                                              
+
+● 就是用户在 bongo 之外改了代码。
+  
+  比如 bongo 刚帮你写完 main.py，你用 VSCode 手动改了 README.md，又 git pull 拉了同事的代码。这时候 bongo 内部持有的工作区快照（文件列表、git
+  分支、最近提交）跟磁盘上的实际状态不一致了。
+
+  bongo 每轮 ask() 都会调 refresh_prefix() 检测这个变化：
+
+  def refresh_prefix(self):
+      refreshed_workspace = WorkspaceContext.build(self.root)
+      workspace_changed = refreshed_workspace.fingerprint() != previous_fingerprint
+      if workspace_changed:
+          self.workspace = refreshed_workspace      # 更新快照
+          self.prefix_state = self.build_prefix()   # 重建前缀（工具定义+工作区摘要）
+
+  fingerprint() 把文件列表、git 分支、最近提交等信息算一个哈希。哈希变了就知道外面改了东西，就会重建 prompt 前缀，让模型看到最新的工作区状态。
+
+```
+
+12个场景覆盖不同类型的外部修改，包括文件内容修改，新增/减少文件，改变git分支，提交文件等，判断是否触发refresh
+
+#### 工具审批和调用功能的实现：
+
+**构建标准化工具调用与安全边界，覆盖参数校验、工作区隔离、高风险审批、重复调用拦截、敏感信息脱敏：**
+
+```
+在 runtime.py 里，三个地方做了脱敏：
+  
+  1. 定义哪些算"敏感"（第25-26行，第317-319行）
+
+  SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+  
+  def is_secret_env_name(self, name):
+      upper = str(name).upper()
+      return upper in self.secret_env_names or \
+             any(upper.endswith(marker) for marker in SENSITIVE_ENV_NAME_MARKERS)
+
+  环境变量名包含 API_KEY、TOKEN、SECRET、PASSWORD 的都算敏感，或者用户通过 --secret-env-name 手动指定的也算。
+
+  2. 脱敏函数（第337-358行）
+
+  def redact_text(self, text):
+      for _, value in sorted(self.secret_env_items(), ...):
+          text = text.replace(value, REDACTED_VALUE)  # "<redacted>"
+      return text
+
+  def redact_artifact(self, value, key=None):
+      if key and self.is_secret_env_name(key):
+          return REDACTED_VALUE
+      if isinstance(value, dict):
+          return {k: self.redact_artifact(v, key=k) for k, v in value.items()}
+      if isinstance(value, str):
+          return self.redact_text(value)
+      return value
+
+  递归遍历字典/列表，遇到敏感 key 或值里包含敏感内容就替换成 <redacted>。
+
+  3. 调用点（第406行，第612行）
+
+  def emit_trace(self, task_status, event, payload=None):
+      payload = self.redact_artifact(payload or {})  # trace 写入前脱敏
+      ...
+
+  def build_report(self, task_status):
+      ...
+      self.redact_artifact(self.build_report(task_status))  # report 写入前脱敏
+
+  每次写 trace 和 report 之前都会过一遍 redact_artifact，确保磁盘上落盘的文件里不包含任何 API key、token 等敏感值。
+
+```
+
+我们定义了一个敏感类，当检测到需要落盘的文件中包含APIKEY,SECRET,PASSWORD等关键字时，将其替换为<unabletoknow>，每次写trace和report之前都会检测一遍防止敏感信息落盘泄露。

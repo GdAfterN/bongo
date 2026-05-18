@@ -9,23 +9,23 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-# NOTE prompt=query+memory+relevant_memory+history+prefix
+# NOTE prompt=query+memory+relevant_notes+history+prefix
 DEFAULT_TOTAL_BUDGET = 12000  # Prompt 总字符数预算上限，防止超出模型上下文窗口限制
 DEFAULT_SECTION_BUDGETS = {   # 各个组成部分（Section）的理想字符数配额
     "prefix": 3600,           # 系统前缀（身份、规则、工具定义）的配额
     "memory": 1600,           # 工作记忆（长期沉淀的知识/摘要）的配额
-    "relevant_memory": 1200,  # 相关记忆（与当前任务高度相关的片段）的配额
+    "relevant_notes": 1200,  # 相关记忆（与当前任务高度相关的片段）的配额
     "history": 5200,          # 对话历史（之前的交互记录）的配额
 }
 DEFAULT_SECTION_FLOORS = {    # 各个组成部分的最小保底字符数，即使超预算也不能低于此值
     "prefix": 1200,           # 前缀的最小长度，确保核心规则和工具说明不丢失
     "memory": 400,            # 工作记忆的最小长度
-    "relevant_memory": 300,   # 相关记忆的最小长度
+    "relevant_notes": 300,   # 相关记忆的最小长度
     "history": 1500,          # 对话历史的最小长度，保留最近的交互语境
 }
 # 当 prompt 超预算时，会优先压缩这些 section。顺序越靠前，越先被裁剪/压缩。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")  # Prompt 各部分的拼接顺序
+DEFAULT_REDUCTION_ORDER = ("relevant_notes", "history", "memory", "prefix")
+SECTION_ORDER = ("prefix", "memory", "relevant_notes", "history", "current_request")  # Prompt 各部分的拼接顺序
 CURRENT_REQUEST_SECTION = "current_request"  # 标记当前用户请求在 Prompt 中的部分名称
 RELEVANT_MEMORY_LIMIT = 3    # 每次最多从记忆中检索并插入的相关片段数量
 
@@ -100,12 +100,12 @@ class ContextManager:
         user_message = str(user_message)
         self.section_floors = self._compute_section_floors()
         memory_enabled = True
-        relevant_memory_enabled = True
+        relevant_notes_enabled = True
         context_reduction_enabled = True
         # 是否启动自定义功能
         if hasattr(self.agent, "feature_enabled"):
             memory_enabled = self.agent.feature_enabled("memory")  # 记忆策略
-            relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")  # 相关记忆检索
+            relevant_notes_enabled = self.agent.feature_enabled("relevant_notes")  # 相关记忆检索
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")  # 上下文压缩
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
@@ -114,8 +114,11 @@ class ContextManager:
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
         selected_notes = []
-        if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
-            selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
+        if memory_enabled and relevant_notes_enabled:
+            notes = list(getattr(self.agent, "session", {}).get("relevant_notes", []))
+            if notes:
+                from .memory import retrieval_candidates as _retrieval_candidates
+                selected_notes = _retrieval_candidates(notes, user_message, limit=RELEVANT_MEMORY_LIMIT)
 
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
@@ -138,7 +141,7 @@ class ContextManager:
 
         # 如果 prompt 超预算，就按固定顺序不断压缩。
         # 这里的顺序体现了平台偏好：
-        # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
+        # 先牺牲 relevant_notes，再牺牲 history，然后才动 memory 和 prefix。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
         while len(prompt) > self.total_budget:
             overflow = len(prompt) - self.total_budget
@@ -205,7 +208,7 @@ class ContextManager:
             "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]),
                                     rendered=section_texts["memory"], details={}),
             # 相关记忆：包装检索到的笔记，并在 details 中记录选中数量等元数据
-            "relevant_memory": SectionRender(
+            "relevant_notes": SectionRender(
                 raw=relevant_raw,
                 budget=len(relevant_raw),
                 rendered=relevant_raw,
@@ -247,8 +250,8 @@ class ContextManager:
             if section == CURRENT_REQUEST_SECTION:
                 raw = section_texts[section]
                 rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
-            elif section == "relevant_memory":
-                rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
+            elif section == "relevant_notes":
+                rendered[section] = self._render_relevant_notes(selected_notes or [], int(budget or 0))
             elif section == "history":
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
@@ -257,7 +260,7 @@ class ContextManager:
                 rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
         return rendered
 
-    def _render_relevant_memory(self, selected_notes, budget):
+    def _render_relevant_notes(self, selected_notes, budget):
         header = "Relevant memory:"
         note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
         raw_lines = [header] + [f"- {text}" for text in note_texts]
@@ -389,7 +392,7 @@ class ContextManager:
             [
                 rendered["prefix"].rendered,
                 rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
+                rendered["relevant_notes"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
@@ -421,14 +424,14 @@ class ContextManager:
             "sections": section_metadata,
             "budget_reductions": reduction_log,
             "reduction_order": list(self.reduction_order),
-            "relevant_memory": {
+            "relevant_notes": {
                 "limit": RELEVANT_MEMORY_LIMIT,
                 "selected_count": len(selected_notes),
                 "selected_notes": [note["text"] for note in selected_notes],
-                "raw_chars": rendered["relevant_memory"].raw_chars,
-                "rendered_chars": rendered["relevant_memory"].rendered_chars,
-                "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
-                "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
+                "raw_chars": rendered["relevant_notes"].raw_chars,
+                "rendered_chars": rendered["relevant_notes"].rendered_chars,
+                "rendered_notes": list(rendered["relevant_notes"].details.get("rendered_notes", [])),
+                "rendered_count": int(rendered["relevant_notes"].details.get("rendered_count", 0)),
             },
             "current_request": {
                 "text": user_message,

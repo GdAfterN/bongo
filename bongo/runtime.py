@@ -27,7 +27,7 @@ REDACTED_VALUE = "<redacted>"
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
-    "relevant_memory": True,
+    "relevant_notes": True,
     "context_reduction": True,
     "prompt_cache": True,
 }
@@ -39,8 +39,8 @@ class PromptPrefix:
     # 这样 runtime 才能明确判断 prefix 是否可以复用。
     text: str  # ← 提示词的实际内容
     hash: str  # ← text 内容的哈希值，用于快速比对内容是否改变
-    workspace_fingerprint: str  # ← 当前工作区状态的“指纹”，比如文件列表、git commit id 等
-    tool_signature: str  # ← 可用工具集的“签名”，如果工具变了，提示词也需要变
+    workspace_fingerprint: str  # ← 当前工作区状态的"指纹"，比如文件列表、git commit id 等
+    tool_signature: str  # ← 可用工具集的"签名"，如果工具变了，提示词也需要变
     built_at: str  # ← 构建时间戳，记录这个 prefix 是什么时候生成的
 
 """
@@ -116,6 +116,7 @@ class bongo:
             "workspace_root": workspace.repo_root,
             "history": [],
             "memory": memorylib.default_memory_state(),
+            "relevant_notes": [],
         }
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
@@ -195,7 +196,7 @@ class bongo:
                 "<final>Done.</final>",
             ]
         )
-        # prefix 可以理解成 agent 的“工作手册”：
+        # prefix 可以理解成 agent 的"工作手册"：
         # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
         text = textwrap.dedent(  # ← 使用 textwrap.dedent 去除多行字符串的公共缩进
             f"""\
@@ -375,7 +376,7 @@ class bongo:
     def _build_prompt_and_metadata(self, user_message):
         refresh = self.refresh_prefix()
         prompt, metadata = self.context_manager.build(user_message)
-        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
+        # 这里把"这轮 prompt 是怎么拼出来的"连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
             {
@@ -406,7 +407,7 @@ class bongo:
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
         payload["created_at"] = now()
-        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
+        # trace 是运行中的逐事件时间线，适合回答"这一轮 agent 到底做了什么"。
         self.run_store.append_trace(task_status, payload)
         return payload
 
@@ -415,7 +416,7 @@ class bongo:
 
         为什么存在：
         并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
+        `history`，这里只挑少量"下一轮大概率还会用到"的事实做提纯，
         例如最近读写过哪些文件、某个文件读出来的短摘要。
 
         输入 / 输出：
@@ -440,7 +441,12 @@ class bongo:
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
+            self.session["relevant_notes"] = memorylib.append_note(
+                self.session.get("relevant_notes", []),
+                summary,
+                tags=(canonical_path,),
+                source=canonical_path,
+            )
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
 
@@ -451,7 +457,7 @@ class bongo:
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
-        `ask()` 是整个 runtime 的总调度器。它把“用户提一个请求”扩展成一条
+        `ask()` 是整个 runtime 的总调度器。它把"用户提一个请求"扩展成一条
         可持续推进的控制循环：记录会话、组 prompt、调用模型、执行工具、
         写 trace/report、更新状态，直到模型给出最终答案或系统主动停下。
 
@@ -464,7 +470,7 @@ class bongo:
         它是 CLI 和底层工具/模型之间的核心桥梁。CLI 收到用户输入后基本只做
         一件事：调用 `agent.ask()`。而 `ask()` 内部再去驱动 `ContextManager`
         组 prompt、`model_client.complete()` 调模型、`run_tool()` 执行动作。
-        如果新人想理解 bongo 是怎么“从一句话跑成一个 agent 流程”的，
+        如果新人想理解 bongo 是怎么"从一句话跑成一个 agent 流程"的，
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()  # 返回单调时间,便于计算所用时间
@@ -488,7 +494,7 @@ class bongo:
         attempts = 0  # 尝试次数
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)  # 这是为了容忍一定次数的模型错误,同时设置合理上限:
 
-        # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
+        # 这是 agent 的主循环，可以按"感知 -> 决策 -> 行动 -> 记录"来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
         # 2. 决策：让模型返回一个工具调用，或一个最终答案
         # 3. 行动：如果是工具调用，就执行工具
@@ -497,8 +503,10 @@ class bongo:
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
             task_status.record_attempt()
-            self.run_store.write_task_status(task_status)
             prompt_started_at = time.monotonic()
+            # 每个关键步骤都更新 current_action 并落盘，方便外部 --status 随时查看
+            task_status.current_action = "building_prompt"
+            self.run_store.write_task_status(task_status)
             # 关键，每轮都重新构建提示词和元数据
             prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
@@ -518,6 +526,8 @@ class bongo:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
+            task_status.current_action = "sending_to_model"
+            self.run_store.write_task_status(task_status)
             prompt_cache_key = None
             prompt_cache_retention = None
             if getattr(self.model_client, "supports_prompt_cache", False):
@@ -539,6 +549,8 @@ class bongo:
                 prompt_metadata.update(completion_metadata)
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
+            task_status.current_action = "model_completed"
+            self.run_store.write_task_status(task_status)
             kind, payload = self.parse(raw)
             self.emit_trace(
                 task_status,
@@ -555,8 +567,11 @@ class bongo:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 task_status.record_tool(name)
+                task_status.current_action = f"executing_tool:{name}"
+                self.run_store.write_task_status(task_status)
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
+                task_status.current_action = f"tool_completed:{name}"
                 self.record(
                     {
                         "role": "tool",
@@ -587,6 +602,7 @@ class bongo:
 
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
+            task_status.current_action = "final_answer"
             task_status.finish_success(final)
             self.run_store.write_task_status(task_status)
             self.emit_trace(
@@ -604,9 +620,11 @@ class bongo:
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
+            task_status.current_action = "stopped:retry_limit"
             task_status.stop_retry_limit(final)
         else:
             final = "Stopped after reaching the step limit without a final answer."
+            task_status.current_action = "stopped:step_limit"
             task_status.stop_step_limit(final)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.run_store.write_task_status(task_status)
@@ -627,8 +645,8 @@ class bongo:
         """执行一次工具调用，并在执行前后套上完整护栏。
 
         为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
+        在 agent 系统里，真正危险的不是"模型会不会想调用工具"，而是
+        "平台有没有在执行前把边界守住"。这个函数就是工具层的总闸口：
         所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
 
         输入 / 输出：
@@ -637,12 +655,12 @@ class bongo:
           这样模型下一轮都能继续消费这份反馈。
 
         在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
+        它位于 `ask()` 的"模型决定要调用工具"之后，是控制循环里真正把模型
         意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
         """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
+        # 工具执行不是"直接调函数"，而是一条带护栏的流水线：
         # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
         # -> 真正执行 -> 更新记忆。
         tool = self.tools.get(name)
@@ -800,7 +818,7 @@ class bongo:
 
         为什么存在：
         模型输出首先是自然语言文本，而 runtime 需要的是结构化决策：
-        “这是工具调用”还是“这是最终答案”。如果没有这层解析，后面的工具校验、
+        "这是工具调用"还是"这是最终答案"。如果没有这层解析，后面的工具校验、
         审批和执行链路就没法可靠工作。
 
         输入 / 输出：
@@ -918,6 +936,7 @@ class bongo:
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
+        self.session["relevant_notes"] = []
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.session_store.save(self.session)
 

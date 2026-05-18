@@ -346,7 +346,7 @@ class BenchmarkEvaluator:
         initial_memory_state = agent.memory.to_dict()
         initial_memory_empty = initial_memory_state == memorylib.default_memory_state()
         initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
-        initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
+        initial_relevant_notes_empty = not agent.session.get("relevant_notes", [])
 
         final_answer = agent.ask(task["prompt"])
         task_status = agent.current_task_status
@@ -413,7 +413,7 @@ class BenchmarkEvaluator:
             "initial_history_empty": initial_history_empty,
             "initial_memory_empty": initial_memory_empty,
             "initial_task_summary_empty": initial_task_summary_empty,
-            "initial_episodic_notes_empty": initial_episodic_notes_empty,
+            "initial_relevant_notes_empty": initial_relevant_notes_empty,
             "task_status": task_status.to_dict(),
             "report": report,
         }
