@@ -34,9 +34,12 @@ tmp/
 .bongo/
 artifacts/
 readme_intro_locked/
+tests/results/
 
 # Local docs not intended for publication
 docs/
+studyForOffer/
+backend/
 
 # OS files
 .DS_Store

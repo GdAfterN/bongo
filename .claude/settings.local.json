@@ -4,7 +4,9 @@
       "Bash(python *)",
       "Bash(pip show *)",
       "Bash(powershell *)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "Bash(git -C D:/aiAgentStudy/bongo-main check-ignore studyForOffer/HARNESS.md)",
+      "Bash(git *)"
     ]
   }
 }
