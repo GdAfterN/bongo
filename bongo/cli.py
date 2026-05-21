@@ -12,10 +12,11 @@ import shutil
 import sys
 import textwrap
 
-from .config import _config_path, load_config, save_config
+from .config import _config_path, load_config, save_config, load_tier_config
 from .task_status import TaskStatus
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import bongo, SessionStore
+from .tier_manager import TierManager
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -43,19 +44,22 @@ WELCOME_STATUS = "calm shell, ready for work"
 HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
-    /help    Show this help message.
-    /memory  Show the agent's distilled working memory.
-    /session Show the path to the saved session file.
-    /reset   Clear the current session history and memory.
-    /exit    Exit the agent.
+    /help            Show this help message.
+    /memory          Show the agent's distilled working memory.
+    /session         Show the path to the saved session file.
+    /reset           Clear the current session history and memory.
+    /model           Show current model and tier status.
+    /model [1|2|3]   Lock to a specific tier model.
+    /model unlock    Unlock model, resume auto-routing.
+    /exit            Exit the agent.
     """
 ).strip()
 
-DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
+DEFAULT_OLLAMA_MODEL = "mimo"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OPENAI_MODEL = "qwen3.5-plus-2026-02-15"
+DEFAULT_OPENAI_MODEL = "mimo"
 DEFAULT_OPENAI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
+DEFAULT_ANTHROPIC_MODEL = "mimo"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 
 
@@ -150,6 +154,83 @@ def _build_model_client(args):
         top_p=args.top_p,
         timeout=args.ollama_timeout,
     )
+
+
+def _build_tier_model_client(tier_config, default_args, global_config=None):
+    """根据层级配置构建模型客户端。tier_config 是 {provider, model, base_url, api_key} 字典。"""
+    if global_config is None:
+        global_config = {}
+    provider = tier_config.get("provider", "openai")
+    model = tier_config.get("model", "") or global_config.get("model", "")
+    base_url = tier_config.get("base_url", "")
+    api_key = tier_config.get("api_key", "")
+    temperature = getattr(default_args, "temperature", 0.2)
+    timeout = getattr(default_args, "openai_timeout", getattr(default_args, "ollama_timeout", 300))
+
+    if provider == "openai":
+        if not base_url:
+            base_url = DEFAULT_OPENAI_BASE_URL
+        if not model:
+            model = DEFAULT_OPENAI_MODEL
+        return OpenAICompatibleModelClient(
+            model=model, base_url=base_url, api_key=api_key,
+            temperature=temperature, timeout=timeout,
+        )
+    if provider == "anthropic":
+        if not base_url:
+            base_url = DEFAULT_ANTHROPIC_BASE_URL
+        if not model:
+            model = DEFAULT_ANTHROPIC_MODEL
+        return AnthropicCompatibleModelClient(
+            model=model, base_url=base_url, api_key=api_key,
+            temperature=temperature, timeout=timeout,
+        )
+    # ollama
+    if not base_url:
+        base_url = DEFAULT_OLLAMA_HOST
+    if not model:
+        model = DEFAULT_OLLAMA_MODEL
+    return OllamaModelClient(
+        model=model, host=base_url,
+        temperature=temperature,
+        top_p=getattr(default_args, "top_p", 0.9),
+        timeout=getattr(default_args, "ollama_timeout", 300),
+    )
+
+
+def _build_tier_manager(args, default_client):
+    """构建多层级模型管理器。优先使用 CLI 参数，其次使用持久化配置，最后回退到默认客户端。"""
+    tier_configs = load_tier_config()
+    global_config = load_config()
+    tiers = {}
+    for level in (1, 2, 3):
+        # 检查 CLI 参数是否有该层级的配置
+        cli_provider = getattr(args, f"tier{level}_provider", None)
+        cli_model = getattr(args, f"tier{level}_model", None)
+        if cli_provider or cli_model:
+            tier_config = {
+                "provider": cli_provider or "openai",
+                "model": cli_model or "",
+                "base_url": getattr(args, f"tier{level}_base_url", "") or "",
+                "api_key": getattr(args, f"tier{level}_api_key", "") or "",
+            }
+        elif tier_configs.get(level):
+            tier_config = tier_configs[level]
+        else:
+            # 没有配置，继承全局配置的 provider/api_key/base_url
+            provider = getattr(args, "provider", "openai")
+            if not getattr(args, "provider_set", False) and global_config.get("provider"):
+                provider = global_config["provider"]
+            tier_config = {
+                "provider": provider,
+                "model": "",
+                "base_url": global_config.get("base_url", ""),
+                "api_key": global_config.get("api_key", ""),
+            }
+
+        tiers[level] = _build_tier_model_client(tier_config, args, global_config)
+
+    return TierManager(tiers[1], tiers[2], tiers[3])
 
 def _handle_config(args):
     """处理 bongo config 子命令：--show 查看，其他参数保存。"""
@@ -266,9 +347,19 @@ def build_welcome(agent, model, host):
             row("WORKSPACE  " + middle(agent.workspace.cwd, inner - 11)),
             pair("MODEL", model, "BRANCH", agent.workspace.branch),
             pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
-            row(""),
         ]
     )
+    # 显示多层级模型信息
+    if agent.tier_manager is not None:
+        rows.append(divider("-"))
+        rows.append(center("MODEL TIERS"))
+        for level in (1, 2, 3):
+            tier_client = agent.tier_manager.get_model(level)
+            tier_name = getattr(tier_client, "model", "unknown")
+            tier_provider = type(tier_client).__name__.replace("ModelClient", "").replace("Compatible", "").lower()
+            label = {1: "Tier1(easy)", 2: "Tier2(medium)", 3: "Tier3(hard)"}[level]
+            rows.append(row(f"{label}: {tier_provider}/{tier_name}"))
+    rows.append(row(""))
     return "\n".join([line, *rows, line])
 
 
@@ -305,6 +396,8 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     store = SessionStore(workspace.repo_root + "/.bongo/sessions")
     model = _build_model_client(args)
+    # 构建多层级模型管理器
+    tier_manager = _build_tier_manager(args, model)
     # 获取命令行参数 --resume 指定的会话 ID。如果值为 "latest"，则调用 store.latest() 方法获取最近一次保存的会话 ID。
     session_id = args.resume
     if session_id == "latest":
@@ -319,6 +412,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=sorted(configured_secret_names),
+            tier_manager=tier_manager,
         )
     return bongo(
         model_client=model,
@@ -328,6 +422,7 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=sorted(configured_secret_names),
+        tier_manager=tier_manager,
     )
 
 # 在命令行解析器的方法里，我们添加了很多的参数
@@ -358,7 +453,7 @@ def build_arg_parser():
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, OPENAI_MODEL for openai, and ANTHROPIC_MODEL for anthropic when set.",
+        help="Model name override. Defaults to mimo for all providers (Ollama, OpenAI, Anthropic) unless overridden by env vars or config.",
     )
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
     parser.add_argument("--base-url", default=None, help="Provider API base URL for openai or anthropic.")
@@ -374,10 +469,22 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--max-steps", type=int, default=20, help="Maximum tool/model iterations per request.")
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+
+    # 多层级模型配置参数
+    for tier_level in (1, 2, 3):
+        tier_group = parser.add_argument_group(f"tier{tier_level} model")
+        tier_group.add_argument(f"--tier{tier_level}-provider", choices=("ollama", "openai", "anthropic"), default=None,
+                                help=f"Provider for tier {tier_level} model.")
+        tier_group.add_argument(f"--tier{tier_level}-model", default=None,
+                                help=f"Model name for tier {tier_level}.")
+        tier_group.add_argument(f"--tier{tier_level}-base-url", default=None,
+                                help=f"API base URL for tier {tier_level}.")
+        tier_group.add_argument(f"--tier{tier_level}-api-key", default=None,
+                                help=f"API key for tier {tier_level}.")
     return parser
 
 
@@ -457,6 +564,19 @@ def main(argv=None):
         if user_input == "/reset":
             agent.reset()
             print("session reset")
+            continue
+        if user_input.startswith("/model"):
+            parts = user_input.split()
+            if len(parts) == 1:
+                # /model - 显示当前状态
+                print(agent.model_status())
+            elif parts[1] == "unlock":
+                print(agent.unlock_model())
+            elif parts[1] in ("1", "2", "3"):
+                level = int(parts[1])
+                print(agent.lock_model(level))
+            else:
+                print("Usage: /model [1|2|3|unlock]")
             continue
 
         print()

@@ -35,3 +35,41 @@ def save_config(data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ── 多层级模型配置 ──────────────────────────────────────
+
+TIER_KEYS = ("provider", "model", "base_url", "api_key")
+
+
+def load_tier_config():
+    """加载多层级模型配置，返回 {1: {...}, 2: {...}, 3: {...}}。"""
+    config = load_config()
+    tiers = {}
+    for level in (1, 2, 3):
+        tier_data = config.get(f"tier{level}", {})
+        if tier_data:
+            tiers[level] = tier_data
+        else:
+            tiers[level] = {}
+    return tiers
+
+
+def save_tier_config(tiers):
+    """保存多层级模型配置到磁盘。"""
+    config = load_config()
+    for level, tier_data in tiers.items():
+        config[f"tier{level}"] = tier_data
+    save_config(config)
+
+
+def get_tier_setting(level, key, fallback_config=None):
+    """获取指定层级的某个配置项，支持回退到全局配置。"""
+    tiers = load_tier_config()
+    tier = tiers.get(level, {})
+    value = tier.get(key)
+    if value:
+        return value
+    if fallback_config:
+        return fallback_config.get(key, "")
+    return ""

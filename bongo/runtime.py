@@ -86,15 +86,19 @@ class bongo:
         run_store=None,  # 运行日志
         approval_policy="ask",  # 审批策略，控制危险操作的执行方式
         max_steps=20,  # 单次请求的最大步数(ReAct)
-        max_new_tokens=512,  # 单次输出的最大token，防止输出过长
+        max_new_tokens=2048,  # 单次输出的最大token，防止输出过长
         depth=0,  # 当前嵌套深度（用于递归调用）
         max_depth=10,
         read_only=False,  # 是否为只读模式
         shell_env_allowlist=None,  # 允许访问的shell环境变量白名单作用：限制AI可以访问的系统环境信息
         secret_env_names=None,  # 需要隐藏的敏感环境变量名列表
         feature_flags=None,  # 配置权限
+        tier_manager=None,  # 多层级模型管理器
     ):
         self.model_client = model_client
+        self.tier_manager = tier_manager
+        self.locked_model = None  # 用户锁定的模型（通过 /model 命令）
+        self._original_model_client = model_client  # 保存原始模型客户端
         self.workspace = workspace
         self.root = Path(workspace.repo_root)
         self.session_store = session_store
@@ -474,6 +478,15 @@ class bongo:
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()  # 返回单调时间,便于计算所用时间
+
+        # ── 多层级模型路由 ──
+        # 根据任务难度选择模型，如果用户锁定了模型则使用锁定的
+        task_level = 1
+        fallback_attempted = False
+        if self.tier_manager is not None:
+            selected_model, task_level = self.tier_manager.select_model(user_message, self.locked_model)
+            self.model_client = selected_model
+
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
         task_status = TaskStatus.create(
@@ -626,6 +639,30 @@ class bongo:
             final = "Stopped after reaching the step limit without a final answer."
             task_status.current_action = "stopped:step_limit"
             task_status.stop_step_limit(final)
+
+        # ── 二级任务回退逻辑 ──
+        # 如果是二级任务且使用了 tier1 模型但失败了，回退到 tier2 模型重试
+        if (
+            task_level == 2
+            and not fallback_attempted
+            and self.tier_manager is not None
+            and self.locked_model is None
+        ):
+            tier2_model = self.tier_manager.get_model(2)
+            if tier2_model is not self.model_client:
+                self.emit_trace(
+                    task_status,
+                    "tier_fallback",
+                    {
+                        "from_level": 1,
+                        "to_level": 2,
+                        "reason": task_status.stop_reason,
+                    },
+                )
+                # 恢复原始模型客户端，让递归调用重新选择
+                self.model_client = self._original_model_client
+                return self._ask_with_fallback(user_message, task_level=2)
+
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.run_store.write_task_status(task_status)
         self.emit_trace(
@@ -640,6 +677,20 @@ class bongo:
         )
         self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
         return final
+
+    def _ask_with_fallback(self, user_message, task_level):
+        """使用指定层级的模型重新执行任务（回退路径）。"""
+        if self.tier_manager is not None:
+            fallback_model = self.tier_manager.get_model(task_level)
+            self.model_client = fallback_model
+        # 直接调用 ask，但由于 locked_model 为 None 且我们会设置 model_client，
+        # 需要在 ask 内部跳过自动路由。通过临时设置 locked_model 实现。
+        original_locked = self.locked_model
+        self.locked_model = self.model_client
+        try:
+            return self.ask(user_message)
+        finally:
+            self.locked_model = original_locked
 
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
@@ -939,6 +990,38 @@ class bongo:
         self.session["relevant_notes"] = []
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.session_store.save(self.session)
+
+    # ── 多层级模型管理 ──────────────────────────────────────
+
+    def lock_model(self, level):
+        """锁定到指定层级的模型，禁用自动路由。"""
+        if self.tier_manager is None:
+            return "error: no tier manager configured"
+        model = self.tier_manager.get_model(level)
+        self.locked_model = model
+        self.model_client = model
+        label = self.tier_manager.tier_label(level)
+        name = getattr(model, "model", "unknown")
+        return f"Model locked to {label}: {name}"
+
+    def unlock_model(self):
+        """解锁模型，恢复自动路由。"""
+        if self.locked_model is None:
+            return "Model is not locked"
+        self.locked_model = None
+        self.model_client = self._original_model_client
+        return "Model unlocked, auto-routing resumed"
+
+    def model_status(self):
+        """返回当前模型状态描述。"""
+        if self.tier_manager is None:
+            name = getattr(self.model_client, "model", "unknown")
+            return f"Model: {name} (single model mode)"
+        if self.locked_model is not None:
+            name = getattr(self.locked_model, "model", "unknown")
+            return f"Model: {name} (LOCKED)"
+        name = getattr(self.model_client, "model", "unknown")
+        return f"Model: {name} (auto-routing)\n{self.tier_manager.tier_info()}"
 
     def path(self, raw_path):
         # 将原始路径字符串转换为 Python 的 pathlib.Path 对象，便于后续的路径操作。
