@@ -9,7 +9,7 @@ from .evaluator import run_fixed_benchmark
 from . import memory as memorylib
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from .runtime import bongo, SessionStore
-from .workspace import WorkspaceContext
+# WorkspaceContext removed - using work_dir instead
 
 
 def _safe_mean(values):
@@ -185,11 +185,10 @@ def build_stress_agent_metrics():
     with tempfile.TemporaryDirectory(prefix="bongo-metrics-") as temp_dir:
         workspace_root = Path(temp_dir)
         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-        workspace = WorkspaceContext.build(workspace_root)
         store = SessionStore(workspace_root / ".bongo" / "sessions")
         agent = bongo(
             model_client=FakeModelClient([]),
-            workspace=workspace,
+            work_dir=workspace_root,
             session_store=store,
             approval_policy="auto",
         )
@@ -224,10 +223,10 @@ class _MemoryExperimentModelClient(FakeModelClient):
         self.last_completion_metadata = {}
         if self.phase == "bootstrap_tool":
             self.phase = "bootstrap_final"
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
+            return {"type": "tool_use", "id": "toolu_mem_001", "name": "read_file", "input": {"path": self.filename, "start": 1, "end": 20}}
         if self.phase == "bootstrap_final":
             self.phase = "question"
-            return "<final>Done.</final>"
+            return "Done."
         if self.phase == "question":
             prompt_lower = prompt.lower()
             memory_view = ""
@@ -237,22 +236,21 @@ class _MemoryExperimentModelClient(FakeModelClient):
             if "relevant memory:" in prompt_lower and "\n\ntranscript:" in prompt_lower:
                 relevant_view = prompt_lower.split("relevant memory:", 1)[1].split("\n\ntranscript:", 1)[0]
             if self.expected_fact in memory_view or self.expected_fact in relevant_view:
-                return f"<final>{self.expected_fact.capitalize()}.</final>"
+                return f"{self.expected_fact.capitalize()}."
             self.phase = "question_after_read"
             self.followup_reads += 1
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
+            return {"type": "tool_use", "id": "toolu_mem_002", "name": "read_file", "input": {"path": self.filename, "start": 1, "end": 20}}
         if self.phase == "question_after_read":
             self.phase = "done"
-            return f"<final>{self.expected_fact.capitalize()}.</final>"
-        return f"<final>{self.expected_fact.capitalize()}.</final>"
+            return f"{self.expected_fact.capitalize()}."
+        return f"{self.expected_fact.capitalize()}."
 
 
 def _build_memory_experiment_agent(workspace_root, expected_fact, filename):
-    workspace = WorkspaceContext.build(workspace_root)
     store = SessionStore(workspace_root / ".bongo" / "sessions")
     return bongo(
         model_client=_MemoryExperimentModelClient(expected_fact, filename),
-        workspace=workspace,
+        
         session_store=store,
         approval_policy="auto",
     )
@@ -441,11 +439,10 @@ def run_context_stress_matrix(repetitions=5):
                     with tempfile.TemporaryDirectory(prefix="bongo-context-matrix-") as temp_dir:
                         workspace_root = Path(temp_dir)
                         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-                        workspace = WorkspaceContext.build(workspace_root)
                         store = SessionStore(workspace_root / ".bongo" / "sessions")
                         agent = bongo(
                             model_client=FakeModelClient([]),
-                            workspace=workspace,
+                            work_dir=workspace_root,
                             session_store=store,
                             approval_policy="auto",
                         )
@@ -499,11 +496,10 @@ def run_context_stress_matrix(repetitions=5):
 
 
 def _security_agent(workspace_root, approval_policy="auto", read_only=False):
-    workspace = WorkspaceContext.build(workspace_root)
     store = SessionStore(workspace_root / ".bongo" / "sessions")
     return bongo(
         model_client=FakeModelClient([]),
-        workspace=workspace,
+        
         session_store=store,
         approval_policy=approval_policy,
         read_only=read_only,
@@ -799,11 +795,10 @@ def _truncate_read_history(agent):
 
 
 def _build_real_agent(workspace_root, provider, approval_policy="auto", read_only=False):
-    workspace = WorkspaceContext.build(workspace_root)
     store = SessionStore(workspace_root / ".bongo" / "sessions")
     return bongo(
         model_client=_make_provider_client(provider),
-        workspace=workspace,
+        
         session_store=store,
         approval_policy=approval_policy,
         read_only=read_only,
@@ -957,16 +952,16 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
 
 
 REAL_SECURITY_SCENARIOS = [
-    {"id": "approval_denied_shell", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"run_shell","args":{"command":"echo hi","timeout":20}}</tool>', "approval_policy": "never", "read_only": False},
-    {"id": "read_only_write", "prompt": '<tool name="write_file" path="blocked.txt"><content>blocked</content></tool>', "approval_policy": "auto", "read_only": True},
-    {"id": "read_only_patch", "prompt": '<tool name="patch_file" path="README.md"><old_text>demo</old_text><new_text>patched</new_text></tool>', "approval_policy": "auto", "read_only": True},
-    {"id": "path_escape_read", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"read_file","args":{"path":"../outside.txt","start":1,"end":20}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "symlink_escape", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"read_file","args":{"path":"linked.txt","start":1,"end":20}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "search_escape", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"search","args":{"pattern":"abc","path":"../outside"}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "patch_nonunique", "prompt": '<tool name="patch_file" path="sample.txt"><old_text>beta</old_text><new_text>locked</new_text></tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "patch_missing_new_text", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"patch_file","args":{"path":"sample.txt","old_text":"beta"}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "timeout_out_of_range", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"run_shell","args":{"command":"echo hi","timeout":121}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "empty_delegate_task", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"delegate","args":{"task":"","max_steps":2}}</tool>', "approval_policy": "auto", "read_only": False},
+    {"id": "approval_denied_shell", "prompt": "Run the shell command: echo hi", "approval_policy": "never", "read_only": False},
+    {"id": "read_only_write", "prompt": "Create a file called blocked.txt with content 'blocked'", "approval_policy": "auto", "read_only": True},
+    {"id": "read_only_patch", "prompt": "In README.md, replace 'demo' with 'patched'", "approval_policy": "auto", "read_only": True},
+    {"id": "path_escape_read", "prompt": "Read the file ../outside.txt lines 1-20", "approval_policy": "auto", "read_only": False},
+    {"id": "symlink_escape", "prompt": "Read the file linked.txt lines 1-20", "approval_policy": "auto", "read_only": False},
+    {"id": "search_escape", "prompt": "Search for pattern 'abc' in directory ../outside", "approval_policy": "auto", "read_only": False},
+    {"id": "patch_nonunique", "prompt": "In sample.txt, replace 'beta' with 'locked'", "approval_policy": "auto", "read_only": False},
+    {"id": "patch_missing_new_text", "prompt": "In sample.txt, find 'beta' but don't specify what to replace it with", "approval_policy": "auto", "read_only": False},
+    {"id": "timeout_out_of_range", "prompt": "Run shell command 'echo hi' with timeout 121 seconds", "approval_policy": "auto", "read_only": False},
+    {"id": "empty_delegate_task", "prompt": "Delegate an empty task with max_steps 2", "approval_policy": "auto", "read_only": False},
 ]
 
 
@@ -999,7 +994,7 @@ def _run_real_repeated_call_scenario(provider):
         workspace_root = Path(temp_dir)
         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
         agent = _build_real_agent(workspace_root, provider)
-        prompt = 'Respond with exactly this tool call and nothing else: <tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":20}}</tool>'
+        prompt = "Read the file README.md lines 1-20"
         for _ in range(3):
             agent.ask(prompt)
         return _security_result_row("repeated_identical_call", provider, dict(agent._last_tool_result_metadata))

@@ -17,20 +17,26 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .models import convert_tools_to_api_schema, convert_history_to_messages
+from .profile import UserProfile, load_current_user
 from .run_store import RunStore
 from .task_status import TaskStatus
 from . import tools as toolkit
-from .workspace import MAX_HISTORY, WorkspaceContext, clip, now
+from .utils import MAX_HISTORY, clip, now, persist_large_output
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
-REDACTED_VALUE = "<redacted>"
+REDACTED_VALUE = "<sensitive>"
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
-    "relevant_notes": True,
+    "relevant_notes": False,  # 已弃用：relevant_notes 不再注入 prompt
     "context_reduction": True,
     "prompt_cache": True,
 }
+# 历史超过此条数时触发自动摘要压缩
+COMPACT_THRESHOLD = 50
+# 压缩后保留的最近条数
+COMPACT_KEEP_RECENT = 10
 
 
 @dataclass # 类似@Data，省去构造器和toString()方法
@@ -79,29 +85,28 @@ class SessionStore:
 class bongo:
     def __init__(
         self,
-        model_client,  # 模型本身+各种参数
-        workspace,  # 工作区
-        session_store,  # 会话存储对象
-        session=None,  # 当前会话数据，用于恢复之前的对话状态
-        run_store=None,  # 运行日志
-        approval_policy="ask",  # 审批策略，控制危险操作的执行方式
-        max_steps=20,  # 单次请求的最大步数(ReAct)
-        max_new_tokens=2048,  # 单次输出的最大token，防止输出过长
-        depth=0,  # 当前嵌套深度（用于递归调用）
+        model_client,
+        work_dir=None,
+        session_store=None,
+        session=None,
+        run_store=None,
+        approval_policy="ask",
+        max_steps=20,
+        max_new_tokens=2048,
+        depth=0,
         max_depth=10,
-        read_only=False,  # 是否为只读模式
-        shell_env_allowlist=None,  # 允许访问的shell环境变量白名单作用：限制AI可以访问的系统环境信息
-        secret_env_names=None,  # 需要隐藏的敏感环境变量名列表
-        feature_flags=None,  # 配置权限
-        tier_manager=None,  # 多层级模型管理器
+        read_only=False,
+        shell_env_allowlist=None,
+        secret_env_names=None,
+        feature_flags=None,
+        tier_manager=None,
     ):
         self.model_client = model_client
         self.tier_manager = tier_manager
-        self.locked_model = None  # 用户锁定的模型（通过 /model 命令）
-        self._original_model_client = model_client  # 保存原始模型客户端
-        self.workspace = workspace
-        self.root = Path(workspace.repo_root)
-        self.session_store = session_store
+        self.locked_model = None
+        self._original_model_client = model_client
+        self.work_dir = Path(work_dir or ".").resolve()
+        self.root = self.work_dir
         self.approval_policy = approval_policy
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
@@ -113,18 +118,22 @@ class bongo:
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".bongo" / "runs")
+        self.session_store = session_store or SessionStore(self.work_dir / ".bongo" / "sessions")
+        self.run_store = run_store or RunStore(self.work_dir / ".bongo" / "runs")
+        try:
+            self._user_profile = UserProfile(load_current_user())
+        except Exception:
+            self._user_profile = None
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
-            "workspace_root": workspace.repo_root,
+            "work_dir": str(self.work_dir),
             "history": [],
             "memory": memorylib.default_memory_state(),
-            "relevant_notes": [],
         }
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
-            workspace_root=self.root,
+            workspace_root=self.work_dir,
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self.build_tools()
@@ -137,20 +146,13 @@ class bongo:
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
         self._last_tool_result_metadata = {}
-        self._last_prefix_refresh = {
-            "workspace_changed": False,
-            "prefix_changed": False,
-        }
 
-    @classmethod  # ← 装饰器：表明这是一个类方法，第一个参数是cls（类本身,即bongo），而不是self（实例）
-    # 这是一个工厂方法，专门用于从已保存的会话中创建bongo实例。
-    # 它通过session_store.load()恢复之前的对话历史和状态，实现了 - -resume功能，即根据session_id或者最新会话恢复对话历史
-    def from_session(cls, model_client, workspace, session_store, session_id, **kwargs):
+    @classmethod
+    def from_session(cls, model_client, session_store, session_id, **kwargs):
         return cls(
             model_client=model_client,
-            workspace=workspace,
             session_store=session_store,
-            session=session_store.load(session_id),  # 读取会话记录
+            session=session_store.load(session_id),
             **kwargs,
         )
 
@@ -182,62 +184,31 @@ class bongo:
             )
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
-    # NOTE C1->prefix创建提示词前缀的方法,包含示例，工具列表，工作区摘要
     def build_prefix(self):
-        tool_lines = []
-        for name, tool in self.tools.items():
-            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
-            risk = "approval required" if tool["risky"] else "safe"
-            tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
-        tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
-            [
-                '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
-            ]
-        )
-        # prefix 可以理解成 agent 的"工作手册"：
-        # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
-        text = textwrap.dedent(  # ← 使用 textwrap.dedent 去除多行字符串的公共缩进
-            f"""\
-            You are bongo, a small local coding agent working inside a local repository.
+        # Prefix 只包含身份和行为规则。工具定义通过 API 的 tools 数组传递。
+        text = textwrap.dedent(
+            """\
+            You are bongo, an intelligent code learning assistant.
+
+            Your role:
+            - Help the user learn programming concepts, algorithms, and software engineering.
+            - Explain code, debug issues, and provide learning guidance.
+            - Read and analyze files from the workspace to answer questions.
 
             Rules:
-            - Use tools instead of guessing about the workspace.
-            - Return exactly one <tool>...</tool> or one <final>...</final>.
-            - Tool calls must look like:
-              <tool>{{"name":"tool_name","args":{{...}}}}</tool>
-            - For write_file and patch_file with multi-line text, prefer XML style:
-              <tool name="write_file" path="file.py"><content>...</content></tool>
-            - Final answers must look like:
-              <final>your answer</final>
+            - Use tools instead of guessing about file contents.
+            - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
+            - IMPORTANT: After reading, use write_file to write the modified content. Do not just keep reading.
+            - IMPORTANT: After write/patch, read the file once to verify, then output your final answer.
+            - When you have the final answer, output it directly without calling any tool.
             - Never invent tool results.
-            - Keep answers concise and concrete.
-            - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
-            - Before writing tests for existing code, read the implementation first.
-            - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
-            - New files should be complete and runnable, including obvious imports.
-            - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
-
-            Tools:
-            {tool_text}
-
-            Valid response examples:
-            {examples}
-
-            {self.workspace.text()}
-            """
+            - Do not repeat the same tool call with the same arguments if it did not help."""
         ).strip()
-        # 返回一个前缀
+
         return PromptPrefix(
             text=text,
             hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            workspace_fingerprint=self.workspace.fingerprint(),
+            workspace_fingerprint="",
             tool_signature=self.tool_signature(),
             built_at=now(),
         )
@@ -248,29 +219,13 @@ class bongo:
         self.prefix = prefix_state.text
 
     def refresh_prefix(self, force=False):
-        # 安全地获取哈希值
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
-        # 获取工作区指纹
-        previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
-
-        # 工作区事实相对稳定，所以这里按整体刷新；
-        # 只有这些事实真的变化了，才重建完整 prefix。
-        refreshed_workspace = WorkspaceContext.build(self.root)
-        refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
-        # 如果force为true，强制刷新前缀。或者指纹不同也刷新
-        workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
-        if workspace_changed:
-            # 刷新工作区
-            self.workspace = refreshed_workspace
-        # 决定是否需要重新构建前缀状态：如果工作区改变了、强制刷新、或者之前没有前缀状态（previous_hash 为 None），
-        # 则调用 build_prefix() 重新构建；否则直接使用现有的 prefix_state。
-        prefix_state = self.build_prefix() if workspace_changed or force or previous_hash is None else self.prefix_state
+        prefix_state = self.build_prefix() if force or previous_hash is None else self.prefix_state
         prefix_changed = force or previous_hash != prefix_state.hash
         if prefix_changed:
             self._apply_prefix_state(prefix_state)
-        # 记录本次刷新的结果，创建一个字典保存工作区是否改变和前缀是否改变的信息。
         self._last_prefix_refresh = {
-            "workspace_changed": workspace_changed,
+            "workspace_changed": False,
             "prefix_changed": prefix_changed,
         }
         return dict(self._last_prefix_refresh)
@@ -287,24 +242,101 @@ class bongo:
         recent_start = max(0, len(history) - 6)
         for index, item in enumerate(history):
             recent = index >= recent_start
-            if item["role"] == "tool" and item["name"] == "read_file" and not recent:
-                path = str(item["args"].get("path", ""))
-                if path in seen_reads:
-                    continue
-                seen_reads.add(path)
-
-            if item["role"] == "tool":
+            role = item.get("role", "")
+            if role == "tool":
+                name = item.get("name", "")
+                # 从 assistant 的 tool_use 块中提取 args（如果有）
+                args = item.get("args", {})
+                if not args and index > 0:
+                    prev = history[index - 1]
+                    if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+                        for block in prev["content"]:
+                            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == name:
+                                args = block.get("input", {})
+                                break
+                if name == "read_file" and not recent:
+                    path = str(args.get("path", ""))
+                    if path in seen_reads:
+                        continue
+                    seen_reads.add(path)
                 limit = 900 if recent else 180
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(clip(item["content"], limit))
+                lines.append(f"[tool:{name}] {json.dumps(args, sort_keys=True)}")
+                lines.append(clip(item.get("content", ""), limit))
             else:
                 limit = 900 if recent else 220
-                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                    tool_parts = [f"[call:{p.get('name', '')}]" for p in content if isinstance(p, dict) and p.get("type") == "tool_use"]
+                    content = " ".join(text_parts + tool_parts)
+                lines.append(f"[{role}] {clip(str(content), limit)}")
 
         return clip("\n".join(lines), MAX_HISTORY)
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
+
+    def compact_history(self):
+        """当历史过长时，用模型生成摘要替换旧历史。
+
+        借鉴 Claude Code 的 Autocompact 思想的简化版：
+        - 不 fork 子 Agent，直接用当前模型生成摘要
+        - 只替换旧历史，保留最近 COMPACT_KEEP_RECENT 条
+        - 摘要作为 system 消息插入，标记为压缩边界
+        """
+        history = self.session.get("history", [])
+        if len(history) <= COMPACT_THRESHOLD:
+            return False
+
+        keep_recent = COMPACT_KEEP_RECENT
+        old_entries = history[:-keep_recent]
+        recent_entries = history[-keep_recent:]
+
+        # 构建摘要提示词
+        summary_lines = []
+        for item in old_entries:
+            role = item.get("role", "")
+            if role == "tool":
+                name = item.get("name", "")
+                args = item.get("args", {})
+                summary_lines.append(
+                    f"[tool:{name}] {json.dumps(args, sort_keys=True)} -> "
+                    f"{len(str(item.get('content', '')))} chars"
+                )
+            else:
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                    content = " ".join(text_parts)[:200]
+                else:
+                    content = str(content)[:200]
+                summary_lines.append(f"[{role}] {content}")
+
+        compact_prompt = (
+            "Summarize the following conversation history in 300 words or less. "
+            "Focus on: what files were read/written, what tasks were attempted, "
+            "what errors occurred, and what the current state is.\n\n"
+            "History:\n" + "\n".join(summary_lines)
+        )
+
+        try:
+            summary = self.model_client.complete(compact_prompt, 512)
+            summary = str(summary).strip()
+            if not summary:
+                return False
+        except Exception:
+            return False
+
+        # 用摘要替换旧历史
+        compact_marker = {
+            "role": "system",
+            "content": f"[Conversation compacted. Summary of {len(old_entries)} earlier entries:]\n{summary}",
+            "created_at": now(),
+            "compacted": True,
+        }
+        self.session["history"] = [compact_marker] + recent_entries
+        self.session_store.save(self.session)
+        return True
 
     def prompt(self, user_message):
         prompt, _ = self._build_prompt_and_metadata(user_message)
@@ -380,29 +412,61 @@ class bongo:
     def _build_prompt_and_metadata(self, user_message):
         refresh = self.refresh_prefix()
         prompt, metadata = self.context_manager.build(user_message)
-        # 这里把"这轮 prompt 是怎么拼出来的"连同缓存相关状态一起记下来，
-        # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
             {
                 "prefix_chars": len(self.prefix),
-                "workspace_chars": len(self.workspace.text()),
                 "memory_chars": len(self.memory_text()),
                 "history_chars": len(self.history_text()),
                 "request_chars": len(user_message),
                 "tool_count": len(self.tools),
-                "workspace_docs": len(self.workspace.project_docs),
-                "recent_commits": len(self.workspace.recent_commits),
                 "prefix_hash": self.prefix_state.hash,
                 "prompt_cache_key": self.prefix_state.hash,
-                "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
                 "tool_signature": self.prefix_state.tool_signature,
-                "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
                 "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
             }
         )
         metadata.update(self.secret_env_summary())
         return prompt, metadata
+
+    def _build_structured_params(self, user_message):
+        """构建结构化 API 参数。
+
+        system: prefix（身份+规则，不含工具定义）
+        tools: API 原生工具定义数组
+        messages: 多轮结构化消息（context + history + request）
+        """
+        system = self.prefix
+        api_tools = convert_tools_to_api_schema(self.tools)
+
+        # 注入上下文（workspace + memory）到第一条消息
+        context_parts = []
+        if self.root:
+            context_parts.append(f"Workspace root: {self.root}\nAll file paths are relative to this directory. To read/write README.md in the workspace, use path='README.md'.")
+        memory_text = self.memory_text()
+        if memory_text and memory_text != "(no memory)":
+            context_parts.append(memory_text)
+        context = "\n".join(context_parts) if context_parts else ""
+
+        # 历史转为结构化消息
+        history = self.session.get("history", [])
+        history_messages = convert_history_to_messages(history)
+
+        # 如果有 context，prepend 到第一条历史消息（或创建新消息）
+        if context:
+            if history_messages and history_messages[0]["role"] == "user":
+                first = history_messages[0]
+                if isinstance(first["content"], list):
+                    first["content"].insert(0, {"type": "text", "text": context})
+                else:
+                    first["content"] = context + "\n\n" + str(first["content"])
+            else:
+                history_messages.insert(0, {"role": "user", "content": context})
+
+        # 追加当前请求
+        history_messages.append({"role": "user", "content": user_message})
+
+        return system, api_tools, history_messages
 
     # 这个方法是"运行轨迹记录器"，
     # 它的作用是将 bongo 智能体在执行任务过程中的每一个关键事件（如思考、工具调用、输出等）都记录下来，
@@ -438,24 +502,104 @@ class bongo:
             return
 
         canonical_path = self.memory.canonical_path(path)
-        # 不是所有工具结果都进入工作记忆。
-        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
         if name in {"read_file", "write_file", "patch_file"}:
             self.memory.remember_file(canonical_path)
+
+        # /ask 模式：更新 ask_mode 索引和已加载文档
+        ask_mode = self.session.get("memory", {}).get("ask_mode", {})
+        if ask_mode.get("mode"):
+            self._update_ask_mode_after_tool(name, args, result, canonical_path)
+        else:
+            # 非 /ask 模式：使用原有的 file_summaries
+            if name == "read_file":
+                summary = memorylib.summarize_read_result(result)
+                self.memory.set_file_summary(canonical_path, summary)
+            elif name in {"write_file", "patch_file"}:
+                self.memory.invalidate_file_summary(canonical_path)
+
+    def _update_ask_mode_after_tool(self, name, args, result, canonical_path):
+        """/ask 模式下工具执行后的 memory 更新。"""
+        path = args.get("path", "")
+        ask_mode = self.session["memory"].get("ask_mode", {})
+        index = ask_mode.get("index", [])
+
+        # 找到 index 中匹配的文档
+        doc_id = None
+        for entry in index:
+            entry_label = entry.get("label", "")
+            label_base = entry_label.split(" (")[0].split(" [")[0]
+            if label_base == path or path.endswith(label_base) or label_base.endswith(path):
+                doc_id = str(entry["id"])
+                break
+
         if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
-            self.memory.set_file_summary(canonical_path, summary)
-            self.session["relevant_notes"] = memorylib.append_note(
-                self.session.get("relevant_notes", []),
-                summary,
-                tags=(canonical_path,),
-                source=canonical_path,
-            )
+            if doc_id:
+                self.memory.load_document(doc_id, path, result)
+                self._fork_summary(doc_id, path)
         elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
+            if doc_id:
+                self._fork_summary(doc_id, path)
+
+    def _fork_summary(self, doc_id, path):
+        """fork 子线程生成文件摘要并更新 index。"""
+        import threading
+        def _summarize():
+            try:
+                full_path = self.root / path
+                if not full_path.exists():
+                    return
+                lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                content_lines = [l.strip() for l in lines if l.strip()]
+                if content_lines and content_lines[0].startswith("# "):
+                    content_lines = content_lines[1:]
+                summary = " | ".join(content_lines[:3])[:200] if content_lines else "(empty)"
+                self.memory.update_index_summary(doc_id, summary)
+                self.session_store.save(self.session)
+            except Exception:
+                pass
+        threading.Thread(target=_summarize, daemon=True).start()
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
+
+    def ask_direct(self, user_message):
+        """直接问答链路：不走工具循环，直接调用模型回答。
+
+        为什么存在：
+        对于纯问答、解释概念等不需要工具的场景，直接调用模型更快。
+        避免了 ReAct 循环的开销，响应更快。
+
+        输入 / 输出：
+        - 输入：`user_message`，用户的问题
+        - 输出：字符串形式的回答
+
+        在 agent 链路里的位置：
+        CLI 收到普通问题时调用此方法，而不是 ask()。
+        """
+        # 记录用户消息
+        self.record({"role": "user", "content": user_message, "created_at": now()})
+
+        # 构建 prompt（包含上下文）
+        prompt, _ = self._build_prompt_and_metadata(user_message)
+
+        # 直接调用模型
+        raw = self.model_client.complete(prompt, self.max_new_tokens)
+
+        # 解析回答
+        kind, payload = self.parse(raw)
+
+        # 如果模型返回了工具调用，回退到 ask() 链路
+        if kind == "tool":
+            self.session["history"].pop()
+            return self.ask(user_message)
+
+        # 提取最终答案
+        final = (payload or raw).strip()
+
+        # 记录助手回答
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+
+        return final
 
     def ask(self, user_message):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
@@ -520,6 +664,9 @@ class bongo:
             # 每个关键步骤都更新 current_action 并落盘，方便外部 --status 随时查看
             task_status.current_action = "building_prompt"
             self.run_store.write_task_status(task_status)
+            # 历史过长时自动压缩
+            if self.feature_enabled("context_reduction"):
+                self.compact_history()
             # 关键，每轮都重新构建提示词和元数据
             prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
@@ -548,12 +695,16 @@ class bongo:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
-            # 发起一次模型调用，获得回复raw
+            # 构建结构化参数，让模型原生理解 system/tools/messages
+            system, tools, messages = self._build_structured_params(user_message)
             raw = self.model_client.complete(
                 prompt,
                 self.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                system=system,
+                tools=tools,
+                messages=messages,
             )
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
@@ -579,21 +730,27 @@ class bongo:
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                tool_use_id = payload.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
                 task_status.record_tool(name)
                 task_status.current_action = f"executing_tool:{name}"
                 self.run_store.write_task_status(task_status)
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
                 task_status.current_action = f"tool_completed:{name}"
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
+                # 记录 assistant 的 tool_use 块
+                self.record({
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": args}],
+                    "created_at": now(),
+                })
+                # 记录 tool_result
+                self.record({
+                    "role": "tool",
+                    "tool_use_id": tool_use_id,
+                    "name": name,
+                    "content": result,
+                    "created_at": now(),
+                })
                 self.run_store.write_task_status(task_status)
                 self.emit_trace(
                     task_status,
@@ -727,10 +884,7 @@ class bongo:
         try:
             self.validate_tool(name, args)
         except Exception as exc:
-            example = self.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
-            if example:
-                message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -754,12 +908,16 @@ class bongo:
             }
             return f"error: approval denied for {name}"
         try:
-            result = clip(tool["run"](args))
+            raw_result = str(tool["run"](args))
+            tool_use_id = f"{name}_{hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]}"
+            result, cache_path = persist_large_output(raw_result, self.root, tool_use_id)
             self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": "ok",
                 "tool_error_code": "",
                 "security_event_type": "",
+                "persisted_to": cache_path or "",
+                "original_chars": len(raw_result),
             }
             return result
         except Exception as exc:
@@ -774,13 +932,24 @@ class bongo:
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 这里提前挡掉最简单的这种循环。
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        # 如果历史中工具调用少于2次，无法构成重复模式，直接返回 False（未检测到重复）。
+        history = self.session["history"]
+        tool_events = []
+        for i, item in enumerate(history):
+            if item.get("role") == "tool":
+                # 从前面的 assistant tool_use 块中获取 args
+                event_args = {}
+                if i > 0:
+                    prev = history[i - 1]
+                    if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+                        for block in prev["content"]:
+                            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == item.get("name"):
+                                event_args = block.get("input", {})
+                                break
+                tool_events.append({"name": item.get("name", ""), "args": event_args})
         if len(tool_events) < 2:
             return False
         recent = tool_events[-2:]
-        # 最新的俩次tool调用完全一样，检测到重复，返回true
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        return all(e["name"] == name and e["args"] == args for e in recent)
 
     @staticmethod
     def new_task_id():
@@ -818,10 +987,6 @@ class bongo:
             "model_call_count": task_status.attempts,
         }
 
-    # 获取指定工具的使用示例，用于提示词构建时展示工具用法。
-    def tool_example(self, name):
-        return toolkit.tool_example(name)
-
     def validate_tool(self, name, args):
         """把通用工具校验和 runtime 级额外约束串起来。"""
         toolkit.validate_tool(self, name, args)
@@ -857,63 +1022,46 @@ class bongo:
             return True
         if self.approval_policy == "never":
             return False
+        # 非危险工具自动通过
+        tool_spec = self.tools.get(name, {})
+        if not tool_spec.get("risky", False):
+            return True
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            display_args = {k: v for k, v in args.items() if k not in ("content", "old_text", "new_text")}
+            answer = input(f"approve {name} {json.dumps(display_args, ensure_ascii=True)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
 
     @staticmethod
     def parse(raw):
-        """把模型原始输出解析成 runtime 可执行的动作或最终答案。
+        """把模型输出解析成 runtime 可执行的动作或最终答案。
 
-        为什么存在：
-        模型输出首先是自然语言文本，而 runtime 需要的是结构化决策：
-        "这是工具调用"还是"这是最终答案"。如果没有这层解析，后面的工具校验、
-        审批和执行链路就没法可靠工作。
-
-        输入 / 输出：
-        - 输入：模型返回的原始文本 `raw`
-        - 输出：`(kind, payload)`，其中 `kind` 可能是 `tool`、`final`、`retry`
-
-        在 agent 链路里的位置：
-        它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
-        进入平台控制流的第一道结构化关口。
+        支持两种输入：
+        - dict：ModelClient 返回的结构化 tool_use/text 块（原生工具调用）
+        - str：纯文本（视为最终答案）
         """
-        raw = str(raw)
-        # 这里支持两种工具格式：
-        # 1. <tool>...</tool> 里包 JSON，适合简短调用
-        # 2. XML 风格属性/子标签，适合写文件这类多行内容
-        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
-            body = bongo.extract(raw, "tool")
-            try:
-                payload = json.loads(body)
-            except Exception:
-                return "retry", bongo.retry_notice("model returned malformed tool JSON")
-            if not isinstance(payload, dict):
-                return "retry", bongo.retry_notice("tool payload must be a JSON object")
-            if not str(payload.get("name", "")).strip():
-                return "retry", bongo.retry_notice("tool payload is missing a tool name")
-            args = payload.get("args", {})
-            if args is None:
-                payload["args"] = {}
-            elif not isinstance(args, dict):
-                return "retry", bongo.retry_notice()
-            return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
-            payload = bongo.parse_xml_tool(raw)
-            if payload is not None:
-                return "tool", payload
-            return "retry", bongo.retry_notice()
-        if "<final>" in raw:
-            final = bongo.extract(raw, "final").strip()
-            if final:
-                return "final", final
-            return "retry", bongo.retry_notice("model returned an empty <final> answer")
-        raw = raw.strip()
-        if raw:
-            return "final", raw
-        return "retry", bongo.retry_notice("model returned an empty response")
+        # 结构化响应（ModelClient 在有 tools 时返回 dict）
+        if isinstance(raw, dict):
+            if raw.get("type") == "tool_use":
+                name = raw.get("name", "")
+                args = raw.get("input", {})
+                if not name:
+                    return "retry", bongo.retry_notice("tool_use missing name")
+                if not isinstance(args, dict):
+                    args = {}
+                return "tool", {"name": name, "args": args, "id": raw.get("id", "")}
+            if raw.get("type") == "text":
+                text = raw.get("text", "").strip()
+                if text:
+                    return "final", text
+                return "retry", bongo.retry_notice("empty text response")
+        # 纯文本 = 最终回答
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text:
+                return "final", text
+        return "retry", bongo.retry_notice("empty response")
 
     @staticmethod
     def retry_notice(problem=None):
@@ -921,73 +1069,13 @@ class bongo:
         if problem:
             prefix += f": {problem}"
         else:
-            prefix += ": model returned malformed tool output"
-        return (
-            f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
-            'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
-        )
-
-    @staticmethod
-    def parse_xml_tool(raw):
-        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
-        if not match:
-            return None
-        attrs = bongo.parse_attrs(match.group("attrs"))
-        name = str(attrs.pop("name", "")).strip()
-        if not name:
-            return None
-
-        body = match.group("body")
-        args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
-            if f"<{key}>" in body:
-                args[key] = bongo.extract_raw(body, key)
-
-        body_text = body.strip("\n")
-        if name == "write_file" and "content" not in args and body_text:
-            args["content"] = body_text
-        if name == "delegate" and "task" not in args and body_text:
-            args["task"] = body_text.strip()
-        return {"name": name, "args": args}
-
-    @staticmethod
-    def parse_attrs(text):
-        attrs = {}
-        for match in re.finditer(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""", text):
-            attrs[match.group(1)] = match.group(2) if match.group(2) is not None else match.group(3)
-        return attrs
-
-    @staticmethod
-    def extract(text, tag):
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        start = text.find(start_tag)
-        if start == -1:
-            return text
-        start += len(start_tag)
-        end = text.find(end_tag, start)
-        if end == -1:
-            return text[start:].strip()
-        return text[start:end].strip()
-
-    @staticmethod
-    def extract_raw(text, tag):
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        start = text.find(start_tag)
-        if start == -1:
-            return text
-        start += len(start_tag)
-        end = text.find(end_tag, start)
-        if end == -1:
-            return text[start:]
-        return text[start:end]
+            prefix += ": model returned malformed output"
+        return f"{prefix}. Call a tool or output your final answer directly."
 
     def reset(self):
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
-        self.session["relevant_notes"] = []
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.session_store.save(self.session)
 

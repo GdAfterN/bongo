@@ -13,7 +13,7 @@ from .models import FakeModelClient
 from .runtime import bongo, SessionStore
 from .run_store import RunStore
 from .task_status import STOP_REASON_FINAL_ANSWER_RETURNED
-from .workspace import WorkspaceContext
+# WorkspaceContext removed - using work_dir instead
 
 # ... existing code ...
 BENCHMARK_SCHEMA_VERSION = 1  # 基准测试配置文件的版本号，用于确保代码与 JSON 格式兼容
@@ -53,33 +53,33 @@ TASK_FIXTURE_ARTIFACTS = {
 SCRIPTED_MODEL_OUTPUTS = {
     # 任务：修改 README 引言
     "readme_intro_locked": [
-        '<tool name="patch_file" path="README.md"><old_text>This is a placeholder benchmark fixture.</old_text><new_text>This fixture is a locked benchmark workspace.</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_001", "name": "patch_file", "input": {"path": "README.md", "old_text": "This is a placeholder benchmark fixture.", "new_text": "This fixture is a locked benchmark workspace."}},
+        "Done.",
     ],
     # 任务：修改 README 关于 schema 的说明
     "readme_schema_note": [
-        '<tool name="patch_file" path="README.md"><old_text>- Placeholder note about the repo.</old_text><new_text>- The benchmark schema and baseline are fixed.</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_002", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the repo.", "new_text": "- The benchmark schema and baseline are fixed."}},
+        "Done.",
     ],
     # 任务：修改 README 关于文件排序的说明
     "readme_ordering_note": [
-        '<tool name="patch_file" path="README.md"><old_text>- Placeholder note about the file layout.</old_text><new_text>- Deterministic file ordering keeps benchmark diffs stable.</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_003", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the file layout.", "new_text": "- Deterministic file ordering keeps benchmark diffs stable."}},
+        "Done.",
     ],
     # 任务：将 sample.txt 中的 beta 替换为 beta-locked
     "sample_beta_locked": [
-        '<tool name="patch_file" path="sample.txt"><old_text>beta</old_text><new_text>beta-locked</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_004", "name": "patch_file", "input": {"path": "sample.txt", "old_text": "beta", "new_text": "beta-locked"}},
+        "Done.",
     ],
     # 任务：将 sample.txt 中的 gamma 替换为 gamma-locked
     "sample_gamma_locked": [
-        '<tool name="patch_file" path="sample.txt"><old_text>gamma</old_text><new_text>gamma-locked</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_005", "name": "patch_file", "input": {"path": "sample.txt", "old_text": "gamma", "new_text": "gamma-locked"}},
+        "Done.",
     ],
     # 任务：将 sample.txt 中的 placeholder 替换为 delta
     "sample_placeholder_delta": [
-        '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>delta</new_text></tool>',
-        "<final>Done.</final>",
+        {"type": "tool_use", "id": "toolu_bench_006", "name": "patch_file", "input": {"path": "sample.txt", "old_text": "placeholder", "new_text": "delta"}},
+        "Done.",
     ],
 }
 # ... existing code ...
@@ -322,19 +322,15 @@ class BenchmarkEvaluator:
         fixture_copy_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(fixture_source, fixture_copy_root)
 
-        workspace = WorkspaceContext.build(
-            fixture_copy_root,
-            repo_root_override=fixture_copy_root,
-        )
         session_store = SessionStore(fixture_copy_root / ".bongo" / "sessions")
         run_store = RunStore(fixture_copy_root / ".bongo" / "runs")
         if self.model_client_factory is not None:
-            model_client = self.model_client_factory(task=task, workspace=workspace)
+            model_client = self.model_client_factory(task=task, work_dir=fixture_copy_root)
         else:
             model_client = FakeModelClient(_scripted_outputs_for_task(task))
         agent = bongo(
             model_client=model_client,
-            workspace=workspace,
+            work_dir=fixture_copy_root,
             session_store=session_store,
             run_store=run_store,
             approval_policy="auto",

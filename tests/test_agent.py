@@ -22,7 +22,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from bongo import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
+from bongo import FakeModelClient, MiniAgent, SessionStore
 from bongo.memory import append_note, retrieval_candidates
 
 
@@ -36,7 +36,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "path_security",
         "desc": "read_file 尝试 ../ 逃逸工作区",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"read_file","args":{"path":"../etc/passwd","start":1,"end":1}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t1", "name": "read_file", "input": {"path": "../etc/passwd", "start": 1, "end": 1}}, "done"],
         "check": lambda result: "path escapes workspace" in result,
     },
     {
@@ -44,7 +44,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "path_security",
         "desc": "search 尝试搜索工作区外路径",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"search","args":{"pattern":"secret","path":"../outside"}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t2", "name": "search", "input": {"pattern": "secret", "path": "../outside"}}, "done"],
         "check": lambda result: "path escapes workspace" in result,
     },
     {
@@ -52,7 +52,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "path_security",
         "desc": "write_file 尝试写到工作区外",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"write_file","args":{"path":"../evil.txt","content":"hacked"}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t3", "name": "write_file", "input": {"path": "../evil.txt", "content": "hacked"}}, "done"],
         "check": lambda result: "path escapes workspace" in result,
     },
     {
@@ -60,7 +60,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "read_file 不传 path 参数",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"read_file","args":{}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t4", "name": "read_file", "input": {}}, "done"],
         "check": lambda result: "invalid arguments" in result and "path" in result,
     },
     {
@@ -68,7 +68,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "write_file 不传 path 参数",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"write_file","args":{}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t5", "name": "write_file", "input": {}}, "done"],
         "check": lambda result: "invalid arguments" in result and "path" in result,
     },
     {
@@ -76,7 +76,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "run_shell 传空命令",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"run_shell","args":{"command":"","timeout":20}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t6", "name": "run_shell", "input": {"command": "", "timeout": 20}}, "done"],
         "check": lambda result: "command must not be empty" in result,
     },
     {
@@ -84,7 +84,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "run_shell 超时超过120秒",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"run_shell","args":{"command":"echo hi","timeout":999}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t7", "name": "run_shell", "input": {"command": "echo hi", "timeout": 999}}, "done"],
         "check": lambda result: "timeout must be in [1, 120]" in result,
     },
     {
@@ -92,7 +92,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "run_shell 超时为0",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"run_shell","args":{"command":"echo hi","timeout":0}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t8", "name": "run_shell", "input": {"command": "echo hi", "timeout": 0}}, "done"],
         "check": lambda result: "timeout must be in [1, 120]" in result,
     },
     {
@@ -100,7 +100,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "approval",
         "desc": "审批策略为 never 时拒绝高风险工具",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"run_shell","args":{"command":"echo hi","timeout":20}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t9", "name": "run_shell", "input": {"command": "echo hi", "timeout": 20}}, "done"],
         "check": lambda result: "approval denied" in result,
         "approval_policy": "never",
     },
@@ -109,7 +109,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "approval",
         "desc": "只读模式下拒绝写文件",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"write_file","args":{"path":"x.txt","content":"nope"}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t10", "name": "write_file", "input": {"path": "x.txt", "content": "nope"}}, "done"],
         "check": lambda result: "approval denied" in result,
         "read_only": True,
     },
@@ -118,7 +118,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "approval",
         "desc": "只读模式下拒绝 patch 文件",
         "setup": lambda d: None,
-        "outputs": ['<tool>{"name":"patch_file","args":{"path":"README.md","old_text":"demo","new_text":"bye"}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t11", "name": "patch_file", "input": {"path": "README.md", "old_text": "demo", "new_text": "bye"}}, "done"],
         "check": lambda result: "approval denied" in result,
         "read_only": True,
     },
@@ -127,7 +127,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "调用不存在的工具",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"nonexistent_tool","args":{"x":1}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t12", "name": "nonexistent_tool", "input": {"x": 1}}, "done"],
         "check": lambda result: "unknown tool" in result,
     },
     {
@@ -136,10 +136,10 @@ TOOL_SECURITY_SCENARIOS = [
         "desc": "连续两次相同参数调用同一工具",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
         "outputs": [
-            '<tool>{"name":"list_files","args":{}}</tool>',
-            '<tool>{"name":"list_files","args":{}}</tool>',
-            '<tool>{"name":"list_files","args":{}}</tool>',
-            "<final>done</final>",
+            {"type": "tool_use", "id": "toolu_t13a", "name": "list_files", "input": {}},
+            {"type": "tool_use", "id": "toolu_t13b", "name": "list_files", "input": {}},
+            {"type": "tool_use", "id": "toolu_t13c", "name": "list_files", "input": {}},
+            "done",
         ],
         "check": lambda result: "repeated identical tool call" in result,
     },
@@ -148,7 +148,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "patch_file 的 old_text 匹配多处",
         "setup": lambda d: (d / "sample.txt").write_text("dup\ndup\n"),
-        "outputs": ['<tool>{"name":"patch_file","args":{"path":"sample.txt","old_text":"dup","new_text":"replaced"}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t14", "name": "patch_file", "input": {"path": "sample.txt", "old_text": "dup", "new_text": "replaced"}}, "done"],
         "check": lambda result: "occur exactly once" in result,
     },
     {
@@ -156,7 +156,7 @@ TOOL_SECURITY_SCENARIOS = [
         "category": "param_validation",
         "desc": "delegate 传空 task",
         "setup": lambda d: (d / "README.md").write_text("ok\n"),
-        "outputs": ['<tool>{"name":"delegate","args":{"task":"","max_steps":2}}</tool>', "<final>done</final>"],
+        "outputs": [{"type": "tool_use", "id": "toolu_t15", "name": "delegate", "input": {"task": "", "max_steps": 2}}, "done"],
         "check": lambda result: "task must not be empty" in result,
     },
 ]
@@ -173,11 +173,10 @@ class AgentTestSuite:
     @staticmethod
     def _build_agent(tmp_path, outputs, approval_policy="auto", read_only=False):
         (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
-        workspace = WorkspaceContext.build(tmp_path)
         store = SessionStore(tmp_path / ".bongo" / "sessions")
         return MiniAgent(
             model_client=FakeModelClient(outputs),
-            workspace=workspace,
+            work_dir=tmp_path,
             session_store=store,
             approval_policy=approval_policy,
             read_only=read_only,
@@ -316,9 +315,9 @@ class AgentTestSuite:
                         (tmp_path / "README.md").write_text("demo\n")
                         (tmp_path / task["file"]).write_text(task["fact"] + "\n")
                         agent = self._build_agent(tmp_path, [
-                            f'<tool>{{"name":"read_file","args":{{"path":"{task["file"]}","start":1,"end":20}}}}</tool>',
-                            "<final>Done.</final>",
-                            f"<final>{task['fact'].capitalize()}.</final>",
+                            {"type": "tool_use", "id": "toolu_m1", "name": "read_file", "input": {"path": task["file"], "start": 1, "end": 20}},
+                            "Done.",
+                            f"{task['fact'].capitalize()}.",
                         ])
                         agent.ask(f"Read {task['file']} and remember the fact.")
 
@@ -348,123 +347,6 @@ class AgentTestSuite:
     # ──────────────────────────────────────
     # 4. Workspace 漂移检测
     # ──────────────────────────────────────
-    def run_drift(self):
-        from bongo.workspace import WorkspaceContext
-
-        def _git(cwd, *args):
-            subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
-
-        def _init_git(d):
-            _git(d, "init")
-            _git(d, "config", "user.email", "t@t")
-            _git(d, "config", "user.name", "t")
-
-        scenarios = [
-            {
-                "id": "readme_changed",
-                "desc": "README 内容被修改",
-                "setup": lambda d: None,
-                "drift": lambda d: (d / "README.md").write_text("changed\n"),
-            },
-            {
-                "id": "new_untracked",
-                "desc": "新未跟踪文件出现",
-                "setup": lambda d: [_init_git(d), (d / "README.md").write_text("init\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: (d / "new.py").write_text("new\n"),
-            },
-            {
-                "id": "tracked_modified",
-                "desc": "已跟踪文件被修改",
-                "setup": lambda d: [_init_git(d), (d / "app.py").write_text("v1\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: (d / "app.py").write_text("v2\n"),
-            },
-            {
-                "id": "new_commit",
-                "desc": "新提交出现",
-                "setup": lambda d: [_init_git(d), (d / "README.md").write_text("init\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: [(d / "README.md").write_text("updated\n"), _git(d, "add", "."), _git(d, "commit", "-m", "update")],
-            },
-            {
-                "id": "file_deleted",
-                "desc": "文件被删除",
-                "setup": lambda d: [_init_git(d), (d / "temp.txt").write_text("temp\n"), _git(d, "add", "."), _git(d, "commit", "-m", "add")],
-                "drift": lambda d: (d / "temp.txt").unlink(),
-            },
-            {
-                "id": "pyproject_changed",
-                "desc": "pyproject.toml 被修改",
-                "setup": lambda d: (d / "pyproject.toml").write_text('[project]\nname = "v1"\n'),
-                "drift": lambda d: (d / "pyproject.toml").write_text('[project]\nname = "v2"\n'),
-            },
-            {
-                "id": "multi_files",
-                "desc": "多个文件同时变动",
-                "setup": lambda d: [_init_git(d), (d / "a.py").write_text("a1\n"), (d / "b.py").write_text("b1\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: [(d / "a.py").write_text("a2\n"), (d / "b.py").write_text("b2\n")],
-            },
-            {
-                "id": "agents_md_created",
-                "desc": "AGENTS.md 被创建",
-                "setup": lambda d: None,
-                "drift": lambda d: (d / "AGENTS.md").write_text("rules\n"),
-            },
-            {
-                "id": "package_json_changed",
-                "desc": "package.json 被修改",
-                "setup": lambda d: (d / "package.json").write_text('{"name":"v1"}\n'),
-                "drift": lambda d: (d / "package.json").write_text('{"name":"v2"}\n'),
-            },
-            {
-                "id": "file_renamed",
-                "desc": "文件被重命名",
-                "setup": lambda d: [_init_git(d), (d / "old.py").write_text("x\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: (d / "old.py").rename(d / "new.py"),
-            },
-            {
-                "id": "file_appended",
-                "desc": "文件被追加内容",
-                "setup": lambda d: [_init_git(d), (d / "log.txt").write_text("line1\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: open(d / "log.txt", "a").write("line2\n"),
-            },
-            {
-                "id": "no_change",
-                "desc": "无变化时不重建（反向测试）",
-                "setup": lambda d: [_init_git(d), (d / "README.md").write_text("stable\n"), _git(d, "add", "."), _git(d, "commit", "-m", "init")],
-                "drift": lambda d: None,
-            },
-        ]
-
-        rows = []
-        for s in scenarios:
-            detected = False
-            try:
-                with tempfile.TemporaryDirectory(prefix="bongo-drift-") as tmp:
-                    tmp_path = Path(tmp)
-                    (tmp_path / "README.md").write_text("demo\n")
-                    s["setup"](tmp_path)
-                    agent = self._build_agent(tmp_path, [])
-                    agent.refresh_prefix()
-                    old_hash = agent.prefix_state.hash
-
-                    s["drift"](tmp_path)
-                    result = agent.refresh_prefix()
-
-                    if s["id"] == "no_change":
-                        detected = not result["workspace_changed"]
-                    else:
-                        detected = result["workspace_changed"] and result["prefix_changed"]
-            except Exception:
-                pass
-
-            rows.append({
-                "id": s["id"],
-                "desc": s["desc"],
-                "detected": detected,
-            })
-
-        self.results["drift"] = rows
-        return rows
-
     # ──────────────────────────────────────
     # 全部跑完 + 打印表格
     # ──────────────────────────────────────
@@ -486,25 +368,17 @@ class AgentTestSuite:
         print(f"\n  Summary: memory_on={summary['memory_on_total']} repeated reads, "
               f"memory_off={summary['memory_off_total']} repeated reads")
 
-        print("\nRunning workspace drift tests...")
-        self.run_drift()
-        self._print_table("Workspace Drift", self.results["drift"],
-                          ["id", "desc", "detected"])
-
         # 总览
         print("\n" + "=" * 50)
         sec_total = len(self.results["tool_security"])
         sec_passed = sum(1 for r in self.results["tool_security"] if r["passed"])
         ctx_total = len(self.results["context"])
-        drt_total = len(self.results["drift"])
-        drt_passed = sum(1 for r in self.results["drift"] if r["detected"])
         mem_on = summary["memory_on_total"]
         mem_off = summary["memory_off_total"]
 
         print(f"Tool Security:       {sec_passed}/{sec_total} passed")
         print(f"Context Compression: {ctx_total} configs tested")
         print(f"Memory Dependency:   {mem_on} vs {mem_off} repeated reads (on vs off)")
-        print(f"Workspace Drift:     {drt_passed}/{drt_total} detected")
 
         self.save_results()
 
@@ -574,13 +448,6 @@ class AgentTestSuite:
             parts.append(f"- memory_on_total: {s['memory_on_total']} repeated reads\n")
             parts.append(f"- memory_off_total: {s['memory_off_total']} repeated reads\n")
 
-        if "drift" in self.results:
-            parts.append(self._to_markdown(
-                "Workspace Drift",
-                self.results["drift"],
-                ["id", "desc", "detected"],
-            ))
-
         # 总览
         summary_lines = ["## Summary\n"]
         if "tool_security" in self.results:
@@ -592,10 +459,6 @@ class AgentTestSuite:
         if "memory" in self.results:
             s = self.results["memory"]["summary"]
             summary_lines.append(f"- Memory Dependency: {s['memory_on_total']} vs {s['memory_off_total']} repeated reads (on vs off)")
-        if "drift" in self.results:
-            drt = self.results["drift"]
-            detected = sum(1 for r in drt if r["detected"])
-            summary_lines.append(f"- Workspace Drift: {detected}/{len(drt)} detected")
         parts.append("\n".join(summary_lines) + "\n")
 
         content = "\n".join(parts)
@@ -633,12 +496,6 @@ def test_memory_dependency():
     assert summary["memory_on_total"] <= summary["memory_off_total"]
 
 
-def test_workspace_drift():
-    rows = AgentTestSuite().run_drift()
-    for r in rows:
-        assert r["detected"], f"[FAIL] {r['id']}: {r['desc']}"
-
-
 def test_save_report():
     t = AgentTestSuite()
     t.run_all()
@@ -648,5 +505,4 @@ def test_save_report():
     assert "Tool Security" in content
     assert "Context Compression" in content
     assert "Memory Dependency" in content
-    assert "Workspace Drift" in content
     assert "Summary" in content

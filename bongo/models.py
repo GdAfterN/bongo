@@ -5,22 +5,154 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 这些差异都在这里被抹平成统一的 complete() 接口。
 """
 
+import hashlib
 import json
+import re
 import time
 from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
 
+# ── 结构化 API 辅助函数 ──────────────────────────────────────
+
+def convert_tools_to_api_schema(tools):
+    """将 bongo 的工具定义转换为 API 兼容的 JSON Schema 格式。"""
+    api_tools = []
+    for name, tool in tools.items():
+        properties = {}
+        required = []
+        param_descs = tool.get("param_descriptions", {})
+        for param_name, param_type in tool.get("schema", {}).items():
+            prop = _parse_param_type(param_name, param_type)
+            if param_name in param_descs:
+                prop["description"] = param_descs[param_name]
+            properties[param_name] = prop
+            if prop.pop("_required", False):
+                required.append(param_name)
+        api_tools.append({
+            "name": name,
+            "description": tool.get("description", ""),
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                **({"required": required} if required else {}),
+            },
+        })
+    return api_tools
+
+
+def _parse_param_type(param_name, type_str):
+    """解析 'str', 'int=1', \"str='.'\" 等类型字符串为 JSON Schema 属性。"""
+    type_str = str(type_str).strip()
+    has_default = "=" in type_str
+    parts = type_str.split("=", 1)
+    base_type = parts[0].strip().lower()
+    default = None
+    if has_default and len(parts) > 1:
+        raw = parts[1].strip().strip("'\"")
+        if base_type == "int":
+            try:
+                default = int(raw)
+            except ValueError:
+                default = raw
+        elif base_type == "float":
+            try:
+                default = float(raw)
+            except ValueError:
+                default = raw
+        else:
+            default = raw
+
+    type_map = {"str": "string", "string": "string", "int": "integer", "float": "number", "bool": "boolean"}
+    json_type = type_map.get(base_type, "string")
+    prop = {"type": json_type}
+    if default is not None:
+        prop["default"] = default
+    if not has_default:
+        prop["_required"] = True
+    return prop
+
+
+def convert_history_to_messages(history):
+    """将 bongo 的 history 转换为 user/assistant 交替的消息格式。
+
+    history 格式：assistant content 为 list（含 tool_use 块），tool 有 tool_use_id
+    """
+    messages = []
+    pending_tool_results = []
+
+    for item in history:
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        if role == "tool":
+            # 新格式：直接有 tool_use_id
+            tool_use_id = item.get("tool_use_id", "")
+            if not tool_use_id:
+                # 旧格式兼容：从 name+args 生成 id
+                tool_name = item.get("name", "")
+                tool_args = item.get("args", {})
+                tool_use_id = f"toolu_{hashlib.sha256(json.dumps({'name': tool_name, 'args': tool_args}, sort_keys=True).encode()).hexdigest()[:12]}"
+            pending_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": str(content)[:4000],
+            })
+            continue
+
+        if pending_tool_results:
+            messages.append({"role": "user", "content": pending_tool_results})
+            pending_tool_results = []
+
+        if role in ("user", "system"):
+            text = str(content)
+            if messages and messages[-1]["role"] == "user":
+                prev = messages[-1]
+                if isinstance(prev["content"], list):
+                    prev["content"].append({"type": "text", "text": text})
+                else:
+                    prev["content"] = str(prev["content"]) + "\n" + text
+            else:
+                messages.append({"role": "user", "content": text})
+        elif role == "assistant":
+            if isinstance(content, list):
+                # 新格式：已经是结构化 list，直接透传
+                messages.append({"role": "assistant", "content": content})
+            else:
+                # 旧格式兼容：纯文本
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": str(content)}]})
+
+    if pending_tool_results:
+        if messages and messages[-1]["role"] == "user":
+            prev = messages[-1]
+            if isinstance(prev["content"], list):
+                prev["content"].extend(pending_tool_results)
+            else:
+                messages.append({"role": "user", "content": pending_tool_results})
+        else:
+            messages.append({"role": "user", "content": pending_tool_results})
+
+    return messages
+
+
 class FakeModelClient:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.prompts = []
+        self.structured_calls = []  # 记录结构化调用参数
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         self.prompts.append(prompt)
+        # 记录结构化参数（如果有）
+        if any(k in kwargs for k in ("system", "tools", "messages")):
+            self.structured_calls.append({
+                "system": kwargs.get("system"),
+                "tools": kwargs.get("tools"),
+                "messages": kwargs.get("messages"),
+            })
         if not getattr(self, "last_completion_metadata", None):
             self.last_completion_metadata = {}
         if not self.outputs:
@@ -39,9 +171,87 @@ class OllamaModelClient:
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
-        # Ollama 当前不支持我们这里接入的 prompt cache 语义，
-        # 所以 runtime 传下来的缓存参数会被忽略。
         self.last_completion_metadata = {}
+        system = kwargs.get("system")
+        tools = kwargs.get("tools")
+        messages = kwargs.get("messages")
+
+        # 优先使用结构化 /api/chat，回退到 /api/generate
+        if messages:
+            return self._complete_chat(system, tools, messages, max_new_tokens)
+        # 无结构化数据时拼接为单条 prompt
+        if system:
+            prompt = f"{system}\n\n{prompt}"
+        return self._complete_generate(prompt, max_new_tokens)
+
+    def _complete_chat(self, system, tools, messages, max_new_tokens):
+        ollama_messages = []
+        if system:
+            ollama_messages.append({"role": "system", "content": system})
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                tool_results = [p for p in content if isinstance(p, dict) and p.get("type") == "tool_result"]
+                if tool_results:
+                    for tr in tool_results:
+                        ollama_messages.append({
+                            "role": "tool",
+                            "content": str(tr.get("content", ""))[:4000],
+                        })
+                elif text_parts:
+                    ollama_messages.append({"role": role, "content": "\n".join(text_parts)})
+            else:
+                ollama_messages.append({"role": role, "content": str(content)})
+
+        payload = {
+            "model": self.model,
+            "messages": ollama_messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_predict": max_new_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+            },
+        }
+        if tools:
+            ollama_tools = []
+            for t in tools:
+                ollama_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {}),
+                    },
+                })
+            payload["tools"] = ollama_tools
+
+        request = urllib.request.Request(
+            self.host + "/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        data = self._do_request(request)
+        message = data.get("message", {})
+        # 优先检查 tool_calls（原生工具调用）
+        if tools:
+            tool_calls = message.get("tool_calls", [])
+            if tool_calls:
+                tc = tool_calls[0]
+                func = tc.get("function", {})
+                return {
+                    "type": "tool_use",
+                    "id": f"toolu_{hashlib.sha256(json.dumps(func, sort_keys=True).encode()).hexdigest()[:12]}",
+                    "name": func.get("name", ""),
+                    "input": func.get("arguments", {}),
+                }
+        return message.get("content", data.get("response", ""))
+
+    def _complete_generate(self, prompt, max_new_tokens):
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -60,9 +270,13 @@ class OllamaModelClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        data = self._do_request(request)
+        return data.get("response", "")
+
+    def _do_request(self, request):
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
@@ -73,10 +287,6 @@ class OllamaModelClient:
                 f"Host: {self.host}\n"
                 f"Model: {self.model}"
             ) from exc
-
-        if data.get("error"):
-            raise RuntimeError(f"Ollama error: {data['error']}")
-        return data.get("response", "")
 
 
 def _normalize_versioned_base_url(base_url):
@@ -111,6 +321,46 @@ def _extract_openai_text(data):
                         return text
 
     return ""
+
+
+def _extract_openai_tool_call(data):
+    """从 OpenAI 响应中提取 tool_call，返回统一格式 dict 或 None。"""
+    # Responses API: output items with type "tool_call"
+    for item in data.get("output", []):
+        if isinstance(item, dict) and item.get("type") == "tool_call":
+            args = item.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            return {
+                "type": "tool_use",
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "input": args,
+            }
+    # Chat Completions API: choices[0].message.tool_calls
+    choices = data.get("choices", [])
+    if choices:
+        message = choices[0].get("message", {})
+        tool_calls = message.get("tool_calls", [])
+        if tool_calls:
+            tc = tool_calls[0]
+            func = tc.get("function", {})
+            args = func.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            return {
+                "type": "tool_use",
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "input": args,
+            }
+    return None
 
 
 def _extract_openai_text_from_sse(body_text):
@@ -233,37 +483,22 @@ class OpenAICompatibleModelClient:
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
-
-        为什么存在：
-        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
-        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
-        细节都包起来，对上层暴露统一的 `complete()` 行为。
-
-        输入 / 输出：
-        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
-
-        在 agent 链路里的位置：
-        它位于 `bongo.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
-        落到 provider API 的地方。
-        """
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, **kwargs):
         self.last_completion_metadata = {}
+        system = kwargs.get("system")
+        tools = kwargs.get("tools")
+        messages = kwargs.get("messages")
+
+        if messages:
+            input_messages = self._build_structured_input(system, tools, messages)
+        else:
+            if system:
+                prompt = f"{system}\n\n{prompt}"
+            input_messages = [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]
+
         payload = {
             "model": self.model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        }
-                    ],
-                }
-            ],
+            "input": input_messages,
             "max_output_tokens": max_new_tokens,
             "stream": False,
         }
@@ -315,14 +550,17 @@ class OpenAICompatibleModelClient:
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             if isinstance(response_data, dict) and response_data:
-                # 这些元数据会一路传回 runtime，进入 trace 和 report，
-                # 用来观察 prompt cache 是否真的命中。
                 self.last_completion_metadata = {
                     "prompt_cache_supported": self.supports_prompt_cache,
                     "prompt_cache_key": prompt_cache_key,
                     "prompt_cache_retention": prompt_cache_retention,
                     **_extract_usage_cache_details(response_data),
                 }
+                # 优先检查 tool_calls
+                if tools:
+                    tc = _extract_openai_tool_call(response_data)
+                    if tc:
+                        return tc
             if text:
                 return text
             raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
@@ -341,13 +579,75 @@ class OpenAICompatibleModelClient:
             "prompt_cache_retention": prompt_cache_retention,
             **_extract_usage_cache_details(data),
         }
+        # 优先检查 tool_calls
+        if tools:
+            tc = _extract_openai_tool_call(data)
+            if tc:
+                return tc
         return _extract_openai_text(data)
 
+    def _build_structured_input(self, system, tools, messages):
+        """将 system/tools/messages 转换为 OpenAI Responses API 的 input 格式。"""
+        input_messages = []
+        if system:
+            input_messages.append({"role": "system", "content": system})
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                openai_content = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "text":
+                        openai_content.append({"type": "input_text", "text": part.get("text", "")})
+                    elif ptype == "tool_use":
+                        openai_content.append({
+                            "type": "tool_call",
+                            "call_id": part.get("id", ""),
+                            "name": part.get("name", ""),
+                            "arguments": json.dumps(part.get("input", {}), ensure_ascii=False),
+                        })
+                    elif ptype == "tool_result":
+                        openai_content.append({
+                            "type": "tool_result",
+                            "call_id": part.get("tool_use_id", ""),
+                            "output": str(part.get("content", ""))[:4000],
+                        })
+                    elif ptype == "input_text":
+                        openai_content.append(part)
+                if openai_content:
+                    input_messages.append({"role": role, "content": openai_content})
+            else:
+                mapped_role = "system" if role == "system" else role
+                input_messages.append({"role": mapped_role, "content": [{"type": "input_text", "text": str(content)}]})
+        return input_messages
 
-def _extract_anthropic_text(data):
+
+def _extract_anthropic_response(data, has_tools=False):
+    """从 Anthropic 响应中提取结果。
+
+    has_tools=True 时优先返回 tool_use 块（dict），否则返回文本（str）。
+    """
+    if has_tools:
+        for item in data.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                return {
+                    "type": "tool_use",
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "input": item.get("input", {}),
+                }
     for item in data.get("content", []):
         if isinstance(item, dict) and item.get("type") == "text":
             text = item.get("text")
+            if isinstance(text, str) and text:
+                return text
+    # Some models (e.g. mimo) may return only thinking content without text.
+    for item in data.get("content", []):
+        if isinstance(item, dict) and item.get("type") == "thinking":
+            text = item.get("thinking")
             if isinstance(text, str) and text:
                 return text
     return ""
@@ -363,27 +663,30 @@ class AnthropicCompatibleModelClient:
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        # 为了保持统一接口，runtime 仍然会传缓存参数进来；
-        # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, **kwargs):
         del prompt_cache_key, prompt_cache_retention
         self.last_completion_metadata = {}
+        system = kwargs.get("system")
+        tools = kwargs.get("tools")
+        messages = kwargs.get("messages")
+
+        if messages:
+            api_messages = self._build_anthropic_messages(messages)
+        else:
+            if system:
+                prompt = f"{system}\n\n{prompt}"
+            api_messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
         payload = {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        }
-                    ],
-                }
-            ],
+            "messages": api_messages,
             "max_tokens": max_new_tokens,
             "stream": False,
         }
+        if system and messages:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = tools
         if self.temperature is not None:
             payload["temperature"] = self.temperature
 
@@ -429,7 +732,47 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
-        text = _extract_anthropic_text(data)
-        if text:
-            return text
-        raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+        result = _extract_anthropic_response(data, has_tools=bool(tools))
+        if result:
+            return result
+        content_summary = [
+            f"type={item.get('type')},len={len(item.get('text', '') or item.get('thinking', ''))}"
+            for item in data.get("content", [])
+        ]
+        raise RuntimeError(
+            f"Anthropic-compatible error: could not extract text from response. "
+            f"content=[{', '.join(content_summary)}], stop_reason={data.get('stop_reason')}"
+        )
+
+    def _build_anthropic_messages(self, messages):
+        """将通用消息格式转换为 Anthropic Messages API 格式。"""
+        api_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                api_content = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "text":
+                        api_content.append({"type": "text", "text": part.get("text", "")})
+                    elif ptype == "tool_use":
+                        api_content.append({
+                            "type": "tool_use",
+                            "id": part.get("id", ""),
+                            "name": part.get("name", ""),
+                            "input": part.get("input", {}),
+                        })
+                    elif ptype == "tool_result":
+                        api_content.append({
+                            "type": "tool_result",
+                            "tool_use_id": part.get("tool_use_id", ""),
+                            "content": str(part.get("content", ""))[:4000],
+                        })
+                if api_content:
+                    api_messages.append({"role": role, "content": api_content})
+            else:
+                api_messages.append({"role": role, "content": str(content)})
+        return api_messages

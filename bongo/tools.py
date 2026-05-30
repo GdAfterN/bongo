@@ -9,48 +9,66 @@ import subprocess
 import textwrap
 from functools import partial
 
-from .workspace import IGNORED_PATH_NAMES, clip
+from .utils import IGNORED_PATH_NAMES, clip
 # 定义 Agent 可用的基础工具规格说明。这些信息会被拼接进 System Prompt，告诉大模型有哪些工具可用、参数是什么以及是否危险。
 BASE_TOOL_SPECS = {
     "list_files": {
-        # 定义工具的参数 schema：path 是字符串类型，默认值为 '.'（当前目录）
         "schema": {"path": "str='.'"},
-        "risky": False,  # 标记该工具是否危险（False 表示安全，执行前不需要用户手动确认）
-        "description": "List files in the workspace.",  # 工具的简短描述，帮助模型理解何时使用该工具
+        "param_descriptions": {"path": "Directory path relative to workspace root, defaults to '.'"},
+        "risky": False,
+        "description": "List files in the workspace.",
     },
     "read_file": {
-        # 定义参数：path(文件路径), start(起始行，默认1), end(结束行，默认200)
         "schema": {"path": "str", "start": "int=1", "end": "int=200"},
-        "risky": False,  # 读取文件是安全的
+        "param_descriptions": {"path": "File path relative to workspace root", "start": "Starting line number (1-based)", "end": "Ending line number (inclusive)"},
+        "risky": False,
         "description": "Read a UTF-8 file by line range.",
     },
     "search": {
-        # 定义参数：pattern(搜索模式/关键词), path(搜索路径，默认为 '.')
         "schema": {"pattern": "str", "path": "str='.'"},
-        "risky": False,  # 搜索操作是安全的
+        "param_descriptions": {"pattern": "Regex or literal search pattern", "path": "Directory to search in, defaults to '.'"},
+        "risky": False,
         "description": "Search the workspace with rg or a simple fallback.",
     },
     "run_shell": {
-        # 定义参数：command(要执行的 shell 命令), timeout(超时时间，默认20秒)
         "schema": {"command": "str", "timeout": "int=20"},
-        "risky": True,  # ⚠️ 标记为危险！执行任意 shell 命令可能导致删库或安全问题，通常需要审批
+        "param_descriptions": {"command": "Shell command to execute", "timeout": "Timeout in seconds (1-120)"},
+        "risky": True,
         "description": "Run a shell command in the repo root.",
     },
     "write_file": {
-        # 定义参数：path(文件路径), content(要写入的文件内容)
         "schema": {"path": "str", "content": "str"},
-        "risky": True,  # ⚠️ 标记为危险！写入文件会修改磁盘数据
-        "description": "Write a text file.",
+        "param_descriptions": {"path": "File path relative to workspace root", "content": "Complete file content to write"},
+        "risky": True,
+        "description": "Write a text file. Creates or overwrites the file.",
     },
     "patch_file": {
-        # 定义参数：path(文件路径), old_text(要被替换的旧文本), new_text(替换后的新文本)
         "schema": {"path": "str", "old_text": "str", "new_text": "str"},
-        "risky": True,  # ⚠️ 标记为危险！修改文件内容
+        "param_descriptions": {"path": "File path relative to workspace root", "old_text": "Exact text to find (must occur exactly once)", "new_text": "Replacement text"},
+        "risky": True,
         "description": "Replace one exact text block in a file.",
+    },
+    "search_mistakes": {
+        "schema": {"query": "str", "limit": "int=3"},
+        "param_descriptions": {"query": "Keywords to search in mistake index", "limit": "Max results to return"},
+        "risky": False,
+        "description": "Search mistake index by keywords. Returns matching mistakes with score and summary.",
+    },
+    "get_mistake_detail": {
+        "schema": {"title": "str"},
+        "param_descriptions": {"title": "Title or partial title of the mistake"},
+        "risky": False,
+        "description": "Get full detail of a mistake by its title. Returns question, answer, feedback, etc.",
+    },
+    "read_notes": {
+        "schema": {"limit": "int=10"},
+        "param_descriptions": {"limit": "Max number of recent notes to return"},
+        "risky": False,
+        "description": "Read recent learning notes from the user's notes file.",
     },
 }
 
-# 定义“委托”工具的规格。允许主 Agent 把任务分派给一个受限的子 Agent 去执行。
+# 定义"委托"工具的规格。允许主 Agent 把任务分派给一个受限的子 Agent 去执行。
 DELEGATE_TOOL_SPEC = {
     # 定义参数：task(子任务描述), max_steps(子 Agent 最大执行步数，限制其能力范围)
     "schema": {"task": "str", "max_steps": "int=3"},
@@ -58,24 +76,6 @@ DELEGATE_TOOL_SPEC = {
     "description": "Ask a bounded read-only child agent to investigate.",
 }
 
-# 提供给大模型的少样本学习（Few-Shot）示例。
-# 这些示例会直接展示在 Prompt 中，教模型如何正确地构造工具调用的 XML/JSON 格式。
-TOOL_EXAMPLES = {
-    # 展示 list_files 的标准 JSON 调用格式
-    "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-    # 展示 read_file 带参数的调用格式
-    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-    # 展示 search 工具的调用格式
-    "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
-    # 展示 run_shell 的调用格式，包含复杂的命令行参数
-    "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-    # 展示 write_file 的 XML 风格调用格式（适合多行代码内容，避免 JSON 转义问题）
-    "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-    # 展示 patch_file 的 XML 风格调用格式，清晰对比 old_text 和 new_text
-    "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-    # 展示 delegate 工具的调用格式
-    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
-}
 
 def build_tool_registry(agent):
     # 工具不是动态发现的，而是显式注册的。
@@ -92,9 +92,6 @@ def build_tool_registry(agent):
         tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, agent)}
     return tools
 
-
-def tool_example(name):
-    return TOOL_EXAMPLES.get(name, "")
 
 
 def validate_tool(agent, name, args):
@@ -163,6 +160,21 @@ def validate_tool(agent, name, args):
             raise ValueError("task must not be empty")
         return
 
+    if name == "search_mistakes":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        return
+
+    if name == "get_mistake_detail":
+        title = str(args.get("title", "")).strip()
+        if not title:
+            raise ValueError("title must not be empty")
+        return
+
+    if name == "read_notes":
+        return
+
 # 工具的具体实现
 def tool_list_files(agent, args):
     path = agent.path(args.get("path", "."))
@@ -205,6 +217,8 @@ def tool_search(agent, args):
             cwd=agent.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -235,6 +249,8 @@ def tool_run_shell(agent, args):
         shell=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
@@ -299,11 +315,81 @@ def tool_delegate(agent, args):
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
     )
-    # 委派的目标是“调查”，不是“放权执行”。
-    # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
     child.session["memory"]["task"] = task
     child.session["memory"]["notes"] = [clip(agent.history_text(), 300)]
     return "delegate_result:\n" + child.ask(task)
+
+
+def tool_search_mistakes(agent, args):
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    limit = int(args.get("limit", 3))
+
+    from .profile import UserProfile, load_current_user
+    from .memory import search_mistakes, load_mistakes_index
+
+    username = load_current_user()
+    profile = UserProfile(username)
+    index = profile.get_mistakes_index()
+    state = {"mistakes_index": index}
+    results = search_mistakes(state, query, limit=limit)
+
+    if not results:
+        return "未找到相关错题。"
+    lines = [f"找到 {len(results)} 条相关错题："]
+    for r in results:
+        lines.append(f"- [{r['timestamp']}] 得分:{r['score']} | 来源:{r['source']} | {r['summary']}")
+    return "\n".join(lines)
+
+
+def tool_get_mistake_detail(agent, args):
+    title = str(args.get("title", "")).strip()
+    if not title:
+        raise ValueError("title must not be empty")
+
+    from .profile import UserProfile, load_current_user
+
+    username = load_current_user()
+    profile = UserProfile(username)
+    mistakes = profile.get_mistakes_from_file(limit=100)
+
+    for m in mistakes:
+        if m.get("title") == title or title in m.get("title", ""):
+            lines = [
+                f"题目：{m.get('question', '')}",
+                f"你的回答：{m.get('user_answer', '')}",
+                f"得分：{m.get('score', 0)}",
+                f"反馈：{m.get('feedback', '')}",
+            ]
+            if m.get("correct_answer"):
+                lines.append(f"正确答案：{m['correct_answer']}")
+            if m.get("source"):
+                lines.append(f"来源：{m['source']}")
+            return "\n".join(lines)
+    return f"未找到标题包含 '{title}' 的错题。"
+
+
+def tool_read_notes(agent, args):
+    limit = int(args.get("limit", 10))
+
+    from .profile import UserProfile, load_current_user
+
+    username = load_current_user()
+    profile = UserProfile(username)
+    notes = profile.get_notes(limit=limit)
+
+    if not notes:
+        return "暂无笔记。"
+    lines = [f"最近 {len(notes)} 条笔记："]
+    for n in notes:
+        ts = n.get("timestamp", "")[:10]
+        fp = f" [{n['file_path']}]" if n.get("file_path") else ""
+        lines.append(f"- {ts} {n.get('title', '')}{fp}")
+        content = n.get("content", "")
+        if content:
+            lines.append(f"  {content[:200]}")
+    return "\n".join(lines)
 
 
 _TOOL_RUNNERS = {
@@ -313,4 +399,7 @@ _TOOL_RUNNERS = {
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "search_mistakes": tool_search_mistakes,
+    "get_mistake_detail": tool_get_mistake_detail,
+    "read_notes": tool_read_notes,
 }

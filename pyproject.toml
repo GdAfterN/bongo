@@ -7,10 +7,11 @@ name = "bongo"
 version = "0.1.0"
 description = "Small local coding agent for Ollama and OpenAI-compatible models"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["mcp"]
 
 [project.scripts]
 bongo = "bongo.cli:main"
+bongo-mcp = "bongo.mcp_server:main"
 
 [dependency-groups]
 dev = [
