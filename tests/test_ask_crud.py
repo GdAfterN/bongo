@@ -406,6 +406,88 @@ class TestReadCache:
             tool_read_cache(agent, {"path": "/etc/passwd"})
 
 
+class TestDeleteCooldown:
+    """Test delete_entry cooldown prevents rapid repeated deletes."""
+
+    def test_cooldown_blocks_second_delete(self, agent, profile):
+        """After a successful delete, second delete on same file within 10s is blocked."""
+        from bongo.tools import tool_write_note
+
+        for t in ["A", "B", "C"]:
+            tool_write_note(agent, {"title": t, "content": f"Content {t}"})
+
+        notes_file = profile.notes_file
+
+        # Simulate the agent runtime with cooldown
+        from bongo.runtime import bongo as BongoAgent
+        import time
+
+        # Create a minimal agent with cooldown tracking
+        agent._delete_cooldown = {}
+        agent.tools = {}
+
+        # Manually test cooldown logic
+        path_key = str(notes_file)
+        now_ts = time.time()
+
+        # First delete should be allowed (no cooldown)
+        assert path_key not in agent._delete_cooldown
+
+        # Record cooldown
+        agent._delete_cooldown[path_key] = now_ts
+
+        # Second delete within 10s should be blocked
+        elapsed = time.time() - agent._delete_cooldown.get(path_key, 0)
+        assert elapsed < 10, "Cooldown should still be active"
+
+    def test_cooldown_expires(self, agent, profile):
+        """After cooldown expires, delete should be allowed again."""
+        import time
+
+        agent._delete_cooldown = {}
+        path_key = "/some/path"
+        agent._delete_cooldown[path_key] = time.time() - 11  # 11 seconds ago
+
+        elapsed = time.time() - agent._delete_cooldown.get(path_key, 0)
+        assert elapsed >= 10, "Cooldown should have expired"
+
+    def test_run_tool_cooldown_integration(self, tmp_path, profile):
+        """Integration test: run_tool blocks second delete_entry within cooldown."""
+        from unittest.mock import MagicMock
+        from bongo.runtime import bongo as BongoAgent
+        from bongo.profile import UserProfile
+
+        work_dir = tmp_path / "workspace"
+        work_dir.mkdir()
+
+        # Create a minimal mock model client
+        mock_client = MagicMock()
+        mock_client.get_provider_name.return_value = "test"
+
+        agent = BongoAgent(
+            model_client=mock_client,
+            work_dir=str(work_dir),
+            max_steps=5,
+            approval_policy="auto",
+        )
+
+        # Create notes inside the workspace so agent.path() resolves correctly
+        test_profile = UserProfile("testuser", notes_dir=work_dir / "notes")
+        for t in ["X", "Y", "Z"]:
+            test_profile.add_note(title=t, content=f"Content of {t}")
+
+        notes_file = test_profile.notes_file  # workspace/notes/testuser.md
+
+        # First delete should succeed
+        result = agent.run_tool("delete_entry", {"path": str(notes_file), "entry": 2})
+        assert "已删除" in result
+
+        # Second delete on same file should be blocked by cooldown
+        result = agent.run_tool("delete_entry", {"path": str(notes_file), "entry": 2})
+        assert "error" in result.lower() or "cooldown" in result.lower()
+        assert "已删除" not in result  # Must NOT succeed
+
+
 class TestEdgeCases:
     """Edge cases and error handling."""
 

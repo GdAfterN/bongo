@@ -144,6 +144,7 @@ class bongo:
         self.last_completion_metadata = {}
         self._last_tool_result_metadata = {}
         self._last_react_steps = []
+        self._delete_cooldown = {}  # path -> last delete timestamp
 
     @classmethod
     def from_session(cls, model_client, session_store, session_id, **kwargs):
@@ -200,10 +201,10 @@ class bongo:
 
             Rules:
             - Use tools instead of guessing about file contents.
+            - *** CRITICAL: After delete_entry succeeds (result starts with '已删除'), your next message MUST be the final answer to the user. Do NOT call any more tools. Do NOT read the file. Do NOT delete again. The deletion is already complete. ***
             - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
             - IMPORTANT: After reading, use write_file to write the modified content. Do not just keep reading.
             - IMPORTANT: After write/patch, read the file once to verify, then output your final answer.
-            - IMPORTANT: After delete_entry succeeds (returns '已删除'), output your final answer immediately. Do NOT verify by reading the file. Do NOT delete again.
             - IMPORTANT: To delete a file, use the delete_file tool. Do NOT use run_shell with rm/del.
             - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
             - IMPORTANT: To read a specific entry from a notes/mistakes file by list number, use read_entry(path, entry).
@@ -900,6 +901,18 @@ class bongo:
                 "security_event_type": "",
             }
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+        # delete_entry cooldown: block rapid repeated deletes on the same file
+        if name == "delete_entry":
+            path_key = str(args.get("path", ""))
+            now_ts = time.time()
+            last_delete = self._delete_cooldown.get(path_key, 0)
+            if now_ts - last_delete < 10:
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "tool_error_code": "delete_cooldown",
+                    "security_event_type": "",
+                }
+                return "error: delete_entry cooldown — you already deleted from this file. Output your final answer now. Do NOT delete again."
         if tool["risky"] and not self.approve(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -911,6 +924,9 @@ class bongo:
             raw_result = str(tool["run"](args))
             tool_use_id = f"{name}_{hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]}"
             result, cache_path = persist_large_output(raw_result, tool_use_id)
+            # Record delete cooldown on success
+            if name == "delete_entry" and result.startswith("已删除"):
+                self._delete_cooldown[str(args.get("path", ""))] = time.time()
             self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": "ok",
