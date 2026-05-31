@@ -204,8 +204,9 @@ class bongo:
             - Use tools instead of guessing about file contents.
             - *** CRITICAL: After delete_entry succeeds (result starts with '已删除'), your next message MUST be the final answer to the user. Do NOT call any more tools. Do NOT read the file. Do NOT delete again. The deletion is already complete. ***
             - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
-            - IMPORTANT: After reading, use write_file to write the modified content. Do not just keep reading.
-            - IMPORTANT: After write/patch, read the file once to verify, then output your final answer.
+            - IMPORTANT: After patch_file succeeds (result contains 'patched'), output your final answer immediately. Do NOT read the file to verify. Trust the tool result.
+            - IMPORTANT: After write_file succeeds, output your final answer. Do NOT read the file back unless the user explicitly asks to see it.
+            - IMPORTANT: When the user asks you to modify a file (add, change, delete text), confirm the change was made and stop. Do NOT output the full file content unless the user asks to see it.
             - IMPORTANT: To delete a file, use the delete_file tool. Do NOT use run_shell with rm/del.
             - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
             - IMPORTANT: To read a specific entry from a notes/mistakes file by list number, use read_entry(path, entry).

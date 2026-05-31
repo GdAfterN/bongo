@@ -559,7 +559,17 @@ def tool_read_entry(agent, args):
         return f"条目编号 {entry_num} 超出范围，索引共 {len(entries)} 条。"
 
     target = entries[entry_num - 1]
-    raw = UserProfile._read_entry_at(path, target["offset"], target["length"])
+    try:
+        raw = UserProfile._read_entry_at(path, target["offset"], target["length"])
+    except (UnicodeDecodeError, ValueError):
+        # 索引 offset 可能因 patch_file 等操作失效，降级为全文解析
+        import re as _re
+        content = path.read_text(encoding="utf-8", errors="replace")
+        sections = _re.split(r'\n(?=## )', content)
+        real_entries = [s for s in sections if s.strip().startswith("## ")]
+        if entry_num > len(real_entries):
+            return f"条目编号 {entry_num} 超出范围，共 {len(real_entries)} 条。"
+        raw = real_entries[entry_num - 1]
     header = f"# Entry {entry_num}/{len(entries)} from {path.name}"
     return f"{header}\n{raw}"
 
