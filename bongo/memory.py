@@ -50,13 +50,18 @@ def default_ask_mode_state():
 
 
 def populate_index(state, items, workspace_root=None):
-    """用文件列表填充 index。items 为 dict 列表，需含 id 和 label，可选 summary。"""
+    """用文件列表填充 index。items 为 dict 列表，需含 label，可选 summary/offset/length/file_path。"""
     ask = state.setdefault("ask_mode", default_ask_mode_state())
     ask["index"] = []
     for i, item in enumerate(items, 1):
         entry = {"id": i, "label": str(item.get("label", ""))}
         if item.get("summary"):
             entry["summary"] = clip(str(item["summary"]).strip(), 200)
+        if item.get("file_path"):
+            entry["file_path"] = str(item["file_path"])
+        if item.get("offset") is not None:
+            entry["offset"] = int(item["offset"])
+            entry["length"] = int(item["length"])
         ask["index"].append(entry)
     return state
 
@@ -77,6 +82,17 @@ def load_document(state, doc_id, path, content, workspace_root=None):
         "loaded_at": now(),
     }
     return state
+
+
+def load_document_by_offset(state, doc_id, file_path, offset, length, workspace_root=None):
+    """用 offset/length 从文件中 seek 读取单条文档，加载到 loaded。"""
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            content = f.read(length).decode("utf-8")
+    except (OSError, ValueError):
+        return state
+    return load_document(state, doc_id, file_path, content, workspace_root)
 
 
 def unload_document(state, doc_id):
@@ -124,6 +140,10 @@ def render_ask_memory(state, workspace_root=None):
 
     index = ask.get("index", [])
     if index:
+        # 检测文件路径（所有条目通常指向同一个文件）
+        file_path = index[0].get("file_path", "") if index else ""
+        if file_path:
+            lines.append(f"Source file: {file_path}")
         lines.append(f"Document index ({len(index)} items):")
         for entry in index:
             summary = f" - {entry['summary']}" if entry.get("summary") else ""
@@ -376,10 +396,12 @@ def invalidate_file_summary(state, path, workspace_root=None):
     state["file_summaries"].pop(path, None)
     return state
 
-# 从读取文件的原始结果中提取前三行信息
-def summarize_read_result(result, limit=180):
-    # 我们不会把完整文件内容塞进记忆层，
-    # 这里只保留足够提醒下一轮"刚刚读到了什么"的短摘要。
+# 从读取文件的原始结果中生成摘要（用模型压缩）
+def summarize_read_result(result, model_client=None, limit=180):
+    if model_client:
+        from . import compressor
+        return compressor.compress_document(str(result), model_client)
+    # 降级：无模型时取前 3 行
     lines = [line.strip() for line in str(result).splitlines() if line.strip()]
     if not lines:
         return "(empty)"
@@ -534,6 +556,10 @@ class LayeredMemory:
 
     def load_document(self, doc_id, path, content):
         self.state = load_document(self.state, doc_id, path, content, self.workspace_root)
+        return self
+
+    def load_document_by_offset(self, doc_id, file_path, offset, length):
+        self.state = load_document_by_offset(self.state, doc_id, file_path, offset, length, self.workspace_root)
         return self
 
     def update_index_summary(self, doc_id, new_summary):

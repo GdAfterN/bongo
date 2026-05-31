@@ -130,26 +130,9 @@ bongo config --show
 /user new <name>      # 创建新用户并切换
 ```
 
-### 模型层级路由
-
-根据任务难度自动选择模型，简单任务用轻量模型，复杂任务用强力模型。
-
-```bash
-/model                # 显示当前模型和层级状态
-/model 1              # 锁定到 Tier 1（简单任务模型）
-/model 2              # 锁定到 Tier 2（中等任务模型）
-/model 3              # 锁定到 Tier 3（复杂任务模型）
-/model unlock         # 解锁，恢复自动路由
-```
-
-任务分类规则：
-- **写任务**：< 200 行 → L1，200-500 行 → L2，> 500 行 → L3
-- **读任务**：< 500 行 → L1，500-1000 行 → L2，> 1000 行 → L3
-- **无行数**：读任务默认 L1，写任务默认 L2
-
 ## 工具
 
-bongo 提供 9 个工具，模型只能调用白名单中的工具：
+bongo 提供 14 个工具，模型只能调用白名单中的工具：
 
 | 工具 | 参数 | 危险 | 说明 |
 |---|---|---|---|
@@ -159,10 +142,14 @@ bongo 提供 9 个工具，模型只能调用白名单中的工具：
 | `run_shell` | `command, timeout=20` | 是 | 执行 shell 命令 |
 | `write_file` | `path, content` | 是 | 写文件 |
 | `patch_file` | `path, old_text, new_text` | 是 | 精确文本替换（old_text 必须恰好出现一次） |
+| `delete_file` | `path` | 是 | 删除文件 |
 | `delegate` | `task, max_steps=3` | 否 | 启动只读子 agent 做调查 |
 | `search_mistakes` | `query, limit=3` | 否 | 搜索错题索引 |
 | `get_mistake_detail` | `title` | 否 | 获取错题详情 |
 | `read_notes` | `limit=10` | 否 | 读取最近学习笔记 |
+| `write_note` | `title, content, file_path=''` | 否 | 保存学习笔记到 ~/.bongo/notes/ |
+| `read_entry` | `path, entry` | 否 | 按编号读取笔记/错题条目（O(1) 索引定位） |
+| `delete_entry` | `path, entry` | 是 | 按编号删除笔记/错题条目，自动重建索引 |
 
 所有文件类工具的路径被锚定在 workspace root 下，`../` 逃逸会被直接拦截。
 
@@ -191,7 +178,6 @@ bongo 提供 9 个工具，模型只能调用白名单中的工具：
 | `/errors` | 显示错误历史 |
 | `/progress` | 显示学习进度 |
 | `/user` | 用户管理 |
-| `/model` | 模型层级管理 |
 | `/memory` | 查看 agent 工作记忆 |
 | `/session` | 查看会话文件路径 |
 | `/reset` | 清空当前会话 |
@@ -304,7 +290,6 @@ bongo/
 ├── memory.py            # 结构化记忆（工作集、文件摘要、ask_mode 渐进式披露）
 ├── models.py            # 模型后端适配（Ollama / OpenAI / Anthropic / Fake）
 ├── profile.py           # 用户画像（技能、错题、笔记、信任路径）
-├── tier_manager.py      # 任务难度分类与多模型层级路由
 ├── mcp_server.py        # MCP server，供 Claude Code 调用
 ├── config.py            # 持久化用户配置（~/.bongo/config.json）
 ├── utils.py             # 工具函数

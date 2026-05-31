@@ -48,6 +48,12 @@ BASE_TOOL_SPECS = {
         "risky": True,
         "description": "Replace one exact text block in a file.",
     },
+    "delete_file": {
+        "schema": {"path": "str"},
+        "param_descriptions": {"path": "File path relative to workspace root"},
+        "risky": True,
+        "description": "Delete a file from the workspace.",
+    },
     "search_mistakes": {
         "schema": {"query": "str", "limit": "int=3"},
         "param_descriptions": {"query": "Keywords to search in mistake index", "limit": "Max results to return"},
@@ -65,6 +71,24 @@ BASE_TOOL_SPECS = {
         "param_descriptions": {"limit": "Max number of recent notes to return"},
         "risky": False,
         "description": "Read recent learning notes from the user's notes file.",
+    },
+    "write_note": {
+        "schema": {"title": "str", "content": "str", "file_path": "str=''"},
+        "param_descriptions": {"title": "Note title", "content": "Note content in markdown", "file_path": "Optional related file path to associate with this note"},
+        "risky": False,
+        "description": "Save a learning note to the user's notes file (~/.bongo/notes/). Use this instead of write_file when creating notes.",
+    },
+    "read_entry": {
+        "schema": {"path": "str", "entry": "int"},
+        "param_descriptions": {"path": "File path relative to workspace root", "entry": "1-based entry number from the document index"},
+        "risky": False,
+        "description": "Read a specific entry by number from a notes or mistakes file. Uses the index for O(1) lookup.",
+    },
+    "delete_entry": {
+        "schema": {"path": "str", "entry": "int"},
+        "param_descriptions": {"path": "File path relative to workspace root", "entry": "1-based entry number from the document index"},
+        "risky": True,
+        "description": "Delete a specific entry by number from a notes or mistakes file. Rebuilds the index after deletion.",
     },
 }
 
@@ -154,6 +178,14 @@ def validate_tool(agent, name, args):
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
 
+    if name == "delete_file":
+        path = agent.path(args["path"])
+        if not path.exists():
+            raise ValueError("path does not exist")
+        if path.is_dir():
+            raise ValueError("path is a directory, cannot delete")
+        return
+
     if name == "delegate":
         task = str(args.get("task", "")).strip()
         if not task:
@@ -173,6 +205,33 @@ def validate_tool(agent, name, args):
         return
 
     if name == "read_notes":
+        return
+
+    if name == "write_note":
+        title = str(args.get("title", "")).strip()
+        if not title:
+            raise ValueError("title must not be empty")
+        content = str(args.get("content", "")).strip()
+        if not content:
+            raise ValueError("content must not be empty")
+        return
+
+    if name == "read_entry":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        entry = int(args.get("entry", 0))
+        if entry < 1:
+            raise ValueError("entry must be >= 1")
+        return
+
+    if name == "delete_entry":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        entry = int(args.get("entry", 0))
+        if entry < 1:
+            raise ValueError("entry must be >= 1")
         return
 
 # 工具的具体实现
@@ -292,6 +351,17 @@ def tool_patch_file(agent, args):
     return f"patched {path.relative_to(agent.root)}"
 
 
+def tool_delete_file(agent, args):
+    path = agent.path(args["path"])
+    if not path.exists():
+        raise ValueError("path does not exist")
+    if path.is_dir():
+        raise ValueError("path is a directory, cannot delete")
+    rel = path.relative_to(agent.root)
+    path.unlink()
+    return f"deleted {rel}"
+
+
 def tool_delegate(agent, args):
     if agent.depth >= agent.max_depth:
         raise ValueError("delegate depth exceeded")
@@ -303,7 +373,7 @@ def tool_delegate(agent, args):
 
     child = bongo(
         model_client=agent.model_client,
-        workspace=agent.workspace,
+        work_dir=agent.root,
         session_store=agent.session_store,
         run_store=agent.run_store,
         approval_policy="never",
@@ -392,6 +462,165 @@ def tool_read_notes(agent, args):
     return "\n".join(lines)
 
 
+def tool_write_note(agent, args):
+    title = str(args.get("title", "")).strip()
+    if not title:
+        raise ValueError("title must not be empty")
+    content = str(args.get("content", "")).strip()
+    if not content:
+        raise ValueError("content must not be empty")
+    file_path = str(args.get("file_path", "")).strip() or None
+
+    from .profile import UserProfile, load_current_user
+
+    username = load_current_user()
+    profile = UserProfile(username)
+    result = profile.add_note(content=content, file_path=file_path, title=title)
+    return f"已保存笔记：{result.get('title', title)}"
+
+
+def tool_read_entry(agent, args):
+    path = agent.path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    entry_num = int(args.get("entry", 0))
+    if entry_num < 1:
+        raise ValueError("entry must be >= 1")
+
+    from .profile import UserProfile
+
+    # 根据文件名推断索引文件位置
+    parent = path.parent
+    stem = path.stem
+    # 索引文件 = 同目录下 {stem}_index.md
+    index_path = parent / f"{stem}_index.md"
+    if not index_path.exists():
+        # 尝试 UserProfile 生成的默认索引路径
+        username = stem
+        profile = UserProfile(username)
+        if path.resolve() == profile.notes_file.resolve():
+            index_path = profile.notes_index_file
+        elif path.resolve() == profile.mistakes_file.resolve():
+            index_path = profile.index_file
+        else:
+            return f"未找到 {path.name} 对应的索引文件。"
+
+    if not index_path.exists():
+        return f"索引文件 {index_path.name} 不存在。"
+
+    # 解析索引获取 offset/length
+    index_text = index_path.read_text(encoding="utf-8")
+    entries = []
+    for line in index_text.split("\n"):
+        if not line.startswith("- "):
+            continue
+        try:
+            body = line[2:]
+            parts = body.split(" | ")
+            offset = None
+            length = None
+            label = parts[0].strip() if parts else ""
+            for p in parts:
+                p = p.strip()
+                if p.startswith("offset:"):
+                    rest = p[7:]
+                    if ", len:" in rest:
+                        o, l = rest.split(", len:", 1)
+                        offset = int(o)
+                        length = int(l)
+            if offset is not None:
+                entries.append({"label": label, "offset": offset, "length": length})
+        except (ValueError, IndexError):
+            continue
+
+    if not entries:
+        return "索引中没有可读取的条目。"
+    if entry_num > len(entries):
+        return f"条目编号 {entry_num} 超出范围，索引共 {len(entries)} 条。"
+
+    target = entries[entry_num - 1]
+    raw = UserProfile._read_entry_at(path, target["offset"], target["length"])
+    header = f"# Entry {entry_num}/{len(entries)} from {path.name}"
+    return f"{header}\n{raw}"
+
+
+def tool_delete_entry(agent, args):
+    path = agent.path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    entry_num = int(args.get("entry", 0))
+    if entry_num < 1:
+        raise ValueError("entry must be >= 1")
+
+    from .profile import UserProfile
+
+    # 查找索引文件
+    parent = path.parent
+    stem = path.stem
+    index_path = parent / f"{stem}_index.md"
+    if not index_path.exists():
+        username = stem
+        profile = UserProfile(username)
+        if path.resolve() == profile.notes_file.resolve():
+            index_path = profile.notes_index_file
+        elif path.resolve() == profile.mistakes_file.resolve():
+            index_path = profile.index_file
+        else:
+            return f"未找到 {path.name} 对应的索引文件。"
+
+    if not index_path.exists():
+        return f"索引文件 {index_path.name} 不存在。"
+
+    # 解析索引
+    index_text = index_path.read_text(encoding="utf-8")
+    entries = []
+    for line in index_text.split("\n"):
+        if not line.startswith("- "):
+            continue
+        try:
+            body = line[2:]
+            parts = body.split(" | ")
+            offset = None
+            length = None
+            label = parts[0].strip() if parts else ""
+            for p in parts:
+                p = p.strip()
+                if p.startswith("offset:"):
+                    rest = p[7:]
+                    if ", len:" in rest:
+                        o, l = rest.split(", len:", 1)
+                        offset = int(o)
+                        length = int(l)
+            if offset is not None:
+                entries.append({"label": label, "offset": offset, "length": length})
+        except (ValueError, IndexError):
+            continue
+
+    if not entries:
+        return "索引中没有可删除的条目。"
+    if entry_num > len(entries):
+        return f"条目编号 {entry_num} 超出范围，索引共 {len(entries)} 条。"
+
+    target = entries[entry_num - 1]
+    raw_bytes = path.read_bytes()
+    entry_bytes = raw_bytes[target["offset"]:target["offset"] + target["length"]]
+
+    # 删除该条目：offset 之前 + (offset+length) 之后
+    new_content = raw_bytes[:target["offset"]] + raw_bytes[target["offset"] + target["length"]:]
+    path.write_bytes(new_content)
+
+    # 重建索引
+    username = path.stem
+    profile = UserProfile(username)
+    if path.resolve() == profile.notes_file.resolve():
+        profile._rebuild_notes_index()
+    elif path.resolve() == profile.mistakes_file.resolve():
+        profile._rebuild_mistakes_index()
+
+    label = target["label"][:50]
+    return f"已删除第 {entry_num} 条：{label}（剩余 {len(entries) - 1} 条）"
+
+
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
@@ -399,7 +628,11 @@ _TOOL_RUNNERS = {
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "delete_file": tool_delete_file,
     "search_mistakes": tool_search_mistakes,
     "get_mistake_detail": tool_get_mistake_detail,
     "read_notes": tool_read_notes,
+    "write_note": tool_write_note,
+    "read_entry": tool_read_entry,
+    "delete_entry": tool_delete_entry,
 }

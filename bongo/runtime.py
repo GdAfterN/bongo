@@ -99,12 +99,8 @@ class bongo:
         shell_env_allowlist=None,
         secret_env_names=None,
         feature_flags=None,
-        tier_manager=None,
     ):
         self.model_client = model_client
-        self.tier_manager = tier_manager
-        self.locked_model = None
-        self._original_model_client = model_client
         self.work_dir = Path(work_dir or ".").resolve()
         self.root = self.work_dir
         self.approval_policy = approval_policy
@@ -186,8 +182,10 @@ class bongo:
 
     def build_prefix(self):
         # Prefix 只包含身份和行为规则。工具定义通过 API 的 tools 数组传递。
+        import platform
+        os_name = platform.system()
         text = textwrap.dedent(
-            """\
+            f"""\
             You are bongo, an intelligent code learning assistant.
 
             Your role:
@@ -195,11 +193,18 @@ class bongo:
             - Explain code, debug issues, and provide learning guidance.
             - Read and analyze files from the workspace to answer questions.
 
+            Environment:
+            - OS: {os_name}
+
             Rules:
             - Use tools instead of guessing about file contents.
             - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
             - IMPORTANT: After reading, use write_file to write the modified content. Do not just keep reading.
             - IMPORTANT: After write/patch, read the file once to verify, then output your final answer.
+            - IMPORTANT: To delete a file, use the delete_file tool. Do NOT use run_shell with rm/del.
+            - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
+            - IMPORTANT: To read a specific entry from a notes/mistakes file by list number, use read_entry(path, entry).
+            - IMPORTANT: To delete a specific entry by list number, use delete_entry(path, entry). Do NOT use patch_file for this.
             - When you have the final answer, output it directly without calling any tool.
             - Never invent tool results.
             - Do not repeat the same tool call with the same arguments if it did not help."""
@@ -512,7 +517,7 @@ class bongo:
         else:
             # 非 /ask 模式：使用原有的 file_summaries
             if name == "read_file":
-                summary = memorylib.summarize_read_result(result)
+                summary = memorylib.summarize_read_result(result, model_client=self.model_client)
                 self.memory.set_file_summary(canonical_path, summary)
             elif name in {"write_file", "patch_file"}:
                 self.memory.invalidate_file_summary(canonical_path)
@@ -541,18 +546,17 @@ class bongo:
                 self._fork_summary(doc_id, path)
 
     def _fork_summary(self, doc_id, path):
-        """fork 子线程生成文件摘要并更新 index。"""
+        """fork 子线程用模型生成文件摘要并更新 index。"""
         import threading
+        from . import compressor
+
         def _summarize():
             try:
                 full_path = self.root / path
                 if not full_path.exists():
                     return
-                lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                content_lines = [l.strip() for l in lines if l.strip()]
-                if content_lines and content_lines[0].startswith("# "):
-                    content_lines = content_lines[1:]
-                summary = " | ".join(content_lines[:3])[:200] if content_lines else "(empty)"
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+                summary = compressor.compress_document(content, self.model_client)
                 self.memory.update_index_summary(doc_id, summary)
                 self.session_store.save(self.session)
             except Exception:
@@ -623,14 +627,6 @@ class bongo:
         """
         run_started_at = time.monotonic()  # 返回单调时间,便于计算所用时间
 
-        # ── 多层级模型路由 ──
-        # 根据任务难度选择模型，如果用户锁定了模型则使用锁定的
-        task_level = 1
-        fallback_attempted = False
-        if self.tier_manager is not None:
-            selected_model, task_level = self.tier_manager.select_model(user_message, self.locked_model)
-            self.model_client = selected_model
-
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
         task_status = TaskStatus.create(
@@ -649,6 +645,7 @@ class bongo:
 
         tool_steps = 0  # 执行了多少次工具调用
         attempts = 0  # 尝试次数
+        react_round = 0  # ReAct 循环轮次（用于显示）
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)  # 这是为了容忍一定次数的模型错误,同时设置合理上限:
 
         # 这是 agent 的主循环，可以按"感知 -> 决策 -> 行动 -> 记录"来理解：
@@ -659,6 +656,8 @@ class bongo:
         # 然后进入下一轮，直到停机条件满足
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
+            react_round += 1
+            print(f"\n  [Round {react_round}] Thinking...")
             task_status.record_attempt()
             prompt_started_at = time.monotonic()
             # 每个关键步骤都更新 current_action 并落盘，方便外部 --status 随时查看
@@ -730,12 +729,16 @@ class bongo:
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                args_preview = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:3])
+                print(f"  [Round {react_round}] Acting: {name}({args_preview})")
                 tool_use_id = payload.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
                 task_status.record_tool(name)
                 task_status.current_action = f"executing_tool:{name}"
                 self.run_store.write_task_status(task_status)
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
+                result_preview = result[:80].replace("\n", " ") if result else "(empty)"
+                print(f"  [Round {react_round}] Observing: {result_preview}")
                 task_status.current_action = f"tool_completed:{name}"
                 # 记录 assistant 的 tool_use 块
                 self.record({
@@ -771,6 +774,7 @@ class bongo:
                 continue
 
             final = (payload or raw).strip()
+            print(f"  [Round {react_round}] Done")
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_status.current_action = "final_answer"
             task_status.finish_success(final)
@@ -797,29 +801,6 @@ class bongo:
             task_status.current_action = "stopped:step_limit"
             task_status.stop_step_limit(final)
 
-        # ── 二级任务回退逻辑 ──
-        # 如果是二级任务且使用了 tier1 模型但失败了，回退到 tier2 模型重试
-        if (
-            task_level == 2
-            and not fallback_attempted
-            and self.tier_manager is not None
-            and self.locked_model is None
-        ):
-            tier2_model = self.tier_manager.get_model(2)
-            if tier2_model is not self.model_client:
-                self.emit_trace(
-                    task_status,
-                    "tier_fallback",
-                    {
-                        "from_level": 1,
-                        "to_level": 2,
-                        "reason": task_status.stop_reason,
-                    },
-                )
-                # 恢复原始模型客户端，让递归调用重新选择
-                self.model_client = self._original_model_client
-                return self._ask_with_fallback(user_message, task_level=2)
-
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.run_store.write_task_status(task_status)
         self.emit_trace(
@@ -834,20 +815,6 @@ class bongo:
         )
         self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
         return final
-
-    def _ask_with_fallback(self, user_message, task_level):
-        """使用指定层级的模型重新执行任务（回退路径）。"""
-        if self.tier_manager is not None:
-            fallback_model = self.tier_manager.get_model(task_level)
-            self.model_client = fallback_model
-        # 直接调用 ask，但由于 locked_model 为 None 且我们会设置 model_client，
-        # 需要在 ask 内部跳过自动路由。通过临时设置 locked_model 实现。
-        original_locked = self.locked_model
-        self.locked_model = self.model_client
-        try:
-            return self.ask(user_message)
-        finally:
-            self.locked_model = original_locked
 
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
@@ -910,7 +877,7 @@ class bongo:
         try:
             raw_result = str(tool["run"](args))
             tool_use_id = f"{name}_{hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]}"
-            result, cache_path = persist_large_output(raw_result, self.root, tool_use_id)
+            result, cache_path = persist_large_output(raw_result, tool_use_id)
             self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": "ok",
@@ -931,25 +898,29 @@ class bongo:
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
-        # 这里提前挡掉最简单的这种循环。
+        # 检查：上一次完全相同的调用（同名同参数）之后，是否有其他工具调用。
+        # 如果没有（连续重复），则拦截；如果有（中间做了别的事），则放行。
         history = self.session["history"]
-        tool_events = []
+        last_match_idx = -1
+        last_tool_idx = -1
         for i, item in enumerate(history):
-            if item.get("role") == "tool":
-                # 从前面的 assistant tool_use 块中获取 args
-                event_args = {}
-                if i > 0:
-                    prev = history[i - 1]
-                    if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
-                        for block in prev["content"]:
-                            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == item.get("name"):
-                                event_args = block.get("input", {})
-                                break
-                tool_events.append({"name": item.get("name", ""), "args": event_args})
-        if len(tool_events) < 2:
+            if item.get("role") != "tool":
+                continue
+            last_tool_idx = i
+            if item.get("name") != name:
+                continue
+            if i > 0:
+                prev = history[i - 1]
+                if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+                    for block in prev["content"]:
+                        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == name:
+                            if block.get("input", {}) == args:
+                                last_match_idx = i
+                            break
+        # 没有历史匹配，或上次匹配之后有其他工具调用，放行
+        if last_match_idx < 0:
             return False
-        recent = tool_events[-2:]
-        return all(e["name"] == name and e["args"] == args for e in recent)
+        return last_match_idx == last_tool_idx
 
     @staticmethod
     def new_task_id():
@@ -1078,38 +1049,6 @@ class bongo:
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.session_store.save(self.session)
-
-    # ── 多层级模型管理 ──────────────────────────────────────
-
-    def lock_model(self, level):
-        """锁定到指定层级的模型，禁用自动路由。"""
-        if self.tier_manager is None:
-            return "error: no tier manager configured"
-        model = self.tier_manager.get_model(level)
-        self.locked_model = model
-        self.model_client = model
-        label = self.tier_manager.tier_label(level)
-        name = getattr(model, "model", "unknown")
-        return f"Model locked to {label}: {name}"
-
-    def unlock_model(self):
-        """解锁模型，恢复自动路由。"""
-        if self.locked_model is None:
-            return "Model is not locked"
-        self.locked_model = None
-        self.model_client = self._original_model_client
-        return "Model unlocked, auto-routing resumed"
-
-    def model_status(self):
-        """返回当前模型状态描述。"""
-        if self.tier_manager is None:
-            name = getattr(self.model_client, "model", "unknown")
-            return f"Model: {name} (single model mode)"
-        if self.locked_model is not None:
-            name = getattr(self.locked_model, "model", "unknown")
-            return f"Model: {name} (LOCKED)"
-        name = getattr(self.model_client, "model", "unknown")
-        return f"Model: {name} (auto-routing)\n{self.tier_manager.tier_info()}"
 
     def path(self, raw_path):
         # 将原始路径字符串转换为 Python 的 pathlib.Path 对象，便于后续的路径操作。

@@ -18,7 +18,7 @@ from .task_status import TaskStatus
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .profile import UserProfile, save_current_user, load_current_user, list_profiles
 from .runtime import bongo, SessionStore
-from .utils import middle
+from .utils import Spinner, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
     "OPENAI_API_KEY",
@@ -32,16 +32,14 @@ DEFAULT_SECRET_ENV_NAMES = (
 
 # ... existing code ...
 WELCOME_ART = (
-    " ___   ____  _   _  _____  ____ ",
-    "| __| | ___|| \\ | ||  ___||  _ \\",
-    "| _|  | ___||  \\| || |___ | |_| |",
-    "|___| |____||_|\\_||\\_____||____/ ",
+    " ██████╗  ██████╗ ███╗   ██╗ ██████╗  ██████╗ ",
+    "██╔══██╗██╔═══██╗████╗  ██║██╔════╝ ██╔═══██╗",
+    "██████╔╝██║   ██║██╔██╗ ██║██║  ███╗██║   ██║",
+    "██╔══██╗██║   ██║██║╚██╗██║██║   ██║██║   ██║",
+    "██║  ██║╚██████╔╝██║ ╚████║╚██████╔╝╚██████╔╝",
+    "╚══════╝╚═════╝ ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ",
 )
-# ... existing code ...
-
-WELCOME_NAME = "bongo"
-WELCOME_SUBTITLE = "本地编程学习助手"
-WELCOME_STATUS = "就绪，等待指令"
+WELCOME_SUBTITLE = "AI 辅助学习助手 · 记笔记 · 练错题 · 读写文档"
 HELP_DETAILS = textwrap.dedent(
     """\
     命令（支持 / 或 - 前缀）：
@@ -79,11 +77,84 @@ HELP_DETAILS = textwrap.dedent(
     /reset           清空当前会话历史和记忆。
     /level           显示当前审批策略。
     /level [ask|auto|never]   切换审批策略。
-    /model           显示当前模型和层级状态。
-    /model [1|2|3]   锁定到指定层级模型。
-    /model unlock    解锁模型，恢复自动路由。
     /help            显示此帮助信息。
     /exit            退出代理。
+    """
+).strip()
+
+PRACTICE_HELP = textwrap.dedent(
+    """\
+    === /practice 用法说明 ===
+
+    练习模式基于 Plan-and-Execute 链路，专注于出题、判分、记录错题。
+    与 /ask 不同，练习模式不调用工具，走独立的上下文设计。
+
+    三种模式：
+
+    1. 快问快答
+       从你最近保存的笔记中自动抽取内容，生成 10 道面试题。
+       适合日常复习，检验对笔记内容的掌握程度。
+       前提：至少有 1 条笔记（通过 /note 或 MCP 添加）。
+
+    2. 深度求索
+       从信任路径中选择一篇 md 文档，围绕其内容生成 10 道题。
+       适合深入学习某个主题。
+       前提：至少有 1 条信任路径（添加笔记时关联文件会自动建立）。
+
+    3. 朝花夕拾
+       从错题本中抽题复习。
+       答对的题目自动从错题本移除，答错的累加错误次数。
+       适合巩固薄弱知识点。
+
+    评分规则：
+    - 每题满分 100 分，低于 60 分自动记入错题本
+    - 错题会关联来源（快问快答/深度求索）和标签
+    - 练习结束后生成总评
+
+    退出：输入 /q 可提前退出当前练习。
+    """
+).strip()
+
+ASK_HELP = textwrap.dedent(
+    """\
+    === /ask 用法说明 ===
+
+    /ask 基于 ReAct（观察→思考→行动→循环）链路，大模型自主调用工具完成任务。
+    与 /practice 不同，/ask 可以读写文件、执行命令，是完整的 agent 交互。
+
+    三种文档类型：
+
+    1. 信任路径（文件操作）
+       选择一个本地目录，agent 在该目录范围内进行文件读写操作。
+       适合：修改代码、分析项目、批量处理文件。
+       示例：/ask 帮我给所有 py 文件加上 type hints
+
+    2. 笔记（学习笔记）
+       agent 工作在 ~/.bongo/notes/ 下，可以查看、修改、补充笔记。
+       适合：整理笔记、补充知识点、合并重复内容。
+       示例：/ask 帮我补充装饰器的实际应用场景
+
+    3. 错题（错题本）
+       agent 工作在 ~/.bongo/mistakes/ 下，可以分析、整理错题。
+       适合：分析错因、补充解题思路、清理已掌握的错题。
+       示例：/ask 分析我最近的错题，找出薄弱知识点
+
+    交互方式：
+    - 选择文档类型后进入交互循环（/ask> 提示符）
+    - 用自然语言描述需求，agent 自主决定调用什么工具
+    - 可以用编号引用文档，如「读一下3号」「修改第5条」
+    - 输入 /q 返回文档类型选择，再输入 /q 返回主菜单
+
+    工具列表：
+    - list_files: 列出目录文件
+    - read_file: 按行号读文件
+    - search: 搜索关键词
+    - write_file: 写文件（需确认）
+    - patch_file: 精确替换文本（需确认）
+    - run_shell: 执行命令（需确认）
+    - search_mistakes: 搜索错题索引
+    - get_mistake_detail: 获取错题详情
+    - read_notes: 读取学习笔记
     """
 ).strip()
 
@@ -289,7 +360,14 @@ def build_welcome(agent, model, host):
     rows.append(center(WELCOME_SUBTITLE))
     rows.append(divider("-"))
     rows.append(row(""))
+    rows.append(row("bongo 是一个本地 AI 学习助手，帮你记笔记、练错题、读写文档。"))
+    rows.append(row("数据全部存在本地 ~/.bongo/，两套独立链路："))
+    rows.append(row("  /ask       ReAct 链路 — 大模型自主调用工具读写文件"))
+    rows.append(row("  /practice  Plan-and-Execute 链路 — 自动出题、判分、记错题"))
+    rows.append(row(""))
+    rows.append(divider("-"))
     # 系统信息
+    rows.append(row(""))
     rows.append(row(f"模型: {model}"))
     rows.append(row(f"工作目录: {middle(str(agent.work_dir), inner - 8)}"))
     rows.append(row(""))
@@ -299,6 +377,8 @@ def build_welcome(agent, model, host):
     rows.append(center("快速开始"))
     rows.append(row("/ask <问题>    向大模型提问，自主调用工具"))
     rows.append(row("/practice      进入练习模式（快问快答 / 深度求索 / 朝花夕拾）"))
+    rows.append(row("/note          查看和管理学习笔记"))
+    rows.append(row("/mistake       查看错题本"))
     rows.append(row("/help          查看全部命令"))
     rows.append(row(""))
     rows.append(line)
@@ -387,12 +467,16 @@ class PracticeContext:
         self.model_client = model_client
         self.work_dir = work_dir
 
-    def complete(self, prompt, max_tokens=4000):
+    def complete(self, prompt, max_tokens=4000, spinner_message=""):
         """调用模型并清理输出（剥离思考标签）。"""
-        raw = self.model_client.complete(prompt, max_tokens)
+        if spinner_message:
+            with Spinner(spinner_message):
+                raw = self.model_client.complete(prompt, max_tokens)
+        else:
+            raw = self.model_client.complete(prompt, max_tokens)
         return _clean_model_output(str(raw))
 
-    def grade(self, question, user_answer, reference):
+    def grade(self, question, user_answer, reference, spinner_message=""):
         """判分阶段：返回 (score, basis, error_reason, correct_answer)。"""
         prompt = GRADE_PROMPT_TEMPLATE.format(
             question=question,
@@ -400,7 +484,7 @@ class PracticeContext:
             user_answer=user_answer,
         )
         try:
-            raw = self.complete(prompt, 4000)
+            raw = self.complete(prompt, 4000, spinner_message=spinner_message)
             return _parse_grade_result(raw)
         except Exception as exc:
             print(f"评分失败: {exc}")
@@ -425,7 +509,7 @@ class PracticeContext:
             f"只输出总评，不要前缀。"
         )
         try:
-            result = self.complete(prompt, 2000)
+            result = self.complete(prompt, 2000, spinner_message="正在生成总评...")
             lines = [l.strip() for l in result.split("\n") if l.strip() and len(l.strip()) > 10]
             if lines:
                 print(f"\n【总评】")
@@ -498,7 +582,7 @@ def _run_practice_review(ctx, user_profile):
             ctx.summarize("朝花夕拾", scores, all_feedback)
             return
 
-        score, basis, error_reason, correct_answer = ctx.grade(question_text, user_answer, reference)
+        score, basis, error_reason, correct_answer = ctx.grade(question_text, user_answer, reference, spinner_message="正在评分...")
         scores.append(score)
         all_feedback.append(f"Q{i}: {basis}")
 
@@ -543,7 +627,7 @@ def _run_practice_plan_execute(ctx, user_profile, reference, source_label, num_q
         f'{{"questions": ["题目1", "题目2", ...]}}'
     )
     try:
-        raw = ctx.complete(plan_prompt, 8000)
+        raw = ctx.complete(plan_prompt, 8000, spinner_message=f"正在生成 {num_questions} 道题目...")
     except Exception as exc:
         print(f"生成题目失败：{type(exc).__name__}: {exc}")
         return
@@ -595,7 +679,7 @@ def _run_practice_plan_execute(ctx, user_profile, reference, source_label, num_q
             ctx.summarize(source_label, scores, all_feedback)
             return
 
-        score, basis, error_reason, correct_answer = ctx.grade(question, user_answer, reference)
+        score, basis, error_reason, correct_answer = ctx.grade(question, user_answer, reference, spinner_message="正在评分...")
         scores.append(score)
         all_feedback.append(f"Q{i}: {basis}")
 
@@ -688,49 +772,55 @@ def _ask_interactive_loop(agent, scoped_root, mode, first_question=None):
 
 
 def _ask_with_notes(agent, user_profile, first_question=None):
-    """笔记模式：列出所有笔记，填充 index，进入交互循环。"""
-    notes = user_profile.get_notes(limit=100)
-    if not notes:
+    """笔记模式：列出所有笔记，填充 index（含 offset），进入交互循环。"""
+    index_entries = user_profile._read_notes_index()
+    if not index_entries:
         print("暂无笔记。请先通过 /note 或 MCP 添加笔记。")
         return
 
-    print(f"\n笔记列表（共 {len(notes)} 条）：")
+    print(f"\n笔记列表（共 {len(index_entries)} 条）：")
     items = []
-    for idx, n in enumerate(notes, 1):
-        ts = n.get("timestamp", "")[:10]
-        fp = f" [{n['file_path']}]" if n.get("file_path") else ""
-        label = n.get("title", "")
-        summary = f"{ts}{fp}"
-        items.append({"label": label, "summary": summary})
-        print(f"  {idx}. [{ts}] {label}{fp}")
+    for idx, entry in enumerate(index_entries, 1):
+        ts = entry.get("timestamp", "")[:10]
+        title = entry.get("title", "")
+        item = {"label": title, "summary": ts, "file_path": str(user_profile.notes_file)}
+        if entry.get("offset") is not None:
+            item["offset"] = entry["offset"]
+            item["length"] = entry["length"]
+        items.append(item)
+        print(f"  {idx}. [{ts}] {title}")
 
     agent.memory.populate_index(items)
-    notes_file = user_profile.notes_file
-    _ask_interactive_loop(agent, notes_file.parent, "notes", first_question)
+    _ask_interactive_loop(agent, user_profile.notes_file.parent, "notes", first_question)
 
 
 def _ask_with_mistakes(agent, user_profile, first_question=None):
-    """错题模式：列出所有错题，填充 index，进入交互循环。"""
-    mistakes = user_profile.get_mistakes_from_file(limit=50)
-    if not mistakes:
+    """错题模式：列出所有错题，填充 index（含 offset），进入交互循环。"""
+    index_entries = user_profile.get_mistakes_index()
+    if not index_entries:
         print("暂无错题。请先通过 /practice 或 MCP 记录错题。")
         return
 
-    print(f"\n错题列表（共 {len(mistakes)} 条）：")
+    print(f"\n错题列表（共 {len(index_entries)} 条）：")
     items = []
-    for idx, m in enumerate(mistakes, 1):
-        ts = m.get("timestamp", "")[:10]
-        score = m.get("score", 0)
-        title = m.get("title", "")[:40]
-        count = m.get("count", 1)
-        label = title
-        summary = f"{ts} 得分:{score} 次数:{count}"
-        items.append({"label": label, "summary": summary})
-        print(f"  {idx}. [{ts}] 得分:{score} 次数:{count} {title}")
+    for idx, entry in enumerate(index_entries, 1):
+        ts = entry.get("timestamp", "")
+        score = entry.get("score", 0)
+        summary_text = entry.get("summary", "")[:40]
+        count = entry.get("count", 1)
+        item = {
+            "label": summary_text,
+            "summary": f"{ts} 得分:{score} 次数:{count}",
+            "file_path": str(user_profile.mistakes_file),
+        }
+        if entry.get("offset") is not None:
+            item["offset"] = entry["offset"]
+            item["length"] = entry["length"]
+        items.append(item)
+        print(f"  {idx}. [{ts}] 得分:{score} 次数:{count} {summary_text}")
 
     agent.memory.populate_index(items)
-    mistakes_file = user_profile.mistakes_file
-    _ask_interactive_loop(agent, mistakes_file.parent, "mistakes", first_question)
+    _ask_interactive_loop(agent, user_profile.mistakes_file.parent, "mistakes", first_question)
 
 
 def _ask_with_trusted_path(agent, user_profile, first_question=None):
@@ -1004,19 +1094,6 @@ def main(argv=None):
             else:
                 print("用法: /level [ask|auto|never]")
             continue
-        if user_input.startswith(("/model", "-model")):
-            parts = user_input.split()
-            if len(parts) == 1:
-                # /model - 显示当前状态
-                print(agent.model_status())
-            elif parts[1] == "unlock":
-                print(agent.unlock_model())
-            elif parts[1] in ("1", "2", "3"):
-                level = int(parts[1])
-                print(agent.lock_model(level))
-            else:
-                print("用法: /model [1|2|3|unlock]")
-            continue
         if user_input.startswith(("/user", "-user")):
             parts = user_input.split(maxsplit=2)
             if len(parts) == 1:
@@ -1264,9 +1341,10 @@ def main(argv=None):
             print("1. 快问快答（从最近笔记中抽取 10 个问题）")
             print("2. 深度求索（选择 md 文档，10 道题）")
             print("3. 朝花夕拾（错题复习）")
+            print("h. 用法说明")
             print("0. 退出练习")
             try:
-                choice = input("\n请选择模式 [1/2/3/0]: ").strip()
+                choice = input("\n请选择模式 [1/2/3/h/0]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("")
                 continue
@@ -1342,6 +1420,8 @@ def main(argv=None):
                 # 朝花夕拾 - 错题复习
                 ctx = PracticeContext(agent.model_client, agent.work_dir)
                 _run_practice_review(ctx, user_profile)
+            elif choice in ("h", "H", "help"):
+                print(PRACTICE_HELP)
             continue
 
         # /ask 命令：选择文档类型后进入交互式 ReAct 问答
@@ -1354,6 +1434,7 @@ def main(argv=None):
                 print("  1. 信任路径（文件操作）")
                 print("  2. 笔记（学习笔记）")
                 print("  3. 错题（错题本）")
+                print("  h. 用法说明")
                 print("  /q 返回主菜单")
                 try:
                     type_choice = input("\n选择编号: ").strip()
@@ -1363,6 +1444,8 @@ def main(argv=None):
 
                 if type_choice == "/q":
                     break
+                elif type_choice in ("h", "H", "help"):
+                    print(ASK_HELP)
                 elif type_choice == "1":
                     _ask_with_trusted_path(agent, user_profile, first_question or None)
                 elif type_choice == "2":

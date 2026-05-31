@@ -6,23 +6,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
 # NOTE prompt=prefix+memory+history+current_request
 # 设计原则：稳定部分在前（命中前缀缓存），不稳定部分在后
-DEFAULT_TOTAL_BUDGET = 24000  # Prompt 总字符数预算上限（约 6000 tokens）
+DEFAULT_TOTAL_BUDGET = 32000  # Prompt 总字符数预算上限（约 8000 tokens）
 DEFAULT_SECTION_BUDGETS = {   # 各个组成部分（Section）的理想字符数配额
     "prefix": 5000,           # 系统前缀（身份+规则+工具）— 最稳定，完全静态
     "workspace": 200,         # 工作空间路径 — 动态注入，但字符数很少
     "memory": 2000,           # 工作记忆（当前任务/文件摘要）的配额 — 任务级稳定
-    "history": 16800,         # 对话历史（之前的交互记录）的配额 — 每轮增长
+    "history": 24000,         # 对话历史（之前的交互记录）的配额 — 每轮增长
 }
 DEFAULT_SECTION_FLOORS = {    # 各个组成部分的最小保底字符数，即使超预算也不能低于此值
     "prefix": 2000,           # 前缀的最小长度，确保核心规则和工具说明不丢失
     "workspace": 100,         # 工作空间最小长度
     "memory": 500,            # 工作记忆的最小长度
-    "history": 3000,          # 对话历史的最小长度，保留最近的交互语境
+    "history": 5000,          # 对话历史的最小长度，保留最近的交互语境
 }
 # 当 prompt 超预算时，会优先压缩这些 section。顺序越靠前，越先被裁剪/压缩。
 DEFAULT_REDUCTION_ORDER = ("history", "workspace", "memory", "prefix")
@@ -229,38 +230,40 @@ class ContextManager:
             rendered = "Transcript:\n- empty"
             return SectionRender(raw=raw, budget=budget, rendered=rendered, details={"rendered_entries": []})
 
-        # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
+        recent_window = 24
         recent_start = max(0, len(history) - recent_window)
         total = len(history)
         rendered_entries = []
-        for index in reversed(range(total)):
+
+        # 旧轮：用模型压缩为摘要
+        old_items = history[:recent_start]
+        if old_items:
+            old_summary = self._get_or_compress_old_history(old_items)
+            rendered_entries.append(f"[Earlier conversation summary ({len(old_items)} rounds)]:")
+            rendered_entries.append(old_summary)
+
+        # 最近 6 条：保持原逻辑
+        for index in range(recent_start, total):
             item = history[index]
-            recent = index >= recent_start
-            age = total - index  # 距今多少轮
-            line_limit = 900 if recent else 60
+            age = total - index
+            line_limit = 900
             candidate_lines = self._render_history_item(item, line_limit, age=age)
-            candidate_entries = candidate_lines + rendered_entries
+            candidate_entries = rendered_entries + candidate_lines
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
             if len(candidate_rendered) <= budget:
                 rendered_entries = candidate_entries
                 continue
-            if recent:
-                available = budget - len("Transcript:")
-                if rendered_entries:
-                    available -= sum(len(line) + 1 for line in rendered_entries)
-                available = max(20, available - 1)
-                candidate_lines = self._render_history_item(item, available, age=age)
-                candidate_entries = candidate_lines + rendered_entries
-                candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
-                    rendered_entries = candidate_entries
-            else:
-                smaller_lines = self._render_history_item(item, 20, age=age)
-                smaller_entries = smaller_lines + rendered_entries
-                smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
-                    rendered_entries = smaller_entries
+            # 预算不够，缩减当前条目
+            available = budget - len("Transcript:")
+            if rendered_entries:
+                available -= sum(len(line) + 1 for line in rendered_entries)
+            available = max(20, available - 1)
+            candidate_lines = self._render_history_item(item, available, age=age)
+            candidate_entries = rendered_entries + candidate_lines
+            candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
+            if len(candidate_rendered) <= budget:
+                rendered_entries = candidate_entries
+
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
         if len(rendered) > budget and budget > 0:
@@ -276,6 +279,34 @@ class ContextManager:
                 "rendered_entries": rendered_entries,
             },
         )
+
+    def _get_or_compress_old_history(self, old_items):
+        """获取缓存的旧历史压缩结果，或重新压缩。"""
+        # 太少的旧条目不值得调用模型，直接截取
+        if len(old_items) < 4:
+            old_text = self._raw_history_text(old_items)
+            return _tail_clip(old_text, 300)
+
+        from . import compressor
+
+        items_hash = hashlib.sha256(
+            json.dumps(old_items, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+
+        memory = getattr(self.agent, "session", {}).get("memory", {})
+        cached = memory.get("compressed_history", {})
+        if cached.get("hash") == items_hash:
+            return cached["text"]
+
+        # 生成原始文本并压缩
+        old_text = self._raw_history_text(old_items)
+        summary = compressor.compress_history(old_text, self.agent.model_client)
+
+        # 缓存
+        if "compressed_history" not in memory:
+            memory["compressed_history"] = {}
+        memory["compressed_history"] = {"hash": items_hash, "text": summary}
+        return summary
 
     def _raw_history_text(self, history):
         if not history:
