@@ -27,11 +27,11 @@ bongo --cwd /path/to/project
 
 ## 支持的模型后端
 
-| Provider | 默认模型 | 启动方式 |
-|---|---|---|
-| Ollama | mimo-v2.5-pro | `ollama serve` 后 `bongo --provider ollama` |
-| OpenAI 兼容 | mimo-v2.5-pro | `bongo --provider openai --base-url ... --model ...` |
-| Anthropic 兼容 | mimo-v2.5-pro | `bongo --provider anthropic --base-url ... --model ...` |
+| Provider | 启动方式 |
+|---|---|
+| Ollama | `ollama serve` 后 `bongo --provider ollama` |
+| OpenAI 兼容 | `bongo --provider openai --base-url ... --model ...` |
+| Anthropic 兼容 | `bongo --provider anthropic --base-url ... --model ...` |
 
 模型优先级：CLI `--model` > 环境变量 > 持久化配置 > 代码默认值。
 
