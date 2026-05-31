@@ -202,20 +202,19 @@ class bongo:
 
             Rules:
             - Use tools instead of guessing about file contents.
-            - *** CRITICAL: After delete_entry succeeds (result starts with '已删除'), your next message MUST be the final answer to the user. Do NOT call any more tools. Do NOT read the file. Do NOT delete again. The deletion is already complete. ***
-            - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
-            - IMPORTANT: After patch_file succeeds (result contains 'patched'), output your final answer immediately. Do NOT read the file to verify. Trust the tool result.
-            - IMPORTANT: After write_file succeeds, output your final answer. Do NOT read the file back unless the user explicitly asks to see it.
-            - IMPORTANT: When the user asks you to modify a file (add, change, delete text), confirm the change was made and stop. Do NOT output the full file content unless the user asks to see it.
-            - IMPORTANT: To delete a file, use the delete_file tool. Do NOT use run_shell with rm/del.
+            - *** CRITICAL: After delete_entry succeeds (result starts with '已删除'), your next message MUST be the final answer to the user. Do NOT call any more tools. ***
+            - *** CRITICAL: After patch_file succeeds (result contains 'patched'), your next message MUST be the final answer. Do NOT read the file. Trust the tool result. ***
+            - IMPORTANT: read_entry already gives you the full content of an entry. Do NOT also call read_file or read_entry again for the same content. Use what you already have.
+            - IMPORTANT: After reading an entry, go straight to the action (patch/write). Do NOT read the file again, do NOT list files, do NOT call unrelated tools.
+            - IMPORTANT: When the user asks to modify a file, do: 1) read_entry to get content, 2) patch_file to modify, 3) output final answer. That is 2 tool calls maximum. Do NOT add extra reads or verification steps.
+            - IMPORTANT: Only call tools that are directly needed for the user's request. Do NOT call list_files, search, or read_file unless the user specifically asks for them.
             - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
-            - IMPORTANT: To read a specific entry from a notes/mistakes file by list number, use read_entry(path, entry).
+            - IMPORTANT: To read a specific entry by list number, use read_entry(path, entry).
             - IMPORTANT: To delete a specific entry by list number, use delete_entry(path, entry). Do NOT use patch_file for this.
             - IMPORTANT: When a tool result says 'Full output saved to: ...', use read_cache(path) to read the full content.
-            - IMPORTANT: For large files, use search(pattern, path) to find relevant sections first, then read_file with specific line ranges.
             - When you have the final answer, output it directly without calling any tool.
             - Never invent tool results.
-            - Do not repeat the same tool call with the same arguments if it did not help."""
+            - Do not repeat the same tool call with the same arguments."""
         ).strip()
 
         return PromptPrefix(
