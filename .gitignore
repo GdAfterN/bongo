@@ -43,6 +43,12 @@ tests/results/
 docs/
 studyForOffer/
 backend/
+CC/
+
+# Experiment results and obsolete scripts
+results/
+scripts/run_tier_experiments.py
+scripts/test_perf.py
 
 # OS files
 .DS_Store
