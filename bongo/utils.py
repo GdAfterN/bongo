@@ -12,8 +12,8 @@ from pathlib import Path
 
 MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
-PERSIST_THRESHOLD = 8000
-PERSIST_PREVIEW_SIZE = 2000
+PERSIST_THRESHOLD = 16000
+PERSIST_PREVIEW_SIZE = 5000
 IGNORED_PATH_NAMES = {".git", ".bongo", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 

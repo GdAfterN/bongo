@@ -764,6 +764,19 @@ def _ask_interactive_loop(agent, scoped_root, mode, first_question=None):
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
             question = None
+            # 空输入展开上次 ReAct 过程
+            has_steps = bool(getattr(agent, "_last_react_steps", []))
+            while has_steps:
+                try:
+                    expand_input = input("/ask> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    expand_input = "/q"
+                if expand_input == "":
+                    agent.expand_last_steps()
+                    has_steps = False
+                else:
+                    question = expand_input
+                    break
     finally:
         agent.root = original_root
         agent.approval_policy = original_approval
@@ -1083,6 +1096,9 @@ def main(argv=None):
         if user_input in ("/reset", "-reset"):
             agent.reset()
             print("会话已重置")
+            continue
+        if user_input in ("/steps", "-steps"):
+            agent.expand_last_steps()
             continue
         if user_input.startswith(("/level", "-level")):
             parts = user_input.split()

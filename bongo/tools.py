@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import textwrap
 from functools import partial
+from pathlib import Path
 
 from .utils import IGNORED_PATH_NAMES, clip
 # 定义 Agent 可用的基础工具规格说明。这些信息会被拼接进 System Prompt，告诉大模型有哪些工具可用、参数是什么以及是否危险。
@@ -19,10 +20,10 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
-        "param_descriptions": {"path": "File path relative to workspace root", "start": "Starting line number (1-based)", "end": "Ending line number (inclusive)"},
+        "schema": {"path": "str", "start": "int=1", "end": "int=500"},
+        "param_descriptions": {"path": "File path relative to workspace root", "start": "Starting line number (1-based)", "end": "Ending line number (inclusive, max 1000)"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range.",
+        "description": "Read a UTF-8 file by line range. Max 1000 lines per call.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -90,6 +91,12 @@ BASE_TOOL_SPECS = {
         "risky": True,
         "description": "Delete a specific entry by number from a notes or mistakes file. Rebuilds the index after deletion.",
     },
+    "read_cache": {
+        "schema": {"path": "str"},
+        "param_descriptions": {"path": "Cache file path returned by a previous tool call (e.g. 'Full output saved to: ...')"},
+        "risky": False,
+        "description": "Read a cached output file from ~/.bongo/cache/. Use this when a tool result says 'Full output saved to: ...'.",
+    },
 }
 
 # 定义"委托"工具的规格。允许主 Agent 把任务分派给一个受限的子 Agent 去执行。
@@ -132,9 +139,11 @@ def validate_tool(agent, name, args):
         if not path.is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
+        end = int(args.get("end", 500))
         if start < 1 or end < start:
             raise ValueError("invalid line range")
+        if end - start + 1 > 1000:
+            raise ValueError("max 1000 lines per call")
         return
 
     if name == "search":
@@ -234,6 +243,15 @@ def validate_tool(agent, name, args):
             raise ValueError("entry must be >= 1")
         return
 
+    if name == "read_cache":
+        cache_path = Path(args["path"])
+        cache_dir = Path.home() / ".bongo" / "cache"
+        if not str(cache_path.resolve()).startswith(str(cache_dir.resolve())):
+            raise ValueError("path must be in ~/.bongo/cache/")
+        if not cache_path.is_file():
+            raise ValueError("cache file not found")
+        return
+
 # 工具的具体实现
 def tool_list_files(agent, args):
     path = agent.path(args.get("path", "."))
@@ -255,9 +273,11 @@ def tool_read_file(agent, args):
     if not path.is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
-    end = int(args.get("end", 200))
+    end = int(args.get("end", 500))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
+    if end - start + 1 > 1000:
+        raise ValueError("max 1000 lines per call")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
     return f"# {path.relative_to(agent.root)}\n{body}"
@@ -621,6 +641,17 @@ def tool_delete_entry(agent, args):
     return f"已删除第 {entry_num} 条：{label}（剩余 {len(entries) - 1} 条）"
 
 
+def tool_read_cache(agent, args):
+    cache_path = Path(args["path"])
+    cache_dir = Path.home() / ".bongo" / "cache"
+    if not str(cache_path.resolve()).startswith(str(cache_dir.resolve())):
+        raise ValueError("path must be in ~/.bongo/cache/")
+    if not cache_path.is_file():
+        raise ValueError("cache file not found")
+    content = cache_path.read_text(encoding="utf-8", errors="replace")
+    return f"# {cache_path.name}\n{content}"
+
+
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
@@ -635,4 +666,5 @@ _TOOL_RUNNERS = {
     "write_note": tool_write_note,
     "read_entry": tool_read_entry,
     "delete_entry": tool_delete_entry,
+    "read_cache": tool_read_cache,
 }

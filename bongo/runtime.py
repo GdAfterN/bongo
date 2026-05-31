@@ -7,6 +7,7 @@ bongo 就是包在模型外面的控制循环：负责组 prompt、解析模型�
 import json
 import os
 import re
+import sys
 import textwrap
 import uuid
 import hashlib
@@ -142,6 +143,7 @@ class bongo:
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
         self._last_tool_result_metadata = {}
+        self._last_react_steps = []
 
     @classmethod
     def from_session(cls, model_client, session_store, session_id, **kwargs):
@@ -201,10 +203,13 @@ class bongo:
             - IMPORTANT: Always read before write. Use read_file to check current content before modifying.
             - IMPORTANT: After reading, use write_file to write the modified content. Do not just keep reading.
             - IMPORTANT: After write/patch, read the file once to verify, then output your final answer.
+            - IMPORTANT: After delete_entry succeeds (returns '已删除'), output your final answer immediately. Do NOT verify by reading the file. Do NOT delete again.
             - IMPORTANT: To delete a file, use the delete_file tool. Do NOT use run_shell with rm/del.
             - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
             - IMPORTANT: To read a specific entry from a notes/mistakes file by list number, use read_entry(path, entry).
             - IMPORTANT: To delete a specific entry by list number, use delete_entry(path, entry). Do NOT use patch_file for this.
+            - IMPORTANT: When a tool result says 'Full output saved to: ...', use read_cache(path) to read the full content.
+            - IMPORTANT: For large files, use search(pattern, path) to find relevant sections first, then read_file with specific line ranges.
             - When you have the final answer, output it directly without calling any tool.
             - Never invent tool results.
             - Do not repeat the same tool call with the same arguments if it did not help."""
@@ -647,6 +652,12 @@ class bongo:
         attempts = 0  # 尝试次数
         react_round = 0  # ReAct 循环轮次（用于显示）
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)  # 这是为了容忍一定次数的模型错误,同时设置合理上限:
+        step_lines = []  # 记录中间步骤的输出行，用于最终折叠
+
+        def _step_print(text):
+            """打印并记录中间步骤，后续可折叠。"""
+            step_lines.append(text)
+            print(text)
 
         # 这是 agent 的主循环，可以按"感知 -> 决策 -> 行动 -> 记录"来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
@@ -657,7 +668,7 @@ class bongo:
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
             react_round += 1
-            print(f"\n  [Round {react_round}] Thinking...")
+            _step_print(f"\n  [Round {react_round}] Thinking...")
             task_status.record_attempt()
             prompt_started_at = time.monotonic()
             # 每个关键步骤都更新 current_action 并落盘，方便外部 --status 随时查看
@@ -730,7 +741,7 @@ class bongo:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 args_preview = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:3])
-                print(f"  [Round {react_round}] Acting: {name}({args_preview})")
+                _step_print(f"  [Round {react_round}] Acting: {name}({args_preview})")
                 tool_use_id = payload.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
                 task_status.record_tool(name)
                 task_status.current_action = f"executing_tool:{name}"
@@ -738,7 +749,7 @@ class bongo:
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
                 result_preview = result[:80].replace("\n", " ") if result else "(empty)"
-                print(f"  [Round {react_round}] Observing: {result_preview}")
+                _step_print(f"  [Round {react_round}] Observing: {result_preview}")
                 task_status.current_action = f"tool_completed:{name}"
                 # 记录 assistant 的 tool_use 块
                 self.record({
@@ -774,7 +785,21 @@ class bongo:
                 continue
 
             final = (payload or raw).strip()
-            print(f"  [Round {react_round}] Done")
+            _step_print(f"  [Round {react_round}] Done")
+
+            # 折叠中间步骤：清掉已输出的步骤行，替换为一行摘要
+            if step_lines:
+                total_lines = sum(text.count("\n") + 1 for text in step_lines)
+                # ANSI: 上移 total_lines 行，清掉从光标到屏幕末尾的内容
+                sys.stdout.write(f"\033[{total_lines}A\033[J")
+                sys.stdout.flush()
+                detail = " | ".join(
+                    line.strip() for line in step_lines
+                    if line.strip().startswith("[Round")
+                )
+                print(f"  [ReAct: {react_round} rounds, {tool_steps} tools] {detail}")
+                print(f"  (按 Enter 展开完整过程)")
+            self._last_react_steps = list(step_lines)
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_status.current_action = "final_answer"
             task_status.finish_success(final)
@@ -814,6 +839,14 @@ class bongo:
             },
         )
         self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
+        # 超限退出时也折叠中间步骤
+        if step_lines:
+            total_lines = sum(text.count("\n") + 1 for text in step_lines)
+            sys.stdout.write(f"\033[{total_lines}A\033[J")
+            sys.stdout.flush()
+            print(f"  [ReAct: {react_round} rounds, {tool_steps} tools] (达到上限)")
+            print(f"  (按 Enter 展开完整过程)")
+        self._last_react_steps = list(step_lines)
         return final
 
     def run_tool(self, name, args):
@@ -1042,6 +1075,17 @@ class bongo:
         else:
             prefix += ": model returned malformed output"
         return f"{prefix}. Call a tool or output your final answer directly."
+
+    def expand_last_steps(self):
+        """展开上一次 ask() 的完整 ReAct 过程。"""
+        steps = getattr(self, "_last_react_steps", [])
+        if not steps:
+            print("(无可展开的步骤)")
+            return
+        print("\n  --- ReAct 完整过程 ---")
+        for line in steps:
+            print(line)
+        print("  --- 结束 ---\n")
 
     def reset(self):
         self.session["history"] = []

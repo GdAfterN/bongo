@@ -132,7 +132,7 @@ bongo config --show
 
 ## 工具
 
-bongo 提供 14 个工具，模型只能调用白名单中的工具：
+bongo 提供 15 个工具，模型只能调用白名单中的工具：
 
 | 工具 | 参数 | 危险 | 说明 |
 |---|---|---|---|
@@ -150,6 +150,7 @@ bongo 提供 14 个工具，模型只能调用白名单中的工具：
 | `write_note` | `title, content, file_path=''` | 否 | 保存学习笔记到 ~/.bongo/notes/ |
 | `read_entry` | `path, entry` | 否 | 按编号读取笔记/错题条目（O(1) 索引定位） |
 | `delete_entry` | `path, entry` | 是 | 按编号删除笔记/错题条目，自动重建索引 |
+| `read_cache` | `path` | 否 | 读取 ~/.bongo/cache/ 中的缓存输出文件 |
 
 所有文件类工具的路径被锚定在 workspace root 下，`../` 逃逸会被直接拦截。
 
