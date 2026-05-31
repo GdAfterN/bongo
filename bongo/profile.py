@@ -219,6 +219,15 @@ class UserProfile:
             self.notes_index_file.write_text(f"# 笔记索引\n\n", encoding="utf-8")
         with open(self.notes_index_file, "a", encoding="utf-8") as f:
             f.write(index_line)
+            f.flush()
+
+        # 验证索引写入成功，失败则重建
+        try:
+            idx_content = self.notes_index_file.read_text(encoding="utf-8")
+            if note_title not in idx_content:
+                self._rebuild_notes_index()
+        except Exception:
+            self._rebuild_notes_index()
 
         return {
             "title": note_title,
