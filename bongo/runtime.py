@@ -145,6 +145,7 @@ class bongo:
         self._last_tool_result_metadata = {}
         self._last_react_steps = []
         self._delete_cooldown = {}  # path -> last delete timestamp
+        self._delete_just_happened = None  # "notes" or "mistakes" or None
 
     @classmethod
     def from_session(cls, model_client, session_store, session_id, **kwargs):
@@ -913,6 +914,33 @@ class bongo:
                     "security_event_type": "",
                 }
                 return "error: delete_entry cooldown — you already deleted from this file. Output your final answer now. Do NOT delete again."
+        # Post-delete read guard: block pointless reads on a file that was just deleted from
+        now_ts = time.time()
+        if name in ("read_file", "read_entry", "search"):
+            path_key = str(args.get("path", ""))
+            last_delete = self._delete_cooldown.get(path_key, 0)
+            if now_ts - last_delete < 10:
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "tool_error_code": "post_delete_read_blocked",
+                    "security_event_type": "",
+                }
+                return "error: You already deleted from this file. The file has changed. Do NOT read or verify. Output your final answer now."
+        # Block read_notes after notes delete, search_mistakes after mistakes delete
+        if name == "read_notes" and self._delete_just_happened == "notes" and now_ts - max(self._delete_cooldown.values(), default=0) < 10:
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "post_delete_read_blocked",
+                "security_event_type": "",
+            }
+            return "error: You already deleted a note. Do NOT read or verify. Output your final answer now."
+        if name == "search_mistakes" and self._delete_just_happened == "mistakes" and now_ts - max(self._delete_cooldown.values(), default=0) < 10:
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "post_delete_read_blocked",
+                "security_event_type": "",
+            }
+            return "error: You already deleted a mistake. Do NOT read or verify. Output your final answer now."
         if tool["risky"] and not self.approve(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -924,9 +952,17 @@ class bongo:
             raw_result = str(tool["run"](args))
             tool_use_id = f"{name}_{hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]}"
             result, cache_path = persist_large_output(raw_result, tool_use_id)
-            # Record delete cooldown on success
+            # Record delete cooldown on success and inject stop instruction
             if name == "delete_entry" and result.startswith("已删除"):
-                self._delete_cooldown[str(args.get("path", ""))] = time.time()
+                path_key = str(args.get("path", ""))
+                self._delete_cooldown[path_key] = time.time()
+                # Track file type for read_notes/search_mistakes blocking
+                lower_path = path_key.lower()
+                if "note" in lower_path:
+                    self._delete_just_happened = "notes"
+                elif "mistake" in lower_path:
+                    self._delete_just_happened = "mistakes"
+                result += "\n\n[SYSTEM] Deletion complete. You MUST now output your final answer to the user. Do NOT call any more tools."
             self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": "ok",

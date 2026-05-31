@@ -487,6 +487,14 @@ class TestDeleteCooldown:
         assert "error" in result.lower() or "cooldown" in result.lower()
         assert "已删除" not in result  # Must NOT succeed
 
+        # read_file on same file should also be blocked after delete
+        result = agent.run_tool("read_file", {"path": str(notes_file), "start": 1, "end": 50})
+        assert "error" in result.lower() or "final answer" in result.lower()
+
+        # read_notes should be blocked after notes delete
+        result = agent.run_tool("read_notes", {"limit": 10})
+        assert "error" in result.lower() or "final answer" in result.lower()
+
 
 class TestEdgeCases:
     """Edge cases and error handling."""
