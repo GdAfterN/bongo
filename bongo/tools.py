@@ -19,11 +19,17 @@ BASE_TOOL_SPECS = {
         "risky": False,
         "description": "List files in the workspace.",
     },
-    "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=500"},
-        "param_descriptions": {"path": "File path relative to workspace root", "start": "Starting line number (1-based)", "end": "Ending line number (inclusive, max 1000)"},
+    "file_info": {
+        "schema": {"path": "str"},
+        "param_descriptions": {"path": "File path relative to workspace root"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range. Max 1000 lines per call.",
+        "description": "Get file metadata (line count, size) without reading content. Use before reading large files.",
+    },
+    "read_file": {
+        "schema": {"path": "str", "start": "int=1", "end": "int=200", "tail": "int=0", "grep": "str=''"},
+        "param_descriptions": {"path": "File path relative to workspace root", "start": "Starting line number (1-based)", "end": "Ending line number (inclusive)", "tail": "Read last N lines (overrides start/end)", "grep": "Only return lines containing this keyword (case-insensitive)"},
+        "risky": False,
+        "description": "Read a UTF-8 file. Modes: tail=N (last N lines), grep=pattern (filter), default=line range. Max 2000 lines.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -44,10 +50,28 @@ BASE_TOOL_SPECS = {
         "description": "Write a text file. Creates or overwrites the file.",
     },
     "patch_file": {
-        "schema": {"path": "str", "old_text": "str", "new_text": "str"},
-        "param_descriptions": {"path": "File path relative to workspace root", "old_text": "Exact text to find (must occur exactly once)", "new_text": "Replacement text"},
+        "schema": {"path": "str", "old_text": "str", "new_text": "str", "nth": "int=0"},
+        "param_descriptions": {"path": "File path relative to workspace root", "old_text": "Exact text to find", "new_text": "Replacement text", "nth": "Replace Nth occurrence (0=must be unique, >0=replace that occurrence)"},
         "risky": True,
-        "description": "Replace one exact text block in a file.",
+        "description": "Replace exact text in a file. Default: old_text must occur exactly once. Use nth=N to replace the Nth occurrence.",
+    },
+    "append_file": {
+        "schema": {"path": "str", "content": "str"},
+        "param_descriptions": {"path": "File path relative to workspace root", "content": "Content to append to end of file"},
+        "risky": True,
+        "description": "Append content to the end of an existing file. No read needed. Use for adding lines.",
+    },
+    "insert_at_line": {
+        "schema": {"path": "str", "line": "int", "content": "str"},
+        "param_descriptions": {"path": "File path relative to workspace root", "line": "Line number to insert before (1-based)", "content": "Content to insert"},
+        "risky": True,
+        "description": "Insert content before a specific line number. Use file_info or read_file to find the target line.",
+    },
+    "delete_line": {
+        "schema": {"path": "str", "line": "int"},
+        "param_descriptions": {"path": "File path relative to workspace root", "line": "Line number to delete (1-based)"},
+        "risky": True,
+        "description": "Delete a specific line from a file by line number. Use file_info or read_file to find the target line.",
     },
     "delete_file": {
         "schema": {"path": "str"},
@@ -134,16 +158,28 @@ def validate_tool(agent, name, args):
             raise ValueError("path is not a directory")
         return
 
+    if name == "file_info":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        return
+
     if name == "read_file":
         path = agent.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
-        start = int(args.get("start", 1))
-        end = int(args.get("end", 500))
-        if start < 1 or end < start:
-            raise ValueError("invalid line range")
-        if end - start + 1 > 1000:
-            raise ValueError("max 1000 lines per call")
+        tail = int(args.get("tail", 0))
+        if tail < 0:
+            raise ValueError("tail must be >= 0")
+        if tail == 0:
+            start = int(args.get("start", 1))
+            end = int(args.get("end", 200))
+            if start < 1 or end < start:
+                raise ValueError("invalid line range")
+            if end - start + 1 > 2000:
+                raise ValueError("max 2000 lines per call")
+        elif tail > 2000:
+            raise ValueError("max 2000 lines per call")
         return
 
     if name == "search":
@@ -171,8 +207,6 @@ def validate_tool(agent, name, args):
         return
 
     if name == "patch_file":
-        # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
-        # 这样修改行为才是确定的，失败原因也更容易解释。
         path = agent.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
@@ -181,10 +215,43 @@ def validate_tool(agent, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
+        nth = int(args.get("nth", 0))
         text = path.read_text(encoding="utf-8")
         count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
+        if nth == 0:
+            if count != 1:
+                raise ValueError(f"old_text must occur exactly once, found {count}")
+        else:
+            if nth < 1 or nth > count:
+                raise ValueError(f"nth={nth} out of range, found {count} occurrences")
+        return
+
+    if name == "append_file":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file — use write_file to create")
+        if "content" not in args:
+            raise ValueError("missing content")
+        return
+
+    if name == "insert_at_line":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        line_no = int(args.get("line", 0))
+        if line_no < 1:
+            raise ValueError("line must be >= 1")
+        if "content" not in args:
+            raise ValueError("missing content")
+        return
+
+    if name == "delete_line":
+        path = agent.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        line_no = int(args.get("line", 0))
+        if line_no < 1:
+            raise ValueError("line must be >= 1")
         return
 
     if name == "delete_file":
@@ -272,15 +339,108 @@ def tool_read_file(agent, args):
     path = agent.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
-    start = int(args.get("start", 1))
-    end = int(args.get("end", 500))
-    if start < 1 or end < start:
-        raise ValueError("invalid line range")
-    if end - start + 1 > 1000:
-        raise ValueError("max 1000 lines per call")
+    tail = int(args.get("tail", 0))
+    grep_pattern = str(args.get("grep", "")).strip()
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(agent.root)}\n{body}"
+    total = len(lines)
+
+    if tail > 0:
+        start_idx = max(0, total - tail)
+        selected = list(enumerate(lines[start_idx:], start=start_idx + 1))
+    elif grep_pattern:
+        selected = [(i + 1, line) for i, line in enumerate(lines) if grep_pattern.lower() in line.lower()]
+        if not selected:
+            return f"# {path.relative_to(agent.root)} ({total} lines)\n(no matches for '{grep_pattern}')"
+        if len(selected) > 2000:
+            selected = selected[:2000]
+    else:
+        start = int(args.get("start", 1))
+        end = int(args.get("end", 200))
+        if start < 1 or end < start:
+            raise ValueError("invalid line range")
+        if end - start + 1 > 2000:
+            raise ValueError("max 2000 lines per call")
+        selected = list(enumerate(lines[start - 1:end], start=start))
+
+    body = "\n".join(f"{num:>4}: {line}" for num, line in selected)
+    return f"# {path.relative_to(agent.root)} ({total} lines)\n{body}"
+
+
+def tool_file_info(agent, args):
+    path = agent.path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    size = path.stat().st_size
+    return f"lines: {len(lines)}, size: {size} bytes, path: {path.relative_to(agent.root)}"
+
+
+def tool_append_file(agent, args):
+    path = agent.path(args["path"])
+    content = str(args["content"])
+    if not path.is_file():
+        raise ValueError("path is not a file — use write_file to create")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(content)
+    # Show last 5 lines so the model can see the appended content
+    all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total_lines = len(all_lines)
+    appended_lines = len(content.splitlines())
+    tail_count = min(5, total_lines)
+    tail = all_lines[-tail_count:]
+    tail_preview = "\n".join(f"  {total_lines - tail_count + 1 + i}: {l}" for i, l in enumerate(tail))
+    return f"SUCCESS: appended {appended_lines} lines to {path.relative_to(agent.root)} (now {total_lines} lines total)\nlast {tail_count} lines:\n{tail_preview}"
+
+
+def tool_insert_at_line(agent, args):
+    path = agent.path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    line_no = int(args["line"])
+    content = str(args["content"])
+    if line_no < 1:
+        raise ValueError("line must be >= 1")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no > len(lines) + 1:
+        raise ValueError(f"line {line_no} out of range (file has {len(lines)} lines)")
+    insert_lines = content.split("\n")
+    new_lines = lines[:line_no - 1] + insert_lines + lines[line_no - 1:]
+    path.write_text("\n".join(new_lines), encoding="utf-8")
+    # Show the inserted lines in context
+    end_line = line_no + len(insert_lines)
+    context_start = max(0, line_no - 2)
+    context_end = min(len(new_lines), end_line + 1)
+    context = "\n".join(f"  {context_start + 1 + i}: {l}" for i, l in enumerate(new_lines[context_start:context_end]))
+    return f"SUCCESS: inserted {len(insert_lines)} lines at line {line_no} in {path.relative_to(agent.root)}\ncontext:\n{context}"
+
+
+def tool_delete_line(agent, args):
+    path = agent.path(args["path"])
+    if not path.is_file():
+        raise ValueError("path is not a file")
+    line_no = int(args["line"])
+    if line_no < 1:
+        raise ValueError("line must be >= 1")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no > len(lines):
+        raise ValueError(f"line {line_no} out of range (file has {len(lines)} lines)")
+    deleted = lines[line_no - 1]
+    new_lines = lines[:line_no - 1] + lines[line_no:]
+    path.write_text("\n".join(new_lines), encoding="utf-8")
+    # Show before/after to prove the delete worked
+    ctx_start = max(0, line_no - 2)
+    before_ctx = lines[ctx_start:line_no + 1]
+    after_ctx = new_lines[ctx_start:line_no + 1]
+    before_str = "\n".join(f"  {ctx_start + 1 + i}: {l}" for i, l in enumerate(before_ctx))
+    after_str = "\n".join(f"  {ctx_start + 1 + i}: {l}" for i, l in enumerate(after_ctx))
+    return (
+        f"SUCCESS: deleted line {line_no} from {path.relative_to(agent.root)}\n"
+        f"deleted content: {deleted[:120]}\n"
+        f"before ({len(lines)} lines):\n{before_str}\n"
+        f"after ({len(new_lines)} lines):\n{after_str}\n"
+        f"The file now has {len(new_lines)} lines. Line {line_no} has changed."
+    )
 
 
 def tool_search(agent, args):
@@ -351,7 +511,8 @@ def tool_write_file(agent, args):
     content = str(args["content"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
+    line_count = len(content.splitlines())
+    return f"wrote {path.relative_to(agent.root)} ({line_count} lines, {len(content)} chars)"
 
 
 def tool_patch_file(agent, args):
@@ -363,11 +524,24 @@ def tool_patch_file(agent, args):
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
+    new_text = str(args["new_text"])
+    nth = int(args.get("nth", 0))
+
     text = path.read_text(encoding="utf-8")
     count = text.count(old_text)
-    if count != 1:
-        raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+
+    if nth == 0:
+        if count != 1:
+            raise ValueError(f"old_text must occur exactly once, found {count}")
+        path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+    else:
+        if nth < 1 or nth > count:
+            raise ValueError(f"nth={nth} out of range, found {count} occurrences")
+        idx = -1
+        for _ in range(nth):
+            idx = text.find(old_text, idx + 1)
+        result = text[:idx] + new_text + text[idx + len(old_text):]
+        path.write_text(result, encoding="utf-8")
     return f"patched {path.relative_to(agent.root)}"
 
 
@@ -523,10 +697,10 @@ def tool_read_entry(agent, args):
         elif path.resolve() == profile.mistakes_file.resolve():
             index_path = profile.index_file
         else:
-            return f"未找到 {path.name} 对应的索引文件。"
+            return f"未找到 {path.name} 对应的索引文件。read_entry 仅适用于笔记/错题文件，请改用 read_file(path={path.name}) 读取全文。"
 
     if not index_path.exists():
-        return f"索引文件 {index_path.name} 不存在。"
+        return f"索引文件 {index_path.name} 不存在。请改用 read_file 读取全文。"
 
     # 解析索引获取 offset/length
     index_text = index_path.read_text(encoding="utf-8")
@@ -596,7 +770,7 @@ def tool_delete_entry(agent, args):
         elif path.resolve() == profile.mistakes_file.resolve():
             index_path = profile.index_file
         else:
-            return f"未找到 {path.name} 对应的索引文件。"
+            return f"未找到 {path.name} 对应的索引文件。delete_entry 仅适用于笔记/错题文件。"
 
     if not index_path.exists():
         return f"索引文件 {index_path.name} 不存在。"
@@ -664,11 +838,15 @@ def tool_read_cache(agent, args):
 
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
+    "file_info": tool_file_info,
     "read_file": tool_read_file,
     "search": tool_search,
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "append_file": tool_append_file,
+    "insert_at_line": tool_insert_at_line,
+    "delete_line": tool_delete_line,
     "delete_file": tool_delete_file,
     "search_mistakes": tool_search_mistakes,
     "get_mistake_detail": tool_get_mistake_detail,

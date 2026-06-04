@@ -22,6 +22,7 @@ STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
 STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_INTERRUPTED = "interrupted"
 
 
 @dataclass
@@ -37,10 +38,16 @@ class TaskStatus:
     tools_called: list = None
     stop_reason: str = ""
     final_answer: str = ""
+    checkpoint_snapshot: dict = None
+    interrupted_at_step: int = 0
+    last_tool_result: str = ""
+    checkpoint_created_at: str = ""
 
     def __post_init__(self):
         if self.tools_called is None:
             self.tools_called = []
+        if self.checkpoint_snapshot is None:
+            self.checkpoint_snapshot = {}
 
     #  创建任务状态类
     @classmethod
@@ -64,6 +71,10 @@ class TaskStatus:
             tools_called=list(data.get("tools_called", [])),
             stop_reason=str(data.get("stop_reason", "")),
             final_answer=str(data.get("final_answer", "")),
+            checkpoint_snapshot=data.get("checkpoint_snapshot") or {},
+            interrupted_at_step=int(data.get("interrupted_at_step", 0)),
+            last_tool_result=str(data.get("last_tool_result", "")),
+            checkpoint_created_at=str(data.get("checkpoint_created_at", "")),
         )
 
     # 记录一次尝试
@@ -105,6 +116,11 @@ class TaskStatus:
         self.final_answer = str(final_answer)
         return self
 
+    def checkpoint(self, snapshot):
+        self.checkpoint_snapshot = snapshot if isinstance(snapshot, dict) else {}
+        self.checkpoint_created_at = datetime.now().isoformat()
+        return self
+
     # 转换为字典
     def to_dict(self):
         return {
@@ -119,4 +135,8 @@ class TaskStatus:
             "tools_called": self.tools_called,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
+            "checkpoint_snapshot": self.checkpoint_snapshot,
+            "interrupted_at_step": self.interrupted_at_step,
+            "last_tool_result": self.last_tool_result,
+            "checkpoint_created_at": self.checkpoint_created_at,
         }

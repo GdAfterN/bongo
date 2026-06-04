@@ -18,14 +18,43 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .trace import TraceStore
 from .models import convert_tools_to_api_schema, convert_history_to_messages
 from .profile import UserProfile, load_current_user
 from .run_store import RunStore
 from .task_status import TaskStatus
 from . import tools as toolkit
 from .utils import MAX_HISTORY, clip, now, persist_large_output
+from .theme import console, STYLE_TOOL_NAME, STYLE_STEP_NUM, STYLE_TOKEN, STYLE_MUTED, STYLE_ERROR
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+
+
+class TokenTracker:
+    """Session 级 token 累计器，用于实时显示用量。"""
+
+    def __init__(self):
+        self.total_input = 0
+        self.total_output = 0
+        self.total_cached = 0
+
+    def update(self, metadata: dict):
+        self.total_input += metadata.get("input_tokens") or 0
+        self.total_output += metadata.get("output_tokens") or 0
+        self.total_cached += metadata.get("cached_tokens") or 0
+
+    def display(self) -> str:
+        parts = []
+        if self.total_input or self.total_output:
+            parts.append(f"{self.total_input:,} in / {self.total_output:,} out")
+        if self.total_cached:
+            parts.append(f"cached: {self.total_cached:,}")
+        return " | ".join(parts) if parts else ""
+
+    def reset(self):
+        self.total_input = 0
+        self.total_output = 0
+        self.total_cached = 0
 REDACTED_VALUE = "<sensitive>"
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
@@ -34,10 +63,10 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
 }
-# 历史超过此条数时触发自动摘要压缩
-COMPACT_THRESHOLD = 50
-# 压缩后保留的最近条数
-COMPACT_KEEP_RECENT = 10
+# 历史超过此条数时触发自动摘要压缩（12轮 * 3条/轮 ≈ 36）
+COMPACT_THRESHOLD = 36
+# 压缩后保留的最近条数（12轮完整 history）
+COMPACT_KEEP_RECENT = 12
 
 
 @dataclass # 类似@Data，省去构造器和toString()方法
@@ -82,6 +111,36 @@ class SessionStore:
         files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
         return files[-1].stem if files else None
 
+    def list_recent(self, limit=10):
+        """返回最近 N 个会话的摘要列表（按修改时间倒序）。
+
+        每项: {id, title, created_at, history_count, work_dir}
+        title 取 history 中第一条 user 消息的前 60 字符。
+        """
+        files = sorted(self.root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        results = []
+        for f in files[:limit]:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            # 从 history 中提取第一条 user 消息作为标题
+            title = ""
+            for item in data.get("history", []):
+                if item.get("role") == "user":
+                    content = item.get("content", "")
+                    if isinstance(content, str):
+                        title = content[:60].replace("\n", " ")
+                    break
+            results.append({
+                "id": data.get("id", f.stem),
+                "title": title or "(无标题)",
+                "created_at": str(data.get("created_at", ""))[:19],
+                "history_count": len(data.get("history", [])),
+                "work_dir": data.get("work_dir", ""),
+            })
+        return results
+
 
 class bongo:
     def __init__(
@@ -91,6 +150,7 @@ class bongo:
         session_store=None,
         session=None,
         run_store=None,
+        trace_store=None,
         approval_policy="ask",
         max_steps=20,
         max_new_tokens=2048,
@@ -116,7 +176,8 @@ class bongo:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.session_store = session_store or SessionStore(self.work_dir / ".bongo" / "sessions")
-        self.run_store = run_store or RunStore(self.work_dir / ".bongo" / "runs")
+        self.run_store = run_store or RunStore(self.work_dir / ".bongo" / "reports")
+        self.trace_store = trace_store or TraceStore(self.work_dir / ".bongo" / "traces")
         try:
             self._user_profile = UserProfile(load_current_user())
         except Exception:
@@ -137,6 +198,8 @@ class bongo:
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
+        self.session.setdefault("active_run_id", "")
+        self.session.setdefault("checkpoints", [])
         self.session_path = self.session_store.save(self.session)
         self.current_task_status = None
         self.current_run_dir = None
@@ -146,15 +209,24 @@ class bongo:
         self._last_react_steps = []
         self._delete_cooldown = {}  # path -> last delete timestamp
         self._delete_just_happened = None  # "notes" or "mistakes" or None
+        self._write_done = False  # True after any successful write in current ask()
+        self._last_write_result = ""  # Result text of the last successful write
+        self._recovery_context = None
+        self._drift_detected = None
+        self.token_tracker = TokenTracker()
 
     @classmethod
     def from_session(cls, model_client, session_store, session_id, **kwargs):
-        return cls(
+        session = session_store.load(session_id)
+        agent = cls(
             model_client=model_client,
             session_store=session_store,
-            session=session_store.load(session_id),
+            session=session,
             **kwargs,
         )
+        agent._check_interrupted_run()
+        agent._detect_workspace_drift(session)
+        return agent
 
     @staticmethod  # 静态方法
     def remember(bucket, item, limit):
@@ -204,23 +276,34 @@ class bongo:
             - Use tools instead of guessing about file contents.
             - *** CRITICAL: After delete_entry succeeds (result starts with '已删除'), your next message MUST be the final answer to the user. Do NOT call any more tools. ***
             - *** CRITICAL: After patch_file succeeds (result contains 'patched'), your next message MUST be the final answer. Do NOT read the file. Trust the tool result. ***
+            - *** CRITICAL: ALL tool results are authoritative and complete. NEVER re-read a file to verify a successful write/append/delete. The tool result IS the proof. Output your final answer immediately. ***
+            - *** CRITICAL: NEVER repeat a tool call with the same arguments. If it succeeded, move on. If it failed, try a different approach. ***
+            - *** CRITICAL: After any successful write operation (patch_file, append_file, insert_at_line, write_file, delete_file, delete_line), your NEXT message MUST be the final answer. No exceptions. ***
+            - *** CRITICAL: When the user gives a file path (e.g. CC/foo.md), USE IT DIRECTLY. NEVER call list_files to verify the path exists. The path is valid. ***
+            - *** CRITICAL: For patch_file, use read_file(grep="keyword") to find the target text. Do NOT read the entire file first. ***
             - IMPORTANT: read_entry already gives you the full content of an entry. Do NOT also call read_file or read_entry again for the same content. Use what you already have.
             - IMPORTANT: After reading an entry, go straight to the action (patch/write). Do NOT read the file again, do NOT list files, do NOT call unrelated tools.
             - IMPORTANT: When the user asks to modify a file, do: 1) read_entry to get content, 2) patch_file to modify, 3) output final answer. That is 2 tool calls maximum. Do NOT add extra reads or verification steps.
             - IMPORTANT: Only call tools that are directly needed for the user's request. Do NOT call list_files, search, or read_file unless the user specifically asks for them.
             - IMPORTANT: To save learning notes, use the write_note tool. Do NOT use write_file for notes.
-            - IMPORTANT: To read a specific entry by list number, use read_entry(path, entry).
+            - IMPORTANT: To read a specific entry by list number, use read_entry(path, entry). Only works for notes/mistakes files that have an index. For other files (docs, code), use read_file instead.
             - IMPORTANT: To delete a specific entry by list number, use delete_entry(path, entry). Do NOT use patch_file for this.
             - IMPORTANT: When a tool result says 'Full output saved to: ...', use read_cache(path) to read the full content.
+            - IMPORTANT: For "add/append a line" operations, use append_file (1 step, no read needed).
+            - IMPORTANT: To delete a specific line, use delete_line(path, line). Do NOT use patch_file to delete lines.
+            - IMPORTANT: To check file size or line count before reading, use file_info first.
+            - IMPORTANT: To find specific content in a file, use read_file(grep="keyword") instead of reading the whole file.
+            - IMPORTANT: To read the end of a file, use read_file(tail=N) instead of reading from the start.
+            - IMPORTANT: To insert content at a specific line number, use insert_at_line(path, line, content).
+            - IMPORTANT: patch_file now accepts nth=N to replace the Nth occurrence (default 0 = must be unique).
             - When you have the final answer, output it directly without calling any tool.
-            - Never invent tool results.
-            - Do not repeat the same tool call with the same arguments."""
+            - Never invent tool results. If a tool succeeded, report its result. If it failed, report the error. Do NOT claim something is true unless a tool confirmed it."""
         ).strip()
 
         return PromptPrefix(
             text=text,
             hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            workspace_fingerprint="",
+            workspace_fingerprint=self._compute_workspace_fingerprint(),
             tool_signature=self.tool_signature(),
             built_at=now(),
         )
@@ -232,12 +315,18 @@ class bongo:
 
     def refresh_prefix(self, force=False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
+        # Compare workspace fingerprint BEFORE rebuilding prefix
+        current_fingerprint = self._compute_workspace_fingerprint()
+        stored_fp = getattr(self.prefix_state, "workspace_fingerprint", "")
+        workspace_changed = bool(stored_fp) and current_fingerprint != stored_fp
+
         prefix_state = self.build_prefix() if force or previous_hash is None else self.prefix_state
         prefix_changed = force or previous_hash != prefix_state.hash
         if prefix_changed:
             self._apply_prefix_state(prefix_state)
+        self.prefix_state.workspace_fingerprint = current_fingerprint
         self._last_prefix_refresh = {
-            "workspace_changed": False,
+            "workspace_changed": workspace_changed,
             "prefix_changed": prefix_changed,
         }
         return dict(self._last_prefix_refresh)
@@ -292,9 +381,10 @@ class bongo:
         """当历史过长时，用模型生成摘要替换旧历史。
 
         借鉴 Claude Code 的 Autocompact 思想的简化版：
-        - 不 fork 子 Agent，直接用当前模型生成摘要
+        - fork 子 agent 压缩旧 history
         - 只替换旧历史，保留最近 COMPACT_KEEP_RECENT 条
         - 摘要作为 system 消息插入，标记为压缩边界
+        - 从 trace 中提取工具链路存入 checkpoint
         """
         history = self.session.get("history", [])
         if len(history) <= COMPACT_THRESHOLD:
@@ -303,6 +393,11 @@ class bongo:
         keep_recent = COMPACT_KEEP_RECENT
         old_entries = history[:-keep_recent]
         recent_entries = history[-keep_recent:]
+
+        # 从 trace 中提取工具链路构建 checkpoint
+        trace_entries = self.trace_store.read_all(self.session["id"])
+        snapshot = self._build_checkpoint_snapshot(old_entries, trace_entries)
+        self._save_checkpoint(snapshot)
 
         # 构建摘要提示词
         summary_lines = []
@@ -349,6 +444,197 @@ class bongo:
         self.session["history"] = [compact_marker] + recent_entries
         self.session_store.save(self.session)
         return True
+
+    def _build_checkpoint_snapshot(self, entries, trace_entries=None):
+        """Build a compact snapshot of working state before compression.
+
+        优先从 trace 中提取工具链路（更轻量），trace 不可用时回退到 history。
+        """
+        tools_summary = []
+        if trace_entries:
+            for t in trace_entries:
+                tool = t.get("tool", "")
+                target = t.get("target", "")
+                if target:
+                    tools_summary.append(f"{tool}({target})")
+                else:
+                    tools_summary.append(tool)
+        else:
+            for item in entries:
+                role = item.get("role", "")
+                if role == "tool":
+                    name = item.get("name", "")
+                    args = item.get("args", {})
+                    tools_summary.append(f"{name}({json.dumps(args, sort_keys=True)[:100]})")
+                elif role == "assistant":
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                tools_summary.append(f"{block.get('name', '')}(...)")
+        return {
+            "entry_count": len(entries),
+            "tools_called": tools_summary,
+            "task_summary": self.session.get("memory", {}).get("working", {}).get("task_summary", ""),
+            "recent_files": list(self.session.get("memory", {}).get("working", {}).get("recent_files", [])),
+            "workspace_fingerprint": self._compute_workspace_fingerprint(),
+            "created_at": now(),
+        }
+
+    def _save_checkpoint(self, snapshot):
+        """Save checkpoint to session for retrieval on resume."""
+        if "checkpoints" not in self.session:
+            self.session["checkpoints"] = []
+        self.session["checkpoints"].append(snapshot)
+        self.session["checkpoints"] = self.session["checkpoints"][-3:]
+        self.session_store.save(self.session)
+
+    def _compute_workspace_fingerprint(self):
+        """Cheap workspace fingerprint: top-level file listing + git HEAD."""
+        parts = []
+        try:
+            entries = sorted(
+                p.name for p in self.root.iterdir()
+                if p.name not in {".git", ".bongo", "__pycache__", ".venv", "venv"}
+            )
+            parts.append(",".join(entries))
+        except OSError:
+            parts.append("(unreadable)")
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self.root), capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                parts.append(result.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        combined = "|".join(parts)
+        return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+    def _check_interrupted_run(self):
+        """If the previous run was interrupted, prepare recovery context."""
+        active_run_id = self.session.get("active_run_id", "")
+        if not active_run_id:
+            return
+        try:
+            run_dir = self.run_store.run_dir(active_run_id)
+            status_path = run_dir / "task_status.json"
+            if not status_path.exists():
+                self.session["active_run_id"] = ""
+                return
+            status_data = json.loads(status_path.read_text(encoding="utf-8"))
+            task_status = TaskStatus.from_dict(status_data)
+        except Exception:
+            self.session["active_run_id"] = ""
+            return
+        if task_status.status != "running":
+            self.session["active_run_id"] = ""
+            return
+        # 从 trace 中读取最近的工具调用链路
+        trace_entries = self.trace_store.read_last(self.session["id"], n=20)
+        self._recovery_context = {
+            "active_run_id": active_run_id,
+            "task_status": task_status,
+            "user_request": task_status.user_request,
+            "tools_called": task_status.tools_called,
+            "tool_steps": task_status.tool_steps,
+            "last_tool": task_status.last_tool,
+            "current_action": task_status.current_action,
+            "trace_entries": trace_entries,
+        }
+        from .task_status import STOP_REASON_INTERRUPTED
+        task_status.stop(
+            stop_reason=STOP_REASON_INTERRUPTED,
+            status="stopped",
+            final_answer="(interrupted - will resume)",
+        )
+        self.run_store.write_task_status(task_status)
+
+    def _detect_workspace_drift(self, stored_session):
+        """Compare stored work_dir and fingerprint with actual workspace."""
+        stored_work_dir = stored_session.get("work_dir", "")
+        actual_work_dir = str(self.work_dir)
+        work_dir_changed = stored_work_dir != actual_work_dir
+        current_fp = self._compute_workspace_fingerprint()
+        stored_fp = ""
+        checkpoints = stored_session.get("checkpoints", [])
+        if checkpoints:
+            stored_fp = checkpoints[-1].get("workspace_fingerprint", "")
+        workspace_files_changed = bool(stored_fp) and stored_fp != current_fp
+        if work_dir_changed or workspace_files_changed:
+            self._drift_detected = {
+                "work_dir_changed": work_dir_changed,
+                "stored_work_dir": stored_work_dir,
+                "actual_work_dir": actual_work_dir,
+                "workspace_files_changed": workspace_files_changed,
+                "stored_fingerprint": stored_fp,
+                "current_fingerprint": current_fp,
+            }
+            self._invalidate_stale_summaries()
+            self.session["_drift_info"] = self._drift_detected
+        else:
+            self._drift_detected = None
+            self.session.pop("_drift_info", None)
+
+    def _invalidate_stale_summaries(self):
+        """Clear file summaries since workspace has drifted."""
+        memory_state = self.session.get("memory", {})
+        file_summaries = memory_state.get("file_summaries", {})
+        if file_summaries:
+            file_summaries.clear()
+        working = memory_state.get("working", {})
+        working.pop("recent_files", None)
+
+    def _resume_ask(self, user_message, recovery):
+        """Resume an interrupted ask() from the last known state.
+
+        流程：
+        1. 压缩旧 history（超过 COMPACT_THRESHOLD 的部分）
+        2. 从 trace 中提取工具链路，注入 memory
+        3. 注入恢复提示，调用正常 ask()
+        """
+        prev_request = recovery["user_request"]
+        prev_status = recovery["task_status"]
+        trace_entries = recovery.get("trace_entries", [])
+
+        # 1. 压缩旧 history
+        self.compact_history()
+
+        # 2. 从 trace 构建恢复上下文，注入 memory
+        if trace_entries:
+            tool_chain = []
+            for entry in trace_entries:
+                tool = entry.get("tool", "")
+                target = entry.get("target", "")
+                if target:
+                    tool_chain.append(f"{tool}({target})")
+                else:
+                    tool_chain.append(tool)
+            recovery_memory = (
+                f"上次中断的任务: {prev_request[:100]}\n"
+                f"已执行 {prev_status.tool_steps} 步, 工具链: {', '.join(tool_chain[-10:])}\n"
+                f"最后动作: {prev_status.current_action}"
+            )
+            self.memory.state.setdefault("working", {})["recovery_context"] = recovery_memory
+
+        # 3. 注入恢复提示
+        if user_message.strip() == prev_request.strip():
+            recovery_note = (
+                f"[System: Previous run was interrupted after "
+                f"{prev_status.tool_steps} tool steps. "
+                f"Last action: {prev_status.current_action}. "
+                f"Tool chain: {', '.join(prev_status.tools_called)}. "
+                f"Please continue from where you left off.]"
+            )
+        else:
+            recovery_note = (
+                f"[System: Previous run was interrupted while processing: "
+                f"'{prev_request[:100]}'. Starting new task.]"
+            )
+        self.record({"role": "system", "content": recovery_note, "created_at": now()})
+        return self.ask(user_message)
 
     def prompt(self, user_message):
         prompt, _ = self._build_prompt_and_metadata(user_message)
@@ -480,6 +766,16 @@ class bongo:
 
         return system, api_tools, history_messages
 
+    @staticmethod
+    def _extract_tool_target(name, args):
+        """从工具参数中提取作用目标（文件路径等）。"""
+        for key in ("path", "file_path", "filename"):
+            if key in args:
+                return str(args[key])
+        if name == "search" and "query" in args:
+            return str(args["query"])[:80]
+        return ""
+
     # 这个方法是"运行轨迹记录器"，
     # 它的作用是将 bongo 智能体在执行任务过程中的每一个关键事件（如思考、工具调用、输出等）都记录下来，
     # 形成一个完整的执行时间线，用于调试、监控和审计。
@@ -514,7 +810,7 @@ class bongo:
             return
 
         canonical_path = self.memory.canonical_path(path)
-        if name in {"read_file", "write_file", "patch_file"}:
+        if name in {"read_file", "write_file", "patch_file", "file_info", "append_file", "insert_at_line", "delete_line"}:
             self.memory.remember_file(canonical_path)
 
         # /ask 模式：更新 ask_mode 索引和已加载文档
@@ -526,7 +822,7 @@ class bongo:
             if name == "read_file":
                 summary = memorylib.summarize_read_result(result, model_client=self.model_client)
                 self.memory.set_file_summary(canonical_path, summary)
-            elif name in {"write_file", "patch_file"}:
+            elif name in {"write_file", "patch_file", "append_file", "insert_at_line", "delete_line"}:
                 self.memory.invalidate_file_summary(canonical_path)
 
     def _update_ask_mode_after_tool(self, name, args, result, canonical_path):
@@ -548,7 +844,7 @@ class bongo:
             if doc_id:
                 self.memory.load_document(doc_id, path, result)
                 self._fork_summary(doc_id, path)
-        elif name in {"write_file", "patch_file"}:
+        elif name in {"write_file", "patch_file", "append_file", "insert_at_line"}:
             if doc_id:
                 self._fork_summary(doc_id, path)
 
@@ -632,7 +928,15 @@ class bongo:
         如果新人想理解 bongo 是怎么"从一句话跑成一个 agent 流程"的，
         这里就是最关键的入口。
         """
+        # Resume detection: if previous run was interrupted, delegate to _resume_ask
+        recovery = getattr(self, "_recovery_context", None)
+        if recovery:
+            self._recovery_context = None  # consume once
+            return self._resume_ask(user_message, recovery)
+
         run_started_at = time.monotonic()  # 返回单调时间,便于计算所用时间
+        self._write_done = False  # reset per-turn write guard
+        self._last_write_result = ""
 
         self.memory.set_task_summary(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
@@ -640,6 +944,9 @@ class bongo:
             run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
         self.current_task_status = task_status
         self.current_run_dir = self.run_store.start_run(task_status)
+        # Link session to this run for interruption recovery
+        self.session["active_run_id"] = task_status.run_id
+        self.session_store.save(self.session)
         # 记录运行开始的轨迹时间
         self.emit_trace(
             task_status,
@@ -655,11 +962,38 @@ class bongo:
         react_round = 0  # ReAct 循环轮次（用于显示）
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)  # 这是为了容忍一定次数的模型错误,同时设置合理上限:
         step_lines = []  # 记录中间步骤的输出行，用于最终折叠
+        consecutive_blocks = 0  # 连续被拦截/错误的工具调用次数
+        WRITE_OPS = {"append_file", "insert_at_line", "write_file", "patch_file", "delete_line", "delete_file"}
 
         def _step_print(text):
             """打印并记录中间步骤，后续可折叠。"""
             step_lines.append(text)
             print(text)
+
+        def _styled_step(step_num, action, detail=""):
+            """输出带颜色的 ReAct 步骤，兼容 ANSI 折叠。"""
+            dim = "\033[2m"
+            bold = "\033[1m"
+            cyan = "\033[36m"
+            yellow = "\033[33m"
+            green = "\033[32m"
+            reset = "\033[0m"
+            header = f"  {dim}[{step_num}/{self.max_steps}]{reset} "
+            if action == "Thinking":
+                _step_print(f"{header}{dim}{cyan}{action}{reset}")
+            elif action == "Acting":
+                # 工具名用黄色加粗，参数用黄色
+                paren_idx = detail.find("(")
+                if paren_idx > 0:
+                    tool_name = detail[:paren_idx]
+                    args_part = detail[paren_idx:]
+                    _step_print(f"{header}{bold}{yellow}{tool_name}{reset}{dim}{yellow}{args_part}{reset}")
+                else:
+                    _step_print(f"{header}{bold}{yellow}{detail}{reset}")
+            elif action == "Done":
+                _step_print(f"{header}{bold}{green}{action}{reset}")
+            else:
+                _step_print(f"{header}{action}")
 
         # 这是 agent 的主循环，可以按"感知 -> 决策 -> 行动 -> 记录"来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
@@ -670,7 +1004,7 @@ class bongo:
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
             react_round += 1
-            _step_print(f"\n  [Round {react_round}] Thinking...")
+            _styled_step(react_round, "Thinking")
             task_status.record_attempt()
             prompt_started_at = time.monotonic()
             # 每个关键步骤都更新 current_action 并落盘，方便外部 --status 随时查看
@@ -725,6 +1059,8 @@ class bongo:
                 prompt_metadata.update(completion_metadata)
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
+            if completion_metadata:
+                self.token_tracker.update(completion_metadata)
             task_status.current_action = "model_completed"
             self.run_store.write_task_status(task_status)
             kind, payload = self.parse(raw)
@@ -743,7 +1079,7 @@ class bongo:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 args_preview = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:3])
-                _step_print(f"  [Round {react_round}] Acting: {name}({args_preview})")
+                _styled_step(react_round, "Acting", f"{name}({args_preview})")
                 tool_use_id = payload.get("id", f"toolu_{uuid.uuid4().hex[:12]}")
                 task_status.record_tool(name)
                 task_status.current_action = f"executing_tool:{name}"
@@ -779,6 +1115,23 @@ class bongo:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+                # 轻量 trace：只记工具名 + 作用目标，用于中断恢复
+                self.trace_store.append(self.session["id"], {
+                    "round": react_round,
+                    "tool": name,
+                    "target": self._extract_tool_target(name, args),
+                })
+                # Track consecutive blocked/error calls — hard stop after 3
+                # Only reset counter on successful WRITES, not reads (reads don't unblock the model)
+                meta = self._last_tool_result_metadata or {}
+                if meta.get("tool_status") in ("rejected", "error"):
+                    consecutive_blocks += 1
+                    if consecutive_blocks >= 3:
+                        final = "Task completed. The write operation already succeeded in a previous round."
+                        _styled_step(react_round, "Done")
+                        break
+                elif name in WRITE_OPS:
+                    consecutive_blocks = 0  # only reset on successful write
                 continue
 
             if kind == "retry":
@@ -787,7 +1140,7 @@ class bongo:
                 continue
 
             final = (payload or raw).strip()
-            _step_print(f"  [Round {react_round}] Done")
+            _styled_step(react_round, "Done")
 
             # 折叠中间步骤：清掉已输出的步骤行，替换为一行摘要
             if step_lines:
@@ -795,12 +1148,10 @@ class bongo:
                 # ANSI: 上移 total_lines 行，清掉从光标到屏幕末尾的内容
                 sys.stdout.write(f"\033[{total_lines}A\033[J")
                 sys.stdout.flush()
-                detail = " | ".join(
-                    line.strip() for line in step_lines
-                    if line.strip().startswith("[Round")
-                )
-                print(f"  [ReAct: {react_round} rounds, {tool_steps} tools] {detail}")
-                print(f"  (按 Enter 展开完整过程)")
+                token_str = self.token_tracker.display()
+                token_part = f" | \033[2m{token_str}\033[0m" if token_str else ""
+                print(f"  \033[1m[\033[33mReAct: {react_round} rounds, {tool_steps} tools\033[0m\033[1m]\033[0m{token_part}")
+                print(f"  \033[2m(按 Enter 展开完整过程)\033[0m")
             self._last_react_steps = list(step_lines)
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_status.current_action = "final_answer"
@@ -817,6 +1168,8 @@ class bongo:
                 },
             )
             self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
+            self.session["active_run_id"] = ""
+            self.session_store.save(self.session)
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
@@ -846,9 +1199,13 @@ class bongo:
             total_lines = sum(text.count("\n") + 1 for text in step_lines)
             sys.stdout.write(f"\033[{total_lines}A\033[J")
             sys.stdout.flush()
-            print(f"  [ReAct: {react_round} rounds, {tool_steps} tools] (达到上限)")
-            print(f"  (按 Enter 展开完整过程)")
+            token_str = self.token_tracker.display()
+            token_part = f" | \033[2m{token_str}\033[0m" if token_str else ""
+            print(f"  \033[1m[\033[33mReAct: {react_round} rounds, {tool_steps} tools\033[0m\033[1m] (达到上限)\033[0m{token_part}")
+            print(f"  \033[2m(按 Enter 展开完整过程)\033[0m")
         self._last_react_steps = list(step_lines)
+        self.session["active_run_id"] = ""
+        self.session_store.save(self.session)
         return final
 
     def run_tool(self, name, args):
@@ -901,7 +1258,17 @@ class bongo:
                 "tool_error_code": "repeated_identical_call",
                 "security_event_type": "",
             }
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+            prev = self._last_write_result[:200] if self._last_write_result else "(result not available)"
+            return f"error: repeated identical tool call for {name}. The first call already succeeded with this result:\n{prev}\n\nThe operation was successful. You MUST output your final answer NOW. Do NOT call any more tools."
+        # After any successful write, block ALL subsequent writes
+        WRITE_OPS = {"append_file", "insert_at_line", "write_file", "patch_file", "delete_line", "delete_file"}
+        if name in WRITE_OPS and self._write_done:
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "write_already_done",
+                "security_event_type": "",
+            }
+            return "error: A write operation already succeeded. You MUST output your final answer NOW. Do NOT call any more tools. Do NOT read files. Do NOT verify anything. The previous write was successful."
         # delete_entry cooldown: block rapid repeated deletes on the same file
         if name == "delete_entry":
             path_key = str(args.get("path", ""))
@@ -916,7 +1283,7 @@ class bongo:
                 return "error: delete_entry cooldown — you already deleted from this file. Output your final answer now. Do NOT delete again."
         # Post-delete read guard: block pointless reads on a file that was just deleted from
         now_ts = time.time()
-        if name in ("read_file", "read_entry", "search"):
+        if name in ("read_file", "read_entry", "search", "file_info"):
             path_key = str(args.get("path", ""))
             last_delete = self._delete_cooldown.get(path_key, 0)
             if now_ts - last_delete < 10:
@@ -952,6 +1319,12 @@ class bongo:
             raw_result = str(tool["run"](args))
             tool_use_id = f"{name}_{hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:8]}"
             result, cache_path = persist_large_output(raw_result, tool_use_id)
+            # After any successful write operation, inject a stop instruction
+            WRITE_OPS = {"append_file", "insert_at_line", "write_file", "patch_file", "delete_line", "delete_file"}
+            if name in WRITE_OPS and not result.startswith("error:"):
+                self._write_done = True
+                self._last_write_result = result
+                result += "\n\n[SYSTEM] Write complete. Output your final answer NOW. Do NOT read the file. Do NOT call any more tools."
             # Record delete cooldown on success and inject stop instruction
             if name == "delete_entry" and result.startswith("已删除"):
                 path_key = str(args.get("path", ""))
@@ -982,30 +1355,35 @@ class bongo:
             return f"error: tool {name} failed: {exc}"
 
     def repeated_tool_call(self, name, args):
-        # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
-        # 检查：上一次完全相同的调用（同名同参数）之后，是否有其他工具调用。
-        # 如果没有（连续重复），则拦截；如果有（中间做了别的事），则放行。
+        # 写操作：检查最近 10 次调用中是否有完全相同的成功写操作。
+        # 读操作：只检查最后一次调用是否完全相同（连续重复才拦截）。
+        # _write_done 全局写锁是写操作的最终兜底。
+        WRITE_TOOLS = {"append_file", "insert_at_line", "write_file", "patch_file", "delete_line", "delete_file", "delete_entry"}
+        is_write = name in WRITE_TOOLS
+
         history = self.session["history"]
-        last_match_idx = -1
-        last_tool_idx = -1
-        for i, item in enumerate(history):
-            if item.get("role") != "tool":
-                continue
-            last_tool_idx = i
-            if item.get("name") != name:
-                continue
-            if i > 0:
-                prev = history[i - 1]
-                if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
-                    for block in prev["content"]:
-                        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == name:
-                            if block.get("input", {}) == args:
-                                last_match_idx = i
-                            break
-        # 没有历史匹配，或上次匹配之后有其他工具调用，放行
-        if last_match_idx < 0:
+        recent_calls = []
+        for item in history:
+            if item.get("role") == "assistant" and isinstance(item.get("content"), list):
+                for block in item["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        recent_calls.append((block.get("name"), block.get("input", {})))
+            elif item.get("role") == "tool":
+                content = item.get("content", "")
+                if isinstance(content, str) and content.startswith("error:"):
+                    recent_calls.pop()
+
+        if is_write:
+            for call_name, call_args in recent_calls[-10:]:
+                if call_name == name and call_args == args:
+                    return True
             return False
-        return last_match_idx == last_tool_idx
+        else:
+            # 读操作：只检查最后一次调用是否完全相同（连续重复才拦截）
+            if not recent_calls:
+                return False
+            last_name, last_args = recent_calls[-1]
+            return last_name == name and last_args == args
 
     @staticmethod
     def new_task_id():

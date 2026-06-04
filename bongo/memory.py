@@ -148,7 +148,7 @@ def render_ask_memory(state, workspace_root=None):
         for entry in index:
             summary = f" - {entry['summary']}" if entry.get("summary") else ""
             lines.append(f"  [{entry['id']}] {entry['label']}{summary}")
-        lines.append("User references documents by number, e.g. 'read #3', 'modify #5'.")
+        lines.append("User references documents by number, e.g. 'read #3', 'modify #5'. Use read_file to access these files, not read_entry.")
 
     loaded = ask.get("loaded", {})
     if loaded:

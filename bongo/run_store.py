@@ -68,6 +68,26 @@ class RunStore:
     def load_report(self, task_id):
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
 
+    def find_interrupted_run(self):
+        """Find the most recent run with status='running' (i.e., interrupted)."""
+        if not self.root.exists():
+            return None
+        run_dirs = sorted(self.root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for run_dir in run_dirs:
+            if not run_dir.is_dir():
+                continue
+            status_path = run_dir / "task_status.json"
+            if not status_path.exists():
+                continue
+            try:
+                data = json.loads(status_path.read_text(encoding="utf-8"))
+                if data.get("status") == "running":
+                    from .task_status import TaskStatus
+                    return TaskStatus.from_dict(data)
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+        return None
+
     def _write_json_atomic(self, path, payload):
         # 原子写：先写临时文件，再 replace。
         # 这样即使中途异常，也不容易留下半截 JSON。

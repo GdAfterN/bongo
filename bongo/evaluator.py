@@ -18,7 +18,7 @@ from .task_status import STOP_REASON_FINAL_ANSWER_RETURNED
 # ... existing code ...
 BENCHMARK_SCHEMA_VERSION = 1  # 基准测试配置文件的版本号，用于确保代码与 JSON 格式兼容
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")  # 默认的任务定义文件路径（即“试卷”的位置）
-DEFAULT_ARTIFACT_PATH = Path("benchmarks/benchmark-v1.json")   # 默认的运行结果输出路径（即“成绩单”的保存位置）
+DEFAULT_ARTIFACT_PATH = Path("benchmarks/benchmarks-v1.json")   # 默认的运行结果输出路径（即“成绩单”的保存位置）
 DEFAULT_MODEL_NAME = "FakeModelClient"      # 默认使用的模型客户端名称（通常用于测试或模拟环境）
 DEFAULT_MODEL_VERSION = "scripted-deterministic"  # 默认模型版本：脚本化确定性模型（即不依赖真实 AI，而是按预设剧本回复）
 DEFAULT_TEMPERATURE = 0.0                   # 默认温度参数：设为 0 保证模型输出完全确定，没有随机性
@@ -53,17 +53,17 @@ TASK_FIXTURE_ARTIFACTS = {
 SCRIPTED_MODEL_OUTPUTS = {
     # 任务：修改 README 引言
     "readme_intro_locked": [
-        {"type": "tool_use", "id": "toolu_bench_001", "name": "patch_file", "input": {"path": "README.md", "old_text": "This is a placeholder benchmark fixture.", "new_text": "This fixture is a locked benchmark workspace."}},
+        {"type": "tool_use", "id": "toolu_bench_001", "name": "patch_file", "input": {"path": "README.md", "old_text": "This is a placeholder benchmarks fixture.", "new_text": "This fixture is a locked benchmarks workspace."}},
         "Done.",
     ],
     # 任务：修改 README 关于 schema 的说明
     "readme_schema_note": [
-        {"type": "tool_use", "id": "toolu_bench_002", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the repo.", "new_text": "- The benchmark schema and baseline are fixed."}},
+        {"type": "tool_use", "id": "toolu_bench_002", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the repo.", "new_text": "- The benchmarks schema and baseline are fixed."}},
         "Done.",
     ],
     # 任务：修改 README 关于文件排序的说明
     "readme_ordering_note": [
-        {"type": "tool_use", "id": "toolu_bench_003", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the file layout.", "new_text": "- Deterministic file ordering keeps benchmark diffs stable."}},
+        {"type": "tool_use", "id": "toolu_bench_003", "name": "patch_file", "input": {"path": "README.md", "old_text": "- Placeholder note about the file layout.", "new_text": "- Deterministic file ordering keeps benchmarks diffs stable."}},
         "Done.",
     ],
     # 任务：将 sample.txt 中的 beta 替换为 beta-locked
@@ -126,7 +126,7 @@ def _workspace_relative(path, workspace_root):
 def _scripted_outputs_for_task(task):
     outputs = SCRIPTED_MODEL_OUTPUTS.get(task["id"])
     if outputs is None:
-        raise ValueError(f"no scripted model outputs for benchmark task: {task['id']}")
+        raise ValueError(f"no scripted model outputs for benchmarks task: {task['id']}")
     return list(outputs)
 
 
@@ -145,56 +145,56 @@ def _fixture_snapshot_id(fixture_paths):
 
 def validate_benchmark(data, repo_root=None):
     if not isinstance(data, dict):
-        raise ValueError("benchmark must be a mapping")
+        raise ValueError("benchmarks must be a mapping")
 
     missing = [key for key in REQUIRED_BENCHMARK_KEYS if key not in data]
     if missing:
-        raise ValueError(f"benchmark is missing required keys: {', '.join(missing)}")
+        raise ValueError(f"benchmarks is missing required keys: {', '.join(missing)}")
 
     if int(data.get("schema_version", 0)) != BENCHMARK_SCHEMA_VERSION:
-        raise ValueError("unsupported benchmark schema_version")
+        raise ValueError("unsupported benchmarks schema_version")
 
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
-        raise ValueError("benchmark tasks must be a non-empty list")
+        raise ValueError("benchmarks tasks must be a non-empty list")
 
     repo_root = Path(repo_root or Path.cwd()).resolve()
     seen_ids = set()
     normalized_tasks = []
     for index, task in enumerate(tasks):
         if not isinstance(task, dict):
-            raise ValueError(f"benchmark task at index {index} must be a mapping")
+            raise ValueError(f"benchmarks task at index {index} must be a mapping")
 
         missing_task_keys = [key for key in REQUIRED_TASK_KEYS if key not in task]
         if missing_task_keys:
             raise ValueError(
-                f"benchmark task {task.get('id', index)!r} is missing required keys: {', '.join(missing_task_keys)}"
+                f"benchmarks task {task.get('id', index)!r} is missing required keys: {', '.join(missing_task_keys)}"
             )
 
         task_id = str(task["id"]).strip()
         if not task_id:
-            raise ValueError(f"benchmark task at index {index} has an empty id")
+            raise ValueError(f"benchmarks task at index {index} has an empty id")
         if task_id in seen_ids:
-            raise ValueError(f"duplicate benchmark task id: {task_id}")
+            raise ValueError(f"duplicate benchmarks task id: {task_id}")
         seen_ids.add(task_id)
 
         fixture_repo = repo_root / str(task["fixture_repo"])
         if not fixture_repo.is_dir():
-            raise ValueError(f"benchmark task {task_id} fixture repo does not exist: {task['fixture_repo']}")
+            raise ValueError(f"benchmarks task {task_id} fixture repo does not exist: {task['fixture_repo']}")
 
         allowed_tools = task["allowed_tools"]
         if not isinstance(allowed_tools, list) or not allowed_tools:
-            raise ValueError(f"benchmark task {task_id} allowed_tools must be a non-empty list")
+            raise ValueError(f"benchmarks task {task_id} allowed_tools must be a non-empty list")
         normalized_allowed_tools = []
         for tool in allowed_tools:
             tool_name = str(tool).strip()
             if not tool_name:
-                raise ValueError(f"benchmark task {task_id} has an empty allowed_tools entry")
+                raise ValueError(f"benchmarks task {task_id} has an empty allowed_tools entry")
             normalized_allowed_tools.append(tool_name)
 
         step_budget = int(task["step_budget"])
         if step_budget < 1:
-            raise ValueError(f"benchmark task {task_id} step_budget must be positive")
+            raise ValueError(f"benchmarks task {task_id} step_budget must be positive")
 
         normalized_task = dict(task)
         normalized_task["id"] = task_id
@@ -263,7 +263,7 @@ class BenchmarkEvaluator:
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
         self.workspace_root = Path(workspace_root) if workspace_root is not None else Path(
-            tempfile.mkdtemp(prefix="bongo-benchmark-")
+            tempfile.mkdtemp(prefix="bongo-benchmarks-")
         )
         self.model_name = model_name
         self.model_version = model_version
@@ -288,7 +288,7 @@ class BenchmarkEvaluator:
                 "commit_sha": _git_value(["rev-parse", "HEAD"], cwd=self.repo_root),
                 "branch": _git_value(["branch", "--show-current"], cwd=self.repo_root),
             },
-            "benchmark": {
+            "benchmarks": {
                 "source": str(self.benchmark_path.resolve().relative_to(self.repo_root)),
                 "task_count": len(benchmark["tasks"]),
             },
@@ -323,7 +323,7 @@ class BenchmarkEvaluator:
         shutil.copytree(fixture_source, fixture_copy_root)
 
         session_store = SessionStore(fixture_copy_root / ".bongo" / "sessions")
-        run_store = RunStore(fixture_copy_root / ".bongo" / "runs")
+        run_store = RunStore(fixture_copy_root / ".bongo" / "reports")
         if self.model_client_factory is not None:
             model_client = self.model_client_factory(task=task, work_dir=fixture_copy_root)
         else:

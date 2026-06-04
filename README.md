@@ -268,7 +268,7 @@ bongo 可以作为 MCP server 被 Claude Code 调用，暴露以下工具：
 
 ### 7. 检查点与恢复
 
-会话状态以 JSON 保存在 `.bongo/sessions/`，运行工件保存在 `.bongo/runs/<run_id>/`。两层持久化分离：会话层用于跨轮次恢复，运行层用于单次执行审计。
+会话状态以 JSON 保存在 `.bongo/sessions/`，Trace 日志保存在 `.bongo/traces/`，运行报告保存在 `.bongo/reports/<run_id>/`。三类持久化分离：session 用于跨轮次恢复，trace 用于中断恢复时的工具链路回溯，report 用于单次执行审计。
 
 ```bash
 bongo --resume latest    # 恢复上一次会话

@@ -236,6 +236,13 @@ class OllamaModelClient:
             method="POST",
         )
         data = self._do_request(request)
+        self.last_completion_metadata = {
+            "input_tokens": data.get("prompt_eval_count"),
+            "output_tokens": data.get("eval_count"),
+            "total_tokens": (data.get("prompt_eval_count") or 0) + (data.get("eval_count") or 0),
+            "cached_tokens": 0,
+            "cache_hit": False,
+        }
         message = data.get("message", {})
         # 优先检查 tool_calls（原生工具调用）
         if tools:
@@ -271,6 +278,13 @@ class OllamaModelClient:
             method="POST",
         )
         data = self._do_request(request)
+        self.last_completion_metadata = {
+            "input_tokens": data.get("prompt_eval_count"),
+            "output_tokens": data.get("eval_count"),
+            "total_tokens": (data.get("prompt_eval_count") or 0) + (data.get("eval_count") or 0),
+            "cached_tokens": 0,
+            "cache_hit": False,
+        }
         return data.get("response", "")
 
     def _do_request(self, request):
@@ -732,6 +746,15 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+        usage = data.get("usage") or {}
+        cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+        self.last_completion_metadata = {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "total_tokens": (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0),
+            "cached_tokens": cached_tokens,
+            "cache_hit": cached_tokens > 0,
+        }
         result = _extract_anthropic_response(data, has_tools=bool(tools))
         if result:
             return result

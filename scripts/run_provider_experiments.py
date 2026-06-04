@@ -12,10 +12,10 @@ from bongo.metrics import run_provider_experiments
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Run Claude/GPT provider experiments for bongo benchmark tasks.")
-    parser.add_argument("--benchmark-path", default="benchmarks/coding_tasks.json", help="Path to benchmark task JSON.")
+    parser = argparse.ArgumentParser(description="Run Claude/GPT provider experiments for bongo benchmarks tasks.")
+    parser.add_argument("--benchmarks-path", default="benchmarks/coding_tasks.json", help="Path to benchmarks task JSON.")
     parser.add_argument("--workspace-root", default="artifacts/provider-workspaces", help="Workspace root for provider experiment copies.")
-    parser.add_argument("--artifact-root", default="artifacts/provider-artifacts", help="Directory to store provider benchmark artifacts.")
+    parser.add_argument("--artifact-root", default="artifacts/provider-artifacts", help="Directory to store provider benchmarks artifacts.")
     parser.add_argument("--output-json", required=True, help="Path to output provider experiment JSON.")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Max output tokens per provider run.")
     return parser

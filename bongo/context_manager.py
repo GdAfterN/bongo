@@ -112,6 +112,34 @@ class ContextManager:
         workspace_root = getattr(self.agent, "root", None)
         workspace_text = f"Workspace:\n  - {workspace_root}" if workspace_root else ""
 
+        # Inject workspace drift warning
+        drift_info = getattr(self.agent, "_drift_detected", None)
+        if drift_info:
+            drift_lines = ["\n[Workspace Drift Detected]"]
+            if drift_info.get("work_dir_changed"):
+                drift_lines.append(
+                    f"  work_dir changed: {drift_info['stored_work_dir']} -> {drift_info['actual_work_dir']}"
+                )
+            if drift_info.get("workspace_files_changed"):
+                drift_lines.append("  File listing has changed since last session.")
+            drift_lines.append("  Stale file summaries have been cleared. Re-read files as needed.")
+            workspace_text += "\n" + "\n".join(drift_lines)
+
+        # Inject checkpoint summary from previous context compression
+        checkpoints = self.agent.session.get("checkpoints", [])
+        if checkpoints:
+            latest = checkpoints[-1]
+            cp_lines = ["\n[Previous Session Checkpoint]"]
+            cp_lines.append(f"  Before context compression, {latest.get('entry_count', '?')} history entries were summarized.")
+            cp_lines.append(f"  Task: {latest.get('task_summary', '-')}")
+            tools = latest.get("tools_called", [])
+            if tools:
+                cp_lines.append(f"  Tools called: {', '.join(tools[-10:])}")
+            files = latest.get("recent_files", [])
+            if files:
+                cp_lines.append(f"  Files involved: {', '.join(files)}")
+            workspace_text += "\n" + "\n".join(cp_lines)
+
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             "workspace": workspace_text,

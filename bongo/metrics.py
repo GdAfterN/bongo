@@ -328,7 +328,7 @@ MEMORY_EXPERIMENT_TASKS = [
     {"id": "edit_field", "category": "edit_dependency", "filename": "config.txt", "fact": "fixed field name is benchmark_schema"},
     {"id": "edit_line", "category": "edit_dependency", "filename": "notes.txt", "fact": "locked marker is on line three"},
     {"id": "history_file", "category": "history_reference", "filename": "history.txt", "fact": "deploy fact came from facts.txt"},
-    {"id": "history_line", "category": "history_reference", "filename": "history.txt", "fact": "benchmark note came from line two"},
+    {"id": "history_line", "category": "history_reference", "filename": "history.txt", "fact": "benchmarks note came from line two"},
     {"id": "history_token", "category": "history_reference", "filename": "history.txt", "fact": "placeholder token was beta"},
     {"id": "history_tool", "category": "history_reference", "filename": "history.txt", "fact": "inspection tool was read_file"},
 ]
@@ -428,7 +428,7 @@ def run_context_stress_matrix(repetitions=5):
     repetitions = int(repetitions)
     history_levels = [("short", 4), ("medium", 12), ("long", 24)]
     note_levels = [("low", 2), ("high", 10)]
-    request_levels = [("short", "recall"), ("long", "recall the relevant benchmark fact without dropping the latest request details")]
+    request_levels = [("short", "recall"), ("long", "recall the relevant benchmarks fact without dropping the latest request details")]
     configs = []
 
     for history_label, history_count in history_levels:
@@ -735,7 +735,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
                     temperature=0.0,
                     timeout=300,
                 )
-        artifact_path = artifact_root / f"{provider_name}-benchmark.json"
+        artifact_path = artifact_root / f"{provider_name}-benchmarks.json"
         try:
             payload = run_fixed_benchmark(
                 benchmark_path=benchmark_path,
@@ -1081,7 +1081,7 @@ def collect_resume_metrics(
             "tool_count": 7,
             "run_artifact_count": 3,
         },
-        "benchmark": benchmark,
+        "benchmarks": benchmark,
         "runs": runs,
         "stress_ablation": stress,
         "memory_experiment": memory,
@@ -1090,7 +1090,7 @@ def collect_resume_metrics(
         "security_experiment": security,
         "provider_experiments": provider_payload,
         "resume_highlights": [
-            f"Built a fixed benchmark harness with {benchmark['task_count']} tasks and automated pass/fail, verifier, and budget summaries.",
+            f"Built a fixed benchmarks harness with {benchmark['task_count']} tasks and automated pass/fail, verifier, and budget summaries.",
             f"Recorded 3 run artifacts per execution and structured runtime metadata across {runs['run_count']} aggregated runs.",
             f"Observed prompt-cache telemetry with average cached tokens of {runs['avg_cached_tokens']:.1f} and cache-hit rate of {runs['cache_hit_rate']:.2%} when available.",
             (
@@ -1106,7 +1106,7 @@ def collect_resume_metrics(
 
 
 def render_resume_metrics_markdown(metrics):
-    benchmark = metrics["benchmark"]
+    benchmark = metrics["benchmarks"]
     runs = metrics["runs"]
     stress = metrics["stress_ablation"]
     memory = metrics["memory_experiment"]
@@ -1121,8 +1121,8 @@ def render_resume_metrics_markdown(metrics):
         f"- Experiment mode: {metrics.get('experiment_mode', 'synthetic')}",
         f"- Model backends: {metrics['facts']['model_backend_count']}",
         f"- Tool types: {metrics['facts']['tool_count']}",
-        f"- Fixed benchmark tasks: {benchmark['task_count']}",
-        f"- Fixed benchmark pass rate: {benchmark['pass_rate']:.2%}",
+        f"- Fixed benchmarks tasks: {benchmark['task_count']}",
+        f"- Fixed benchmarks pass rate: {benchmark['pass_rate']:.2%}",
         f"- Aggregated runs: {runs['run_count']}",
         f"- Average tool steps per run: {runs['avg_tool_steps']:.2f}",
         f"- Average attempts per run: {runs['avg_attempts']:.2f}",
@@ -1155,7 +1155,7 @@ def render_resume_metrics_markdown(metrics):
 
 
 def render_large_scale_experiment_report(metrics):
-    benchmark = metrics["benchmark"]
+    benchmark = metrics["benchmarks"]
     memory_small = metrics["memory_experiment"]
     memory_large = metrics["memory_large_experiment"]
     context = metrics["context_experiment"]
@@ -1177,7 +1177,7 @@ def render_large_scale_experiment_report(metrics):
             if metrics.get("experiment_mode") == "real"
             else f"- Experiment mode: {metrics.get('experiment_mode', 'synthetic')}"
         ),
-        f"- Fixed benchmark tasks: {benchmark['task_count']}",
+        f"- Fixed benchmarks tasks: {benchmark['task_count']}",
         f"- Large-scale memory tasks: {memory_large['task_count']}",
         f"- Context stress configurations: {context['config_count']}",
         f"- Security scenarios: {security['scenario_count']}",
@@ -1218,7 +1218,7 @@ def render_large_scale_experiment_report(metrics):
             "## Resume-Safe Claims",
             f"- Long-context stress scenario: prompt length reduced from {metrics['stress_ablation']['no_context_reduction']['prompt_chars']} to {metrics['stress_ablation']['full']['prompt_chars']}.",
             f"- Large-scale memory experiment: repeated reads reduced from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']}.",
-            f"- Platform facts: {benchmark['task_count']} benchmark tasks, {metrics['facts']['tool_count']} tool types, {metrics['facts']['run_artifact_count']} run artifacts.",
+            f"- Platform facts: {benchmark['task_count']} benchmarks tasks, {metrics['facts']['tool_count']} tool types, {metrics['facts']['run_artifact_count']} run artifacts.",
             "",
         ]
     )
