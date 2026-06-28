@@ -1075,61 +1075,69 @@ def _run_video_workflow(agent, user_profile, current_username):
 
         print(f"\n[LLM 节点] 正在实现章节 {ch_num}: {ch_id}...")
 
-        # ── 调用1: 生成 tsx 组件 ──
+        # ── 调用1: 生成 tsx 组件（带验证重试）──
         tsx_prompt = f"""你是专业的 React 前端开发者。请生成视频演示第 {ch_num} 章节的 React 组件。
 
 {shared_context}
 
-直接输出 {ch_id}.tsx 的完整代码，不要用代码块包裹，不要输出任何解释。
-组件必须 default export，接收 {{ step: number }} props，用 step 驱动逐步揭示。"""
+【硬性规则】
+- 只输出可编译的 TypeScript/JSX 代码，不要输出任何解释、分析、思考过程
+- 不要用 markdown 代码块包裹
+- 组件必须 default export，接收 {{ step: number }} props
+- 用 if (step === N) 或 step >= N 驱动逐步揭示
+- 必须有 return 语句返回 JSX 元素
+- import 的 CSS 文件名必须是 ./{ch_id}.css（不是 .module.css）"""
 
-        tsx_code = ctx.complete(tsx_prompt, max_tokens=6000, spinner_message=f"生成 {ch_id}.tsx...")
-        tsx_code = _strip_code_fences(tsx_code)
-        tsx_code = _strip_thinking_preamble(tsx_code, "tsx")
-        (ch_dir / f"{ch_id}.tsx").write_text(tsx_code.strip(), encoding="utf-8")
-        print(f"  ✓ {ch_id}.tsx ({len(tsx_code.strip().splitlines())} 行)")
+        tsx_code = _generate_and_validate(
+            ctx, tsx_prompt, "tsx", ch_id, ch_dir,
+            max_tokens=6000, spinner=f"生成 {ch_id}.tsx..."
+        )
 
-        # ── 调用2: 生成 css ──
+        # ── 调用2: 生成 css（带验证重试）──
         css_prompt = f"""你是专业的 CSS 开发者。请生成视频演示第 {ch_num} 章节的样式文件。
 
 {shared_context}
 
-对应的 TSX 组件代码如下：
+对应的 TSX 组件代码：
 ```tsx
 {tsx_code[:3000]}
 ```
 
-直接输出 {ch_id}.css 的完整代码，不要用代码块包裹，不要输出任何解释。
-使用主题 CSS 变量（如 var(--accent), var(--surface) 等）。"""
+【硬性规则】
+- 只输出可编译的 CSS 代码，不要输出任何解释、分析、思考过程
+- 不要用 markdown 代码块包裹
+- 使用主题 CSS 变量（如 var(--accent), var(--surface) 等）
+- 第一个非空行必须是 CSS 选择器（如 .xxx {{ 或 #xxx {{）"""
 
-        css_code = ctx.complete(css_prompt, max_tokens=4000, spinner_message=f"生成 {ch_id}.css...")
-        css_code = _strip_code_fences(css_code)
-        css_code = _strip_thinking_preamble(css_code, "css")
-        (ch_dir / f"{ch_id}.css").write_text(css_code.strip(), encoding="utf-8")
-        print(f"  ✓ {ch_id}.css ({len(css_code.strip().splitlines())} 行)")
+        css_code = _generate_and_validate(
+            ctx, css_prompt, "css", ch_id, ch_dir,
+            max_tokens=4000, spinner=f"生成 {ch_id}.css..."
+        )
 
-        # ── 调用3: 生成 narrations.ts ──
+        # ── 调用3: 生成 narrations.ts（带验证重试）──
         narr_prompt = f"""你是专业的视频旁白作者。请生成视频演示第 {ch_num} 章节的旁白数组。
 
 {shared_context}
 
-章节共 {ch['steps']} 个 step。生成一个 TypeScript 数组，每个 step 对应一句中文旁白。
-第 0 个 step 通常是空字符串（过场）。
+章节共 {ch['steps']} 个 step（step 0 到 step {ch['steps']-1}）。
 
-直接输出完整的 TypeScript 代码，格式如下，不要用代码块包裹，不要输出任何解释：
+【硬性规则】
+- 只输出可编译的 TypeScript 代码，不要输出任何解释、分析、思考过程
+- 不要用 markdown 代码块包裹
+- 格式必须是：
 const narrations: string[] = [
   "",  // step 0
   "旁白内容",  // step 1
   ...
 ]
 
-export default narrations;"""
+export default narrations;
+- 数组长度必须恰好是 {ch['steps']} 个元素"""
 
-        narr_code = ctx.complete(narr_prompt, max_tokens=2000, spinner_message=f"生成 narrations.ts...")
-        narr_code = _strip_code_fences(narr_code)
-        narr_code = _strip_thinking_preamble(narr_code, "narrations")
-        (ch_dir / "narrations.ts").write_text(narr_code.strip(), encoding="utf-8")
-        print(f"  ✓ narrations.ts")
+        narr_code = _generate_and_validate(
+            ctx, narr_prompt, "narrations", ch_id, ch_dir,
+            max_tokens=2000, spinner=f"生成 narrations.ts..."
+        )
 
         # 更新状态
         completed_chapters.append(ch_id)
@@ -1385,6 +1393,101 @@ def _strip_thinking_preamble(text, file_type="tsx"):
             return '\n'.join(lines[i:])
     # 找不到代码起始行，返回原文
     return text
+
+
+def _validate_code(code, file_type, ch_id):
+    """验证生成的代码是否有效。返回 (is_valid, error_msg)。"""
+    code = code.strip()
+    if not code:
+        return False, "输出为空"
+
+    if file_type == "tsx":
+        # 检查是否有 export default
+        if "export default" not in code:
+            return False, "缺少 export default"
+        # 检查是否有 return 语句
+        if "return" not in code:
+            return False, "缺少 return 语句"
+        # 检查是否有 JSX（至少有 < 和 >）
+        if "<" not in code or ">" not in code:
+            return False, "没有 JSX 元素"
+        # 检查是否有未清理的 thinking 文本
+        first_line = code.split('\n')[0].strip()
+        if first_line.startswith(('The user', 'Let me', 'I need', 'This is', 'Here', 'Now', 'For step', 'For Step')):
+            return False, f"代码前有思考文本: {first_line[:50]}"
+
+    elif file_type == "css":
+        # 检查是否有 CSS 规则
+        if "{" not in code:
+            return False, "没有 CSS 规则（缺少 {）"
+        # 检查是否有选择器
+        first_line = code.split('\n')[0].strip()
+        if not first_line.startswith(('.', '#', ':root', '@', 'body', 'html', ':host', '::', '[', '/*', '*')):
+            return False, f"第一个非空行不是 CSS 选择器: {first_line[:50]}"
+
+    elif file_type == "narrations":
+        # 检查是否有 narrations 数组
+        if "narrations" not in code:
+            return False, "缺少 narrations 数组"
+        if "[" not in code or "]" not in code:
+            return False, "缺少数组括号"
+        if "export default" not in code:
+            return False, "缺少 export default"
+        # 检查是否有未清理的 thinking 文本
+        lines = code.split('\n')
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith(('"', "'", '//', '/*', '*', 'const', 'export', 'import', '[', ']', ',', '(', ')')):
+                if any(w in stripped.lower() for w in ['wait,', 'but ', 'the user', 'let me', 'if step', 'i need']):
+                    return False, f"有思考文本混入: {stripped[:50]}"
+
+    return True, ""
+
+
+def _generate_and_validate(ctx, prompt, file_type, ch_id, ch_dir, max_tokens=6000, spinner="生成中..."):
+    """生成代码并验证，失败时自动重试（最多 2 次）。"""
+    import re as _re
+
+    file_ext = {"tsx": f"{ch_id}.tsx", "css": f"{ch_id}.css", "narrations": "narrations.ts"}[file_type]
+    max_retries = 2
+
+    for attempt in range(max_retries + 1):
+        if attempt == 0:
+            code = ctx.complete(prompt, max_tokens=max_tokens, spinner_message=spinner)
+        else:
+            retry_prompt = f"""你上次输出的代码有错误，请修复后重新输出完整代码。
+
+【错误】{error_msg}
+
+【你上次的代码】
+{code[:4000]}
+
+【要求】
+- 只输出可编译的完整代码，不要输出任何解释、分析、思考过程
+- 不要用 markdown 代码块包裹
+- 修复上述错误后输出完整的 {file_ext}"""
+            code = ctx.complete(retry_prompt, max_tokens=max_tokens, spinner_message=f"重试生成 {file_ext}...")
+
+        # 清理
+        code = _strip_code_fences(code)
+        code = _strip_thinking_preamble(code, file_type)
+        code = code.strip()
+
+        # 验证
+        is_valid, error_msg = _validate_code(code, file_type, ch_id)
+        if is_valid:
+            (ch_dir / file_ext).write_text(code, encoding="utf-8")
+            line_count = len(code.splitlines())
+            print(f"  ✓ {file_ext} ({line_count} 行)")
+            return code
+
+        if attempt < max_retries:
+            print(f"  ⚠ {file_ext} 验证失败: {error_msg}，重试 ({attempt+1}/{max_retries})...")
+
+    # 所有重试都失败，保存最后一次的代码
+    (ch_dir / file_ext).write_text(code, encoding="utf-8")
+    print(f"  ⚠ {file_ext} 验证失败（已保存），错误: {error_msg}")
+    return code
 
 
 def _save_chapter_files(code_text, chapter_dir, chapter_id):
