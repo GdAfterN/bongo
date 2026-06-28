@@ -1090,7 +1090,7 @@ def _run_video_workflow(agent, user_profile, current_username):
 
         tsx_code = _generate_and_validate(
             ctx, tsx_prompt, "tsx", ch_id, ch_dir,
-            max_tokens=6000, spinner=f"生成 {ch_id}.tsx..."
+            max_tokens=8000, spinner=f"生成 {ch_id}.tsx..."
         )
 
         # ── 调用2: 生成 css（带验证重试）──
@@ -1177,6 +1177,40 @@ export const CHAPTERS: ChapterDef[] = [
     registry_path = presentation_dir / "src" / "registry" / "chapters.ts"
     registry_path.write_text(registry_content, encoding="utf-8")
     print(f"✓ 已注册 {len(chapters)} 个章节到 registry/chapters.ts")
+
+    # ── TypeScript 编译检查 ──
+    print("\n[验证] 运行 TypeScript 编译检查...")
+    try:
+        tsc_result = subprocess.run(
+            "npx tsc --noEmit --pretty false",
+            cwd=str(presentation_dir),
+            shell=True,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=60
+        )
+        if tsc_result.returncode == 0:
+            print("✓ TypeScript 编译通过")
+        else:
+            print(f"⚠ TypeScript 编译有错误:")
+            # 解析错误，找出有问题的文件
+            errors = tsc_result.stdout + tsc_result.stderr
+            broken_files = set()
+            for line in errors.split('\n'):
+                if 'src/chapters/' in line and '.tsx(' in line:
+                    fname = line.split('src/chapters/')[1].split('(')[0]
+                    broken_files.add(fname)
+                elif 'src/chapters/' in line and '.ts(' in line:
+                    fname = line.split('src/chapters/')[1].split('(')[0]
+                    broken_files.add(fname)
+            if broken_files:
+                print(f"  有问题的文件: {', '.join(sorted(broken_files))}")
+                print("  请检查并修复这些文件，或重新运行 /video 重新生成章节。")
+            # 打印前 10 行错误
+            for line in errors.strip().split('\n')[:10]:
+                print(f"  {line}")
+    except Exception as exc:
+        print(f"  ⚠ TypeScript 检查跳过: {exc}")
 
     # ── Checkpoint Audio ──
     print(f"\n{'='*50}")
@@ -1397,51 +1431,64 @@ def _strip_thinking_preamble(text, file_type="tsx"):
 
 def _validate_code(code, file_type, ch_id):
     """验证生成的代码是否有效。返回 (is_valid, error_msg)。"""
+    import re as _re
     code = code.strip()
     if not code:
         return False, "输出为空"
 
+    # 通用：检查是否有 thinking 文本（任何行以常见 thinking 开头）
+    thinking_patterns = [
+        r'^[A-Z][a-z]+ (need|want|should|let me|think|analyze|consider)',
+        r'^(Now |Here |This is|The user|For step|For Step|Wait,|But )',
+        r'^(I |We |Let me|Step \d+:)',
+    ]
+    for line in code.split('\n')[:10]:  # 只检查前10行
+        stripped = line.strip()
+        if not stripped or stripped.startswith(('import', 'export', 'const', '//', '/*', '*', 'type', 'interface')):
+            continue
+        for pat in thinking_patterns:
+            if _re.match(pat, stripped):
+                return False, f"有思考文本: {stripped[:60]}"
+
     if file_type == "tsx":
-        # 检查是否有 export default
         if "export default" not in code:
             return False, "缺少 export default"
-        # 检查是否有 return 语句
-        if "return" not in code:
-            return False, "缺少 return 语句"
-        # 检查是否有 JSX（至少有 < 和 >）
-        if "<" not in code or ">" not in code:
-            return False, "没有 JSX 元素"
-        # 检查是否有未清理的 thinking 文本
-        first_line = code.split('\n')[0].strip()
-        if first_line.startswith(('The user', 'Let me', 'I need', 'This is', 'Here', 'Now', 'For step', 'For Step')):
-            return False, f"代码前有思考文本: {first_line[:50]}"
+        # 检查 return 是否在注释外（去掉注释后检查）
+        code_no_comments = _re.sub(r'//.*$', '', code, flags=_re.MULTILINE)
+        code_no_comments = _re.sub(r'/\*.*?\*/', '', code_no_comments, flags=_re.DOTALL)
+        if "return" not in code_no_comments:
+            return False, "缺少 return 语句（或 return 在注释中）"
+        # 检查是否有实际 JSX（return 后面有 <div> 或类似）
+        if not _re.search(r'return\s*\(?\s*<[A-Za-z]', code_no_comments):
+            return False, "return 后没有 JSX 元素"
+        # 检查是否有占位符注释
+        if _re.search(r'//\s*\.{3}\s*\w', code):
+            return False, "有占位符注释（如 // ... component logic）"
 
     elif file_type == "css":
-        # 检查是否有 CSS 规则
         if "{" not in code:
-            return False, "没有 CSS 规则（缺少 {）"
-        # 检查是否有选择器
+            return False, "没有 CSS 规则"
         first_line = code.split('\n')[0].strip()
         if not first_line.startswith(('.', '#', ':root', '@', 'body', 'html', ':host', '::', '[', '/*', '*')):
-            return False, f"第一个非空行不是 CSS 选择器: {first_line[:50]}"
+            return False, f"不是 CSS 代码: {first_line[:50]}"
 
     elif file_type == "narrations":
-        # 检查是否有 narrations 数组
         if "narrations" not in code:
             return False, "缺少 narrations 数组"
-        if "[" not in code or "]" not in code:
-            return False, "缺少数组括号"
         if "export default" not in code:
             return False, "缺少 export default"
-        # 检查是否有未清理的 thinking 文本
-        lines = code.split('\n')
-        for line in lines:
-            stripped = line.strip()
-            if stripped and not stripped.startswith(('"', "'", '//', '/*', '*', 'const', 'export', 'import', '[', ']', ',', '(', ')')):
-                if any(w in stripped.lower() for w in ['wait,', 'but ', 'the user', 'let me', 'if step', 'i need']):
-                    return False, f"有思考文本混入: {stripped[:50]}"
+        # 检查中文引号（会导致 JS 解析错误）
+        if '“' in code or '”' in code:
+            return False, "含有中文引号（会导致 JS 解析错误）"
 
     return True, ""
+
+
+def _fix_narrations_quotes(code):
+    """修复 narrations.ts 中的中文引号。"""
+    code = code.replace('“', '\\"').replace('”', '\\"')
+    code = code.replace('‘', "\\'").replace('’', "\\'")
+    return code
 
 
 def _generate_and_validate(ctx, prompt, file_type, ch_id, ch_dir, max_tokens=6000, spinner="生成中..."):
@@ -1472,6 +1519,10 @@ def _generate_and_validate(ctx, prompt, file_type, ch_id, ch_dir, max_tokens=600
         code = _strip_code_fences(code)
         code = _strip_thinking_preamble(code, file_type)
         code = code.strip()
+
+        # narrations 额外处理：修复中文引号
+        if file_type == "narrations":
+            code = _fix_narrations_quotes(code)
 
         # 验证
         is_valid, error_msg = _validate_code(code, file_type, ch_id)
