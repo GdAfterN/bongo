@@ -41,6 +41,19 @@ def default_profile(username="default"):
         "streak": 0,
         "last_active_date": None,
         "last_summary_date": None,
+        # 用户定位（创建时设定）
+        "user_positioning": "",     # 如 "一个 Java 领域的求职者"、"前端初学者"
+        # 画像三要素
+        "frequent_topics": [],      # 常聊话题（从 /ask 中提取）
+        "weak_areas": [],           # 薄弱领域（从 /practice 错题中提取）
+        "user_preference": {        # 用户偏好（从使用行为统计）
+            "ask_count": 0,         # /ask 使用次数
+            "practice_count": 0,    # /practice 使用次数
+            "topics_explored": {},  # 话题 -> 出现次数
+            "preference_type": "",  # 推断的偏好类型
+        },
+        # session 记录
+        "sessions": [],             # 最近 session 摘要列表
     }
 
 
@@ -104,14 +117,6 @@ class UserProfile:
         learnings = learnings or []
         files = files or []
 
-        for skill in skills:
-            current = self.data["skills"].get(skill, {"level": 1, "count": 0})
-            current["count"] = current.get("count", 0) + 1
-            current["last_used"] = _now_iso()
-            if current["count"] % 5 == 0 and current.get("level", 1) < 5:
-                current["level"] = current.get("level", 1) + 1
-            self.data["skills"][skill] = current
-
         for mistake in mistakes:
             entry = {
                 "type": mistake.get("type", "general"),
@@ -132,10 +137,9 @@ class UserProfile:
 
         today = _today_str()
         if today not in self.data["daily_log"]:
-            self.data["daily_log"][today] = {"tasks": 0, "skills_used": [], "mistakes_count": 0}
+            self.data["daily_log"][today] = {"tasks": 0, "mistakes_count": 0}
         daily = self.data["daily_log"][today]
         daily["tasks"] += 1
-        daily["skills_used"] = list(set(daily["skills_used"] + skills))
         daily["mistakes_count"] += len(mistakes)
 
         last = self.data.get("last_active_date")
@@ -172,10 +176,11 @@ class UserProfile:
         return result
 
     def get_skills(self):
-        skills = self.data.get("skills", {})
+        """返回用户知识画像摘要（供其他 agent 理解用户）。"""
         return {
-            name: {"level": info.get("level", 1), "count": info.get("count", 0)}
-            for name, info in skills.items()
+            "frequent_topics": self.data.get("frequent_topics", []),
+            "weak_areas": self.data.get("weak_areas", []),
+            "preference_type": self.data.get("user_preference", {}).get("preference_type", ""),
         }
 
     def add_note(self, content, file_path=None, title=None):
@@ -726,11 +731,13 @@ class UserProfile:
         level_cn = self.LEVEL_NAMES.get(level_raw, level_raw)
         lines = [f"用户: {self.username} | 水平: {level_cn} | 连续学习: {self.data.get('streak', 0)} 天"]
 
-        skills = self.get_skills()
-        if skills:
-            top = sorted(skills.items(), key=lambda x: -x[1]["level"])[:5]
-            skill_str = ", ".join(f"{n}(Lv.{v['level']})" for n, v in top)
-            lines.append(f"技能: {skill_str}")
+        frequent_topics = self.data.get("frequent_topics", [])
+        if frequent_topics:
+            lines.append(f"常聊话题: {', '.join(frequent_topics[:5])}")
+
+        weak_areas = self.data.get("weak_areas", [])
+        if weak_areas:
+            lines.append(f"薄弱领域: {', '.join(weak_areas[:3])}")
 
         mistakes = self.data.get("mistakes", [])
         if mistakes:
@@ -776,31 +783,41 @@ class UserProfile:
         result = []
         for i in range(days):
             d = (today - __import__("datetime").timedelta(days=i)).strftime("%Y-%m-%d")
-            entry = daily.get(d, {"tasks": 0, "skills_used": [], "mistakes_count": 0})
+            entry = daily.get(d, {"tasks": 0, "mistakes_count": 0})
             result.append({"date": d, **entry})
         return result
 
     LEVEL_NAMES = {"beginner": "初学者", "intermediate": "进阶", "advanced": "熟练", "expert": "专家"}
 
     def get_profile_summary(self):
-        skills = self.get_skills()
         mistakes = self.data.get("mistakes", [])
-        top_skills = sorted(skills.items(), key=lambda x: -x[1]["level"])[:5]
         recent_mistakes = mistakes[-5:] if mistakes else []
 
         level_raw = self.data.get("level", "beginner")
         level_cn = self.LEVEL_NAMES.get(level_raw, level_raw)
         total_tasks = sum(d.get("tasks", 0) for d in self.data.get("daily_log", {}).values())
 
+        positioning = self.data.get("user_positioning", "")
+        frequent_topics = self.data.get("frequent_topics", [])
+        weak_areas = self.data.get("weak_areas", [])
+        pref = self.data.get("user_preference", {})
+        preference_type = pref.get("preference_type", "")
+
         lines = [f"用户: {self.username}"]
+        if positioning:
+            lines.append(f"定位: {positioning}")
         lines.append(f"水平: {level_cn}")
         lines.append(f"连续学习: {self.data.get('streak', 0)} 天")
         lines.append(f"累计任务: {total_tasks}")
 
-        if top_skills:
-            lines.append("擅长技能:")
-            for name, info in top_skills:
-                lines.append(f"  - {name}: Lv.{info['level']}（使用 {info['count']} 次）")
+        if frequent_topics:
+            lines.append(f"常聊话题: {', '.join(frequent_topics[:5])}")
+
+        if weak_areas:
+            lines.append(f"薄弱领域: {', '.join(weak_areas[:5])}")
+
+        if preference_type:
+            lines.append(f"用户偏好: {preference_type}")
 
         if recent_mistakes:
             lines.append("近期错误:")
@@ -814,8 +831,8 @@ class UserProfile:
         today = _today_str()
         yesterday = (datetime.now() - __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d")
 
-        today_data = daily.get(today, {"tasks": 0, "skills_used": [], "mistakes_count": 0})
-        yesterday_data = daily.get(yesterday, {"tasks": 0, "skills_used": [], "mistakes_count": 0})
+        today_data = daily.get(today, {"tasks": 0, "mistakes_count": 0})
+        yesterday_data = daily.get(yesterday, {"tasks": 0, "mistakes_count": 0})
 
         mistakes = self.data.get("mistakes", [])
         week_ago = (datetime.now() - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
@@ -836,12 +853,11 @@ class UserProfile:
             for mtype, count in sorted(mistake_types.items(), key=lambda x: -x[1]):
                 lines.append(f"  - {mtype}: {count} 次")
 
-        skills = self.get_skills()
-        if skills:
-            top = sorted(skills.items(), key=lambda x: -x[1]["level"])[:3]
-            lines.append("最强技能:")
-            for name, info in top:
-                lines.append(f"  - {name}: Lv.{info['level']}")
+        frequent_topics = self.data.get("frequent_topics", [])
+        if frequent_topics:
+            lines.append("常聊话题:")
+            for topic in frequent_topics[:5]:
+                lines.append(f"  - {topic}")
 
         return "\n".join(lines)
 
@@ -852,6 +868,373 @@ class UserProfile:
     def mark_summary_shown(self):
         self.data["last_summary_date"] = _today_str()
         self.save()
+
+    def update_learning_context(self, learning_style=None, weak_areas=None, frequent_topics=None):
+        """更新学习偏好、薄弱领域、常问话题。"""
+        if learning_style is not None:
+            self.data["learning_style"] = learning_style
+        if weak_areas is not None:
+            self.data["weak_areas"] = list(set(weak_areas))
+        if frequent_topics is not None:
+            self.data["frequent_topics"] = list(set(frequent_topics))
+        self.save()
+
+    def set_positioning(self, positioning):
+        """设置用户定位。"""
+        self.data["user_positioning"] = positioning.strip()
+        self.save()
+
+    def record_ask_topics(self, topics):
+        """从 /ask 会话中记录常聊话题。"""
+        freq = self.data.get("frequent_topics", [])
+        for topic in topics:
+            topic = topic.strip()
+            if not topic:
+                continue
+            if topic not in freq:
+                freq.append(topic)
+        # 只保留最近 20 个话题
+        self.data["frequent_topics"] = freq[-20:]
+        # 更新用户偏好
+        pref = self.data.setdefault("user_preference", {
+            "ask_count": 0, "practice_count": 0, "topics_explored": {}, "preference_type": "",
+        })
+        pref["ask_count"] = pref.get("ask_count", 0) + 1
+        for topic in topics:
+            topic = topic.strip()
+            if topic:
+                pref.setdefault("topics_explored", {})[topic] = pref.get("topics_explored", {}).get(topic, 0) + 1
+        self._update_preference_type()
+        self.save()
+
+    def record_practice_weak_area(self, topic, score):
+        """/practice 答错时记录薄弱领域。"""
+        weak = self.data.get("weak_areas", [])
+        if topic and topic not in weak:
+            weak.append(topic)
+        self.data["weak_areas"] = weak[-15:]
+        # 更新用户偏好
+        pref = self.data.setdefault("user_preference", {
+            "ask_count": 0, "practice_count": 0, "topics_explored": {}, "preference_type": "",
+        })
+        pref["practice_count"] = pref.get("practice_count", 0) + 1
+        self._update_preference_type()
+        self.save()
+
+    def _update_preference_type(self):
+        """根据使用行为推断用户偏好类型。"""
+        pref = self.data.get("user_preference", {})
+        ask = pref.get("ask_count", 0)
+        practice = pref.get("practice_count", 0)
+        topics = pref.get("topics_explored", {})
+
+        if ask + practice == 0:
+            pref["preference_type"] = ""
+            return
+
+        # 探索型 vs 深耕型：话题分散度
+        if topics:
+            topic_counts = list(topics.values())
+            avg = sum(topic_counts) / len(topic_counts)
+            max_count = max(topic_counts)
+            # 如果最高频话题远高于平均，是深耕型
+            if max_count > avg * 2 and len(topics) <= 5:
+                explore_type = "深耕型"
+            elif len(topics) > 8:
+                explore_type = "探索型"
+            else:
+                explore_type = "均衡型"
+        else:
+            explore_type = ""
+
+        # 新知型 vs 温习型：ask vs practice 比率
+        total = ask + practice
+        if practice / total > 0.6:
+            review_type = "温习型"
+        elif ask / total > 0.6:
+            review_type = "新知型"
+        else:
+            review_type = "均衡型"
+
+        pref["preference_type"] = f"{explore_type}、{review_type}" if explore_type else review_type
+
+    def record_session(self, session_id, title, created_at, history_count, work_dir, topics=None, summary=""):
+        """记录一个 session 摘要。"""
+        sessions = self.data.setdefault("sessions", [])
+        entry = {
+            "id": session_id,
+            "title": title[:100],
+            "created_at": created_at,
+            "history_count": history_count,
+            "work_dir": work_dir,
+            "topics": topics or [],
+            "summary": summary[:300],
+        }
+        # 去重（按 id）
+        sessions = [s for s in sessions if s.get("id") != session_id]
+        sessions.append(entry)
+        # 按时间排序，保留最近 30 个
+        sessions.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+        self.data["sessions"] = sessions[:30]
+        self.save()
+
+    def _infer_weak_areas(self):
+        """从错题中自动推断薄弱领域。"""
+        mistakes = self.data.get("mistakes", [])
+        type_counts = {}
+        for m in mistakes:
+            t = m.get("type", "general")
+            if t != "general":
+                type_counts[t] = type_counts.get(t, 0) + 1
+        # 取错误次数最多的前 5 个类型
+        sorted_types = sorted(type_counts.items(), key=lambda x: -x[1])[:5]
+        return [t for t, _ in sorted_types]
+
+    def _infer_frequent_topics(self):
+        """从技能使用记录中推断常问话题。"""
+        skills = self.data.get("skills", {})
+        # 按使用次数排序，取前 8 个
+        sorted_skills = sorted(skills.items(), key=lambda x: -x[1].get("count", 0))[:8]
+        return [name for name, _ in sorted_skills]
+
+    def export_as_skill(self, output_dir=None, session_store=None, compress_old_sessions=True):
+        """将用户画像、笔记、错题、session 导出为可复用的 skill 目录。
+
+        输出结构：
+        {output_dir}/
+          SKILL.md          — skill 元数据 + 用户画像三要素
+          references/
+            notes.md        — 笔记导出
+            mistakes.md     — 错题导出
+            sessions/       — session 导出
+              session_*.md  — 最近 10 个完整 session
+              older_summary.md — 更早 session 的压缩摘要
+        """
+        from pathlib import Path as _Path
+
+        if output_dir is None:
+            output_dir = _Path.home() / ".bongo" / "skills" / self.username
+        output_dir = _Path(output_dir)
+        refs_dir = output_dir / "references"
+        sessions_dir = refs_dir / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        # 画像三要素
+        positioning = self.data.get("user_positioning", "")
+        frequent_topics = self.data.get("frequent_topics", [])
+        weak_areas = self.data.get("weak_areas", [])
+        pref = self.data.get("user_preference", {})
+        preference_type = pref.get("preference_type", "")
+
+        level_raw = self.data.get("level", "beginner")
+        level_cn = self.LEVEL_NAMES.get(level_raw, level_raw)
+        total_tasks = sum(d.get("tasks", 0) for d in self.data.get("daily_log", {}).values())
+        streak = self.data.get("streak", 0)
+
+        # --- SKILL.md ---
+        skill_md = f"""---
+name: user-{self.username}
+description: "{positioning or self.username + ' 的个人学习画像'}。包含常聊话题、薄弱领域、学习偏好。当讨论到 {', '.join(frequent_topics[:5]) if frequent_topics else '技术'} 相关话题时参考。"
+when-to-use: "当需要了解 {self.username} 的学习背景、常见错误模式、或复习已学内容时触发。"
+arguments: [mode]
+argument-hint: "<mode: profile|notes|mistakes|sessions|review>"
+version: 2.0.0
+---
+
+# {self.username} 的学习画像
+
+## 用户定位
+{positioning or '未设置'}
+
+## 基本信息
+- 水平: {level_cn}
+- 连续学习: {streak} 天
+- 累计任务: {total_tasks} 个
+
+## 画像三要素
+
+### 常聊话题
+"""
+        if frequent_topics:
+            for topic in frequent_topics:
+                skill_md += f"- {topic}\n"
+        else:
+            skill_md += "- 暂无记录\n"
+
+        skill_md += "\n### 薄弱领域\n"
+        if weak_areas:
+            for area in weak_areas:
+                skill_md += f"- {area}\n"
+        else:
+            skill_md += "- 暂无记录\n"
+
+        skill_md += f"\n### 用户偏好\n{preference_type or '数据积累中'}\n"
+
+        skill_md += f"""
+## 可用资源
+
+本 skill 包含以下资源，可通过对应的 mode 参数访问：
+
+- `references/notes.md` — 学习笔记
+- `references/mistakes.md` — 错题本
+- `references/sessions/` — 历史会话记录（最近 10 个完整，更早的已压缩）
+
+## 模式说明
+
+### profile 模式（默认）
+展示完整的用户画像，包括三要素和技能详情。
+
+### notes 模式
+读取学习笔记，展示最近的记录。
+
+### mistakes 模式
+读取错题本，按类型分组展示。
+
+### sessions 模式
+读取历史会话记录，展示最近的学习过程。
+
+### review 模式
+基于用户的薄弱领域和常错类型，生成针对性的复习计划。
+
+## 使用建议
+
+- 该用户定位为: {positioning or '未设置'}
+- 讨论到 **{', '.join(frequent_topics[:3]) if frequent_topics else '技术'}** 等话题时，优先参考该用户的技能水平和常见错误
+- 薄弱领域: {', '.join(weak_areas[:3]) if weak_areas else '待分析'}
+- 用户偏好: {preference_type or '数据积累中'}
+"""
+        (output_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+        # --- references/notes.md ---
+        notes_md = f"# {self.username} 的学习笔记\n\n"
+        notes = self.get_notes(limit=50)
+        if notes:
+            for note in notes:
+                notes_md += f"## {note.get('title', '无标题')}\n"
+                notes_md += f"- 时间: {note.get('timestamp', '')}\n"
+                if note.get("file_path"):
+                    notes_md += f"- 关联文件: {note['file_path']}\n"
+                notes_md += f"\n{note.get('content', '')}\n\n"
+        else:
+            notes_md += "暂无笔记。\n"
+        (refs_dir / "notes.md").write_text(notes_md, encoding="utf-8")
+
+        # --- references/mistakes.md ---
+        mistakes_md = f"# {self.username} 的错题本\n\n"
+        mistakes = self.get_mistakes_from_file(limit=50)
+        if mistakes:
+            by_type = {}
+            for m in mistakes:
+                t = m.get("source", "") or m.get("title", "未分类")
+                by_type.setdefault(t, []).append(m)
+
+            for mtype, items in by_type.items():
+                mistakes_md += f"## {mtype}（{len(items)} 题）\n\n"
+                for m in items:
+                    mistakes_md += f"### {m.get('title', '无标题')}\n"
+                    mistakes_md += f"- 时间: {m.get('timestamp', '')}\n"
+                    mistakes_md += f"- 得分: {m.get('score', 0)}\n"
+                    mistakes_md += f"- 错误次数: {m.get('count', 1)}\n"
+                    if m.get("question"):
+                        mistakes_md += f"\n**题目：** {m['question']}\n"
+                    if m.get("user_answer"):
+                        mistakes_md += f"\n**你的回答：** {m['user_answer']}\n"
+                    if m.get("correct_answer"):
+                        mistakes_md += f"\n**正确答案：** {m['correct_answer']}\n"
+                    if m.get("feedback"):
+                        mistakes_md += f"\n**反馈：** {m['feedback']}\n"
+                    mistakes_md += "\n"
+        else:
+            mistakes_md += "暂无错题。\n"
+        (refs_dir / "mistakes.md").write_text(mistakes_md, encoding="utf-8")
+
+        # --- references/sessions/ ---
+        exported_sessions = self._export_sessions(sessions_dir, session_store, compress_old_sessions)
+
+        return {
+            "output_dir": str(output_dir),
+            "files": [
+                str(output_dir / "SKILL.md"),
+                str(refs_dir / "notes.md"),
+                str(refs_dir / "mistakes.md"),
+            ] + [str(sessions_dir / f) for f in exported_sessions],
+            "summary": {
+                "username": self.username,
+                "positioning": positioning,
+                "level": level_cn,
+                "notes_count": len(notes),
+                "mistakes_count": len(mistakes),
+                "sessions_count": len(exported_sessions),
+                "frequent_topics": frequent_topics,
+                "weak_areas": weak_areas,
+                "preference_type": preference_type,
+            },
+        }
+
+    def _export_sessions(self, sessions_dir, session_store=None, compress_old=True):
+        """导出 session 到 sessions 目录。最近 10 个完整导出，更早的压缩。"""
+        import json as _json
+        exported = []
+
+        sessions = self.data.get("sessions", [])
+        if not sessions:
+            (sessions_dir / "no_sessions.md").write_text("暂无会话记录。\n", encoding="utf-8")
+            return ["no_sessions.md"]
+
+        # 最近 10 个完整导出
+        recent = sessions[:10]
+        older = sessions[10:]
+
+        for s in recent:
+            filename = f"session_{s.get('id', 'unknown')}.md"
+            md = f"# Session: {s.get('title', '无标题')}\n\n"
+            md += f"- ID: {s.get('id', '')}\n"
+            md += f"- 时间: {s.get('created_at', '')}\n"
+            md += f"- 消息数: {s.get('history_count', 0)}\n"
+            md += f"- 工作目录: {s.get('work_dir', '')}\n"
+            if s.get("topics"):
+                md += f"- 话题: {', '.join(s['topics'])}\n"
+            if s.get("summary"):
+                md += f"\n## 摘要\n{s['summary']}\n"
+
+            # 如果有 session_store，尝试加载完整 history
+            if session_store and s.get("id"):
+                try:
+                    full_session = session_store.load(s["id"])
+                    history = full_session.get("history", [])
+                    if history:
+                        md += "\n## 完整对话记录\n\n"
+                        for item in history:
+                            role = item.get("role", "")
+                            content = item.get("content", "")
+                            if isinstance(content, list):
+                                text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                                tool_parts = [f"[调用工具: {p.get('name', '')}]" for p in content if isinstance(p, dict) and p.get("type") == "tool_use"]
+                                content = " ".join(text_parts + tool_parts)
+                            md += f"**{role}**: {str(content)[:500]}\n\n"
+                except Exception:
+                    md += "\n（无法加载完整对话记录）\n"
+
+            (sessions_dir / filename).write_text(md, encoding="utf-8")
+            exported.append(filename)
+
+        # 更早的 session 压缩成一个摘要文件
+        if older:
+            summary_md = "# 更早的会话摘要\n\n"
+            summary_md += f"共 {len(older)} 个更早的会话（按时间倒序）：\n\n"
+            for s in older:
+                summary_md += f"## {s.get('title', '无标题')}\n"
+                summary_md += f"- 时间: {s.get('created_at', '')}\n"
+                summary_md += f"- 消息数: {s.get('history_count', 0)}\n"
+                if s.get("topics"):
+                    summary_md += f"- 话题: {', '.join(s['topics'])}\n"
+                if s.get("summary"):
+                    summary_md += f"- 摘要: {s['summary']}\n"
+                summary_md += "\n"
+            (sessions_dir / "older_summary.md").write_text(summary_md, encoding="utf-8")
+            exported.append("older_summary.md")
+
+        return exported
 
 
 def save_current_user(username):

@@ -869,6 +869,62 @@ class bongo:
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
 
+    def _auto_record_session(self, user_message, final_answer, task_status):
+        """ask() 结束后自动记录本次会话到用户画像。
+
+        用模型提炼知识话题，记录到 frequent_topics。
+        记录 session 摘要。
+        """
+        if not self._user_profile:
+            return
+
+        history = self.session.get("history", [])
+
+        # 用模型提炼知识话题
+        topics = []
+        try:
+            topics = self._extract_topics_from_session(user_message, final_answer)
+            if topics:
+                self._user_profile.record_ask_topics(topics)
+        except Exception:
+            pass
+
+        # 记录 session 摘要
+        try:
+            session_id = self.session.get("id", "")
+            created_at = self.session.get("created_at", "")
+            self._user_profile.record_session(
+                session_id=session_id,
+                title=user_message[:100],
+                created_at=created_at,
+                history_count=len(history),
+                work_dir=str(self.work_dir),
+                topics=topics,
+                summary=final_answer[:300] if final_answer else "",
+            )
+        except Exception:
+            pass
+
+    def _extract_topics_from_session(self, user_message, final_answer):
+        """用模型从会话中提炼知识话题关键词。"""
+        # 构建提炼 prompt
+        extract_prompt = (
+            "从以下对话中提取 3-5 个知识领域关键词（如 'React Hooks'、'数据库索引'、'动态规划'）。\n"
+            "只返回关键词列表，用逗号分隔，不要其他内容。\n\n"
+            f"用户问题: {user_message[:300]}\n"
+            f"回答摘要: {str(final_answer)[:300]}"
+        )
+        try:
+            raw = self.model_client.complete(extract_prompt, 100)
+            raw = str(raw).strip()
+            # 解析逗号分隔的关键词
+            topics = [t.strip() for t in raw.split(",") if t.strip()]
+            # 过滤掉太短或太长的
+            topics = [t for t in topics if 2 <= len(t) <= 20]
+            return topics[:5]
+        except Exception:
+            return []
+
     def ask_direct(self, user_message):
         """直接问答链路：不走工具循环，直接调用模型回答。
 
@@ -1168,6 +1224,7 @@ class bongo:
                 },
             )
             self.run_store.write_report(task_status, self.redact_artifact(self.build_report(task_status)))
+            self._auto_record_session(user_message, final, task_status)
             self.session["active_run_id"] = ""
             self.session_store.save(self.session)
             return final
@@ -1204,6 +1261,7 @@ class bongo:
             print(f"  \033[1m[\033[33mReAct: {react_round} rounds, {tool_steps} tools\033[0m\033[1m] (达到上限)\033[0m{token_part}")
             print(f"  \033[2m(按 Enter 展开完整过程)\033[0m")
         self._last_react_steps = list(step_lines)
+        self._auto_record_session(user_message, final, task_status)
         self.session["active_run_id"] = ""
         self.session_store.save(self.session)
         return final

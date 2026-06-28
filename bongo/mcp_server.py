@@ -1,7 +1,7 @@
 """bongo MCP Server.
 
 作为 MCP server 被 Claude Code 调用，暴露学习伙伴工具：
-- record_task: 记录完成的任务、技能、易错点
+- record_task: 记录完成的任务、知识话题、易错点
 - add_note: 记录学习笔记和信任的文件路径
 - get_profile: 获取用户画像摘要
 - get_mistakes: 查询历史易错点
@@ -22,7 +22,7 @@ profile = UserProfile(current_username)
 @mcp.tool()
 def record_task(
     task: str,
-    skills: list[str] = None,
+    topics: list[str] = None,
     mistakes: list[dict] = None,
     learnings: list[str] = None,
     files: list[str] = None,
@@ -32,7 +32,7 @@ def record_task(
 
     Args:
         task: Description of the task completed
-        skills: List of skills used (e.g. ["binary_search", "recursion"])
+        topics: List of knowledge topics explored (e.g. ["binary_search", "recursion"])
         mistakes: List of mistakes made, each with type/desc/fix fields
         learnings: List of new things learned
         files: List of files modified
@@ -40,12 +40,16 @@ def record_task(
     """
     profile.record_task(
         task=task,
-        skills=skills or [],
+        skills=topics or [],
         mistakes=mistakes or [],
         learnings=learnings or [],
         files=files or [],
         difficulty=difficulty,
     )
+
+    # 记录话题到 frequent_topics
+    if topics:
+        profile.record_ask_topics(topics)
 
     similar_past = []
     if mistakes:
@@ -57,8 +61,8 @@ def record_task(
                 similar_past.append(f"You've made '{mtype}' mistakes {len(similar)} times before. Watch out!")
 
     response = f"Task recorded: {task}"
-    if skills:
-        response += f"\nSkills: {', '.join(skills)}"
+    if topics:
+        response += f"\nTopics: {', '.join(topics)}"
     if similar_past:
         response += "\n\nWarnings:\n" + "\n".join(similar_past)
     return response
@@ -104,23 +108,15 @@ def get_progress(days: int = 7) -> str:
         d = entry["date"]
         tasks = entry.get("tasks", 0)
         mistakes = entry.get("mistakes_count", 0)
-        skills = entry.get("skills_used", [])
         bar = "+" * tasks
         line = f"  {d}: {tasks} 个任务 {bar}"
         if mistakes:
             line += f" ({mistakes} 个错误)"
-        if skills:
-            line += f" [{', '.join(skills)}]"
         lines.append(line)
 
     total_tasks = sum(e.get("tasks", 0) for e in progress)
     total_mistakes = sum(e.get("mistakes_count", 0) for e in progress)
-    all_skills = set()
-    for e in progress:
-        all_skills.update(e.get("skills_used", []))
     lines.append(f"\n总计: {total_tasks} 个任务, {total_mistakes} 个错误")
-    if all_skills:
-        lines.append(f"练习的技能: {', '.join(sorted(all_skills))}")
     return "\n".join(lines)
 
 

@@ -153,6 +153,7 @@ HELP_DETAILS = textwrap.dedent(
     [cyan]/user[/]            显示当前用户和所有用户列表。
     [cyan]/user[/] <name>     切换到另一个用户。
     [cyan]/user new[/] <name> 创建新用户并切换。
+    [cyan]/skills[/]          查看用户画像三要素并导出 skill。
 
     系统命令：
     [cyan]/memory[/]          显示代理的工作记忆。
@@ -454,6 +455,7 @@ def build_welcome(agent, model, host):
     guide_table.add_row("/practice", "进入练习模式（快问快答 / 深度求索 / 朝花夕拾）")
     guide_table.add_row("/note", "查看和管理学习笔记")
     guide_table.add_row("/mistake", "查看错题本")
+    guide_table.add_row("/skills", "查看画像三要素，导出 skill")
     guide_table.add_row("/resume", "恢复上次会话")
     guide_table.add_row("/help", "查看全部命令")
 
@@ -699,6 +701,11 @@ def _run_practice_review(ctx, user_profile):
         else:
             new_count = count + 1
             user_profile.update_mistake_count(summary, new_count)
+            # 记录薄弱领域
+            try:
+                user_profile.record_practice_weak_area(summary[:20], score)
+            except Exception:
+                pass
             print(f"  [错误次数: {count} → {new_count}]")
         print()
 
@@ -816,6 +823,16 @@ def _run_practice_plan_execute(ctx, user_profile, reference, source_label, num_q
                 correct_answer=correct_answer,
                 source=source_label,
             )
+            # 记录薄弱领域
+            try:
+                # 从问题中提取话题关键词
+                import re as _re
+                cn_words = _re.findall(r'[一-鿿]{2,6}', question)
+                en_words = _re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', question)
+                topic = (cn_words + en_words)[0] if (cn_words + en_words) else source_label
+                user_profile.record_practice_weak_area(topic, score)
+            except Exception:
+                pass
             print(f"  [已记入错题本]")
         print()
 
@@ -1472,6 +1489,15 @@ def main(argv=None):
                     save_current_user(new_name)
                     current_username = new_name
                     user_profile = UserProfile(current_username)
+                    # 询问用户定位
+                    try:
+                        positioning = _styled_input([
+                            ("class:prompt", "请描述您的用户定位（如 '一个 Java 领域的求职者'，可跳过）: "),
+                        ]).strip()
+                        if positioning:
+                            user_profile.set_positioning(positioning)
+                    except (EOFError, KeyboardInterrupt):
+                        pass
                     print(f"已创建并切换到用户: {current_username}")
                     print(user_profile.get_profile_summary())
             else:
@@ -1492,6 +1518,63 @@ def main(argv=None):
                 print(user_profile.get_profile_summary())
             except Exception as exc:
                 print(f"加载档案失败: {exc}")
+            continue
+        if user_input.startswith(("/skills", "-skills")):
+            try:
+                parts = user_input.split(maxsplit=1)
+                if len(parts) > 1 and parts[1] == "export":
+                    # /skills export - 导出 skill
+                    from rich.panel import Panel
+                    from rich.table import Table
+                    C.print("[bold]正在导出 skill...[/]")
+                    result = user_profile.export_as_skill(session_store=agent.session_store)
+                    C.print(Panel(
+                        f"[bold green]导出成功！[/]\n\n"
+                        f"输出目录: {result['output_dir']}\n"
+                        f"文件数: {len(result['files'])}\n\n"
+                        f"[bold]画像摘要:[/]\n"
+                        f"  用户定位: {result['summary'].get('positioning', '未设置')}\n"
+                        f"  常聊话题: {', '.join(result['summary'].get('frequent_topics', [])) or '暂无'}\n"
+                        f"  薄弱领域: {', '.join(result['summary'].get('weak_areas', [])) or '暂无'}\n"
+                        f"  用户偏好: {result['summary'].get('preference_type', '数据积累中')}\n"
+                        f"  笔记数: {result['summary'].get('notes_count', 0)}\n"
+                        f"  错题数: {result['summary'].get('mistakes_count', 0)}\n"
+                        f"  Session数: {result['summary'].get('sessions_count', 0)}",
+                        title="[bold cyan]Skill 导出结果[/]",
+                        border_style="cyan",
+                    ))
+                else:
+                    # /skills - 查看画像三要素
+                    from rich.table import Table
+                    from rich.panel import Panel
+
+                    positioning = user_profile.data.get("user_positioning", "")
+                    frequent_topics = user_profile.data.get("frequent_topics", [])
+                    weak_areas = user_profile.data.get("weak_areas", [])
+                    pref = user_profile.data.get("user_preference", {})
+                    preference_type = pref.get("preference_type", "")
+                    ask_count = pref.get("ask_count", 0)
+                    practice_count = pref.get("practice_count", 0)
+
+                    C.print(Panel(
+                        f"[bold]{current_username}[/] 的学习画像\n"
+                        f"用户定位: {positioning or '[muted]未设置[/]'}",
+                        title="[bold cyan]用户画像[/]",
+                        border_style="cyan",
+                    ))
+
+                    table = Table(title="画像三要素", show_header=True, header_style="bold")
+                    table.add_column("维度", style="cyan")
+                    table.add_column("内容")
+                    table.add_row("常聊话题", ", ".join(frequent_topics) or "[muted]暂无[/]")
+                    table.add_row("薄弱领域", ", ".join(weak_areas) or "[muted]暂无[/]")
+                    table.add_row("用户偏好", preference_type or "[muted]数据积累中[/]")
+                    table.add_row("使用统计", f"/ask {ask_count} 次, /practice {practice_count} 次")
+                    C.print(table)
+
+                    C.print("\n[dim]输入 [cyan]/skills export[/] 导出为可复用的 skill 目录[/]")
+            except Exception as exc:
+                print(f"操作失败: {exc}")
             continue
         if user_input in ("/mistakes", "-mistakes", "/errors", "-errors"):
             try:
@@ -1677,13 +1760,10 @@ def main(argv=None):
                     d = entry["date"]
                     tasks = entry.get("tasks", 0)
                     mistakes = entry.get("mistakes_count", 0)
-                    skills = entry.get("skills_used", [])
                     bar = "+" * tasks
                     line = f"  {d}: {tasks} 个任务 {bar}"
                     if mistakes:
                         line += f" ({mistakes} 个错误)"
-                    if skills:
-                        line += f" [{', '.join(skills)}]"
                     print(line)
                 total = sum(e.get("tasks", 0) for e in progress)
                 print(f"\n  总计: 7 天内 {total} 个任务")
