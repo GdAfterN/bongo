@@ -1222,19 +1222,29 @@ def _run_video_workflow(agent, user_profile, current_username):
 
     import re as _re
     import threading
+    import time as _time
 
     detected_port = [None]
-    port_detected = threading.Event()
+
+    def _clean_line(raw_bytes):
+        """清理 ANSI 转义码和 Unicode 特殊字符"""
+        s = raw_bytes.decode('utf-8', errors='replace')
+        s = _re.sub(r'\x1b\[[0-9;]*m', '', s)
+        s = s.replace('➜', '->')
+        return s
 
     def _read_output(pipe):
         """后台线程：持续读取 Vite 输出并提取端口"""
-        for line in iter(pipe.readline, ''):
-            print(line, end="", flush=True)
-            if not detected_port[0] and "localhost:" in line:
+        for raw in iter(pipe.readline, b''):
+            line = _clean_line(raw)
+            try:
+                print(line, end="", flush=True)
+            except Exception:
+                pass
+            if not detected_port[0]:
                 m = _re.search(r'localhost:(\d+)', line)
                 if m:
                     detected_port[0] = m.group(1)
-                    port_detected.set()
         pipe.close()
 
     try:
@@ -1244,16 +1254,16 @@ def _run_video_workflow(agent, user_profile, current_username):
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            bufsize=0,
         )
         reader = threading.Thread(target=_read_output, args=(proc.stdout,), daemon=True)
         reader.start()
 
-        # 等待端口检测（最多 30 秒）
-        port_detected.wait(timeout=30)
+        # 等待端口检测（轮询，最多 30 秒）
+        for _ in range(60):
+            if detected_port[0]:
+                break
+            _time.sleep(0.5)
 
         if detected_port[0]:
             port = detected_port[0]
