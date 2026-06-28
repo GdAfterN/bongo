@@ -859,12 +859,17 @@ def _run_video_workflow(agent, user_profile, current_username):
     scaffold_script = VIDEO_SKILL_DIR / "scripts" / "scaffold.sh"
     presentation_dir = work_dir / "presentation"
 
+    # Windows 路径转为 bash 兼容的正斜杠路径
+    scaffold_script_bash = str(scaffold_script).replace("\\", "/")
+    presentation_dir_bash = str(presentation_dir).replace("\\", "/")
+    work_dir_bash = str(work_dir).replace("\\", "/")
+
     print("\n[固定步骤] 正在创建 Vite 项目...")
     import subprocess
     try:
         result = subprocess.run(
-            ["bash", str(scaffold_script), str(presentation_dir), f"--theme={selected_theme}"],
-            cwd=str(work_dir),
+            ["bash", scaffold_script_bash, presentation_dir_bash, f"--theme={selected_theme}"],
+            cwd=work_dir_bash,
             capture_output=True,
             text=True,
             timeout=120
@@ -1026,10 +1031,11 @@ def _run_video_workflow(agent, user_profile, current_username):
 
         # 提取旁白
         print("\n[固定步骤] 正在提取旁白...")
+        presentation_dir_bash = str(presentation_dir).replace("\\", "/")
         try:
             result = subprocess.run(
                 ["npx", "tsx", "scripts/extract-narrations.ts"],
-                cwd=str(presentation_dir),
+                cwd=presentation_dir_bash,
                 capture_output=True,
                 text=True,
                 timeout=60
@@ -1047,7 +1053,7 @@ def _run_video_workflow(agent, user_profile, current_username):
         try:
             result = subprocess.run(
                 ["bash", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
-                cwd=str(presentation_dir),
+                cwd=presentation_dir_bash,
                 capture_output=True,
                 text=True,
                 timeout=600
@@ -1070,7 +1076,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     print("按 Ctrl+C 停止服务器\n")
 
     try:
-        subprocess.run(["npm", "run", "dev"], cwd=str(presentation_dir))
+        subprocess.run(["npm", "run", "dev"], cwd=presentation_dir_bash)
     except KeyboardInterrupt:
         print("\n开发服务器已停止。")
 
