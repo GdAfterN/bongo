@@ -1144,8 +1144,13 @@ def _run_video_workflow(agent, user_profile, current_username):
             print(f"⚠ 提取旁白异常: {exc}")
 
         # 合成音频
-        tts_choice = _styled_input("\n选择 TTS 提供商 [1-minimax / 2-openai] (默认 1): ").strip()
-        tts_provider = "openai" if tts_choice == "2" else "minimax"
+        print("\n  TTS 提供商（文字转语音，生成配音）：")
+        print("    1) Edge TTS（免费，无需 API key）")
+        print("    2) MiniMax（需 mmx-cli + API key）")
+        print("    3) OpenAI（需 API key）")
+        tts_choice = _styled_input("  选择 [1/2/3] (默认 1): ").strip()
+        tts_map = {"1": "edge", "2": "minimax", "3": "openai"}
+        tts_provider = tts_map.get(tts_choice, "edge")
         print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
         try:
             result = subprocess.run(
