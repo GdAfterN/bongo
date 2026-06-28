@@ -1084,8 +1084,8 @@ def _run_video_workflow(agent, user_profile, current_username):
 组件必须 default export，接收 {{ step: number }} props，用 step 驱动逐步揭示。"""
 
         tsx_code = ctx.complete(tsx_prompt, max_tokens=6000, spinner_message=f"生成 {ch_id}.tsx...")
-        # 清理可能的代码块包裹
         tsx_code = _strip_code_fences(tsx_code)
+        tsx_code = _strip_thinking_preamble(tsx_code, "tsx")
         (ch_dir / f"{ch_id}.tsx").write_text(tsx_code.strip(), encoding="utf-8")
         print(f"  ✓ {ch_id}.tsx ({len(tsx_code.strip().splitlines())} 行)")
 
@@ -1104,6 +1104,7 @@ def _run_video_workflow(agent, user_profile, current_username):
 
         css_code = ctx.complete(css_prompt, max_tokens=4000, spinner_message=f"生成 {ch_id}.css...")
         css_code = _strip_code_fences(css_code)
+        css_code = _strip_thinking_preamble(css_code, "css")
         (ch_dir / f"{ch_id}.css").write_text(css_code.strip(), encoding="utf-8")
         print(f"  ✓ {ch_id}.css ({len(css_code.strip().splitlines())} 行)")
 
@@ -1126,6 +1127,7 @@ export default narrations;"""
 
         narr_code = ctx.complete(narr_prompt, max_tokens=2000, spinner_message=f"生成 narrations.ts...")
         narr_code = _strip_code_fences(narr_code)
+        narr_code = _strip_thinking_preamble(narr_code, "narrations")
         (ch_dir / "narrations.ts").write_text(narr_code.strip(), encoding="utf-8")
         print(f"  ✓ narrations.ts")
 
@@ -1362,6 +1364,26 @@ def _strip_code_fences(text):
     m = re.match(r'^```(?:\w*)\s*\n(.*?)```\s*$', text, re.DOTALL)
     if m:
         return m.group(1)
+    return text
+
+
+def _strip_thinking_preamble(text, file_type="tsx"):
+    """去掉 LLM 在代码前输出的思考/分析文本。
+    file_type: 'tsx', 'css', 'narrations'"""
+    import re
+    lines = text.split('\n')
+    # 代码起始标志：import/export/const 等，或单行注释 //
+    # 不匹配 * 或 /** （避免误匹配 markdown 粗体 **text**）
+    code_start_patterns = {
+        'tsx': r'^\s*(import |export |const |let |var |function |type |interface )',
+        'css': r'^\s*(\.|#|:root|@|body |html |:host|::|\[)',
+        'narrations': r'^\s*(const |export |import )',
+    }
+    pattern = code_start_patterns.get(file_type, code_start_patterns['tsx'])
+    for i, line in enumerate(lines):
+        if re.match(pattern, line):
+            return '\n'.join(lines[i:])
+    # 找不到代码起始行，返回原文
     return text
 
 
