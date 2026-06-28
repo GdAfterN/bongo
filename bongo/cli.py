@@ -861,18 +861,18 @@ def _run_video_workflow(agent, user_profile, current_username):
 
     # Windows 路径转为 bash 兼容的正斜杠路径
     scaffold_script_bash = str(scaffold_script).replace("\\", "/")
-    presentation_dir_bash = str(presentation_dir).replace("\\", "/")
     work_dir_bash = str(work_dir).replace("\\", "/")
 
     print("\n[固定步骤] 正在创建 Vite 项目...")
     import subprocess
     try:
+        # 使用相对路径避免 npm create vite@latest 的路径解析问题
         result = subprocess.run(
-            ["bash", scaffold_script_bash, presentation_dir_bash, f"--theme={selected_theme}"],
+            ["bash", scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
             cwd=work_dir_bash,
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=180
         )
         if result.returncode != 0:
             print(f"✗ scaffold 失败: {result.stderr}")
