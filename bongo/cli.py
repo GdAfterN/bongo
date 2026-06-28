@@ -1005,12 +1005,13 @@ def _run_video_workflow(agent, user_profile, current_username):
     import re
     chapters = []
     for line in outline_content.split("\n"):
-        m = re.match(r'^##\s+(\d+)\.\s+(\S+)\s+—\s+(.+?)(?:（|$)', line)
+        m = re.match(r'^##\s+(\d+)\.\s+(\S+)\s+—\s+(.+?)(?:（(\d+)\s*steps|（|$)', line)
         if m:
             chapters.append({
                 "num": int(m.group(1)),
                 "id": m.group(2),
                 "title": m.group(3).strip(),
+                "steps": int(m.group(4)) if m.group(4) else 4,
             })
 
     if not chapters:
@@ -1056,9 +1057,8 @@ def _run_video_workflow(agent, user_profile, current_username):
         else:
             ch_outline = _extract_chapter_outline(outline_content, ch_num)
 
-        chapter_prompt_n = f"""你是专业的 React 前端开发者。请根据以下指引，实现视频演示的第 {ch_num} 个章节。
-
-## 章节开发指引
+        # 公共上下文（三个 prompt 共用）
+        shared_context = f"""## 章节开发指引
 {chapter_craft[:4000]}
 
 ## 主题 CSS Tokens
@@ -1071,31 +1071,63 @@ def _run_video_workflow(agent, user_profile, current_username):
 {script_content[:4000]}
 
 ## 原文（用于信息池）
-{article_content[:4000]}
-
-请生成以下 3 个文件，必须用 markdown 代码块包裹，不要输出其他内容：
-
-```tsx
-// {ch_id}.tsx
-{{React 组件代码，使用 step 属性驱动逐步揭示}}
-```
-
-```css
-// {ch_id}.css
-{{样式代码，使用主题 token}}
-```
-
-```ts
-// narrations.ts
-{{旁白数组，每个 step 一句旁白，export default narrations}}
-```
-
-重要：严格按上述 3 个代码块输出，不要省略任何文件，不要在代码块外输出解释文字。"""
+{article_content[:4000]}"""
 
         print(f"\n[LLM 节点] 正在实现章节 {ch_num}: {ch_id}...")
-        ch_code = ctx.complete(chapter_prompt_n, max_tokens=8000, spinner_message=f"实现章节 {ch_id}...")
-        _save_chapter_files(ch_code, ch_dir, ch_id)
-        print(f"✓ 章节 {ch_id} 已实现")
+
+        # ── 调用1: 生成 tsx 组件 ──
+        tsx_prompt = f"""你是专业的 React 前端开发者。请生成视频演示第 {ch_num} 章节的 React 组件。
+
+{shared_context}
+
+直接输出 {ch_id}.tsx 的完整代码，不要用代码块包裹，不要输出任何解释。
+组件必须 default export，接收 {{ step: number }} props，用 step 驱动逐步揭示。"""
+
+        tsx_code = ctx.complete(tsx_prompt, max_tokens=6000, spinner_message=f"生成 {ch_id}.tsx...")
+        # 清理可能的代码块包裹
+        tsx_code = _strip_code_fences(tsx_code)
+        (ch_dir / f"{ch_id}.tsx").write_text(tsx_code.strip(), encoding="utf-8")
+        print(f"  ✓ {ch_id}.tsx ({len(tsx_code.strip().splitlines())} 行)")
+
+        # ── 调用2: 生成 css ──
+        css_prompt = f"""你是专业的 CSS 开发者。请生成视频演示第 {ch_num} 章节的样式文件。
+
+{shared_context}
+
+对应的 TSX 组件代码如下：
+```tsx
+{tsx_code[:3000]}
+```
+
+直接输出 {ch_id}.css 的完整代码，不要用代码块包裹，不要输出任何解释。
+使用主题 CSS 变量（如 var(--accent), var(--surface) 等）。"""
+
+        css_code = ctx.complete(css_prompt, max_tokens=4000, spinner_message=f"生成 {ch_id}.css...")
+        css_code = _strip_code_fences(css_code)
+        (ch_dir / f"{ch_id}.css").write_text(css_code.strip(), encoding="utf-8")
+        print(f"  ✓ {ch_id}.css ({len(css_code.strip().splitlines())} 行)")
+
+        # ── 调用3: 生成 narrations.ts ──
+        narr_prompt = f"""你是专业的视频旁白作者。请生成视频演示第 {ch_num} 章节的旁白数组。
+
+{shared_context}
+
+章节共 {ch['steps']} 个 step。生成一个 TypeScript 数组，每个 step 对应一句中文旁白。
+第 0 个 step 通常是空字符串（过场）。
+
+直接输出完整的 TypeScript 代码，格式如下，不要用代码块包裹，不要输出任何解释：
+const narrations: string[] = [
+  "",  // step 0
+  "旁白内容",  // step 1
+  ...
+]
+
+export default narrations;"""
+
+        narr_code = ctx.complete(narr_prompt, max_tokens=2000, spinner_message=f"生成 narrations.ts...")
+        narr_code = _strip_code_fences(narr_code)
+        (ch_dir / "narrations.ts").write_text(narr_code.strip(), encoding="utf-8")
+        print(f"  ✓ narrations.ts")
 
         # 更新状态
         completed_chapters.append(ch_id)
@@ -1322,6 +1354,15 @@ export const CHAPTERS: ChapterDef[] = [
         proc.wait()
     except KeyboardInterrupt:
         print("\n\n开发服务器已停止。")
+
+
+def _strip_code_fences(text):
+    """去掉 LLM 可能添加的 ```...``` 代码块包裹。"""
+    import re
+    m = re.match(r'^```(?:\w*)\s*\n(.*?)```\s*$', text, re.DOTALL)
+    if m:
+        return m.group(1)
+    return text
 
 
 def _save_chapter_files(code_text, chapter_dir, chapter_id):
