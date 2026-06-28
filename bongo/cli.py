@@ -1152,22 +1152,67 @@ def _run_video_workflow(agent, user_profile, current_username):
         tts_map = {"1": "edge", "2": "minimax", "3": "openai"}
         tts_provider = tts_map.get(tts_choice, "edge")
         print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
-        try:
-            result = subprocess.run(
-                [git_bash, "-l", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
-                cwd=str(presentation_dir),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=600
-            )
-            if result.returncode == 0:
-                print("✓ 音频已合成")
+
+        # 读取 audio-segments.json
+        segments_file = presentation_dir / "audio-segments.json"
+        if not segments_file.exists():
+            print("⚠ audio-segments.json 不存在，请先运行 extract-narrations")
+        else:
+            segments = json.loads(segments_file.read_text(encoding="utf-8"))
+            audio_dir = presentation_dir / "public" / "audio"
+            synthesized = 0
+            skipped = 0
+            failed = 0
+
+            if tts_provider == "edge":
+                # 直接用 Python edge-tts，避免 bash 的路径问题
+                try:
+                    import asyncio
+                    import edge_tts
+
+                    async def _synthesize_all():
+                        nonlocal synthesized, skipped, failed
+                        for i, seg in enumerate(segments, 1):
+                            ch = seg["chapter"]
+                            step = seg["step"]
+                            text = seg["text"]
+                            out = audio_dir / ch / f"{step}.mp3"
+                            if out.exists():
+                                skipped += 1
+                                print(f"  [{i}/{len(segments)}] {ch}/{step}.mp3 跳过（已存在）")
+                                continue
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            try:
+                                voice = "zh-CN-XiaoxiaoNeural"
+                                communicate = edge_tts.Communicate(text, voice)
+                                await communicate.save(str(out))
+                                synthesized += 1
+                                print(f"  [{i}/{len(segments)}] {ch}/{step}.mp3 ✓")
+                            except Exception as e:
+                                failed += 1
+                                print(f"  [{i}/{len(segments)}] {ch}/{step}.mp3 ✗ {e}")
+
+                    asyncio.run(_synthesize_all())
+                except ImportError:
+                    print("⚠ edge-tts 未安装，请运行: pip install edge-tts")
             else:
-                print(f"⚠ 合成音频失败: {result.stderr}")
-        except Exception as exc:
-            print(f"⚠ 合成音频异常: {exc}")
+                # minimax/openai 走 bash 脚本
+                try:
+                    result = subprocess.run(
+                        [git_bash, "-l", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
+                        cwd=str(presentation_dir),
+                        capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=600
+                    )
+                    if result.returncode == 0:
+                        print("✓ 音频已合成")
+                    else:
+                        print(f"⚠ 合成音频失败: {result.stderr}")
+                except Exception as exc:
+                    print(f"⚠ 合成音频异常: {exc}")
+
+            if tts_provider == "edge":
+                print(f"\n✓ 音频合成完成: 生成 {synthesized} 个, 跳过 {skipped} 个, 失败 {failed} 个")
 
     # ── Phase 4: 启动开发服务器 ──
     print(f"\n{'='*50}")
@@ -1177,6 +1222,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     print(f"\n项目目录: {presentation_dir}")
     print("启动开发服务器...\n")
 
+    import re as _re
     try:
         proc = subprocess.Popen(
             "npm run dev",
@@ -1189,25 +1235,22 @@ def _run_video_workflow(agent, user_profile, current_username):
             errors="replace",
         )
         detected_port = None
+        guidance_printed = False
         for line in proc.stdout:
             print(line, end="")
             # 从 Vite 输出中提取实际端口
             if not detected_port and "localhost:" in line:
-                import re
-                m = re.search(r'localhost:(\d+)', line)
+                m = _re.search(r'localhost:(\d+)', line)
                 if m:
                     detected_port = m.group(1)
-
-        proc.wait()
-    except KeyboardInterrupt:
-        print("\n\n开发服务器已停止。")
-
-    # 显示录制指引
-    port = detected_port or "5173"
-    print(f"\n{'='*50}")
-    print("录制指引")
-    print(f"{'='*50}")
-    print(f"""
+            # 端口检测到后立即显示录制指引（在服务器运行期间）
+            if detected_port and not guidance_printed:
+                guidance_printed = True
+                port = detected_port
+                print(f"\n{'='*50}")
+                print("录制指引")
+                print(f"{'='*50}")
+                print(f"""
   1. 浏览器打开 http://localhost:{port}/
      - 点击舞台任意位置推进 step
      - 按 M 键切换播放模式
@@ -1223,7 +1266,12 @@ def _run_video_workflow(agent, user_profile, current_username):
 
   4. 音频文件位置：
      {presentation_dir / 'public' / 'audio'}
+
+  按 Ctrl+C 停止开发服务器。
 """)
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\n\n开发服务器已停止。")
 
 
 def _save_chapter_files(code_text, chapter_dir, chapter_id):
