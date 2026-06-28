@@ -892,8 +892,9 @@ def _run_video_workflow(agent, user_profile, current_username):
     git_bash = _find_git_bash()
     try:
         # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
+        # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
         result = subprocess.run(
-            [git_bash, scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
+            [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
             cwd=str(work_dir),
             capture_output=True,
             text=True,
@@ -1080,7 +1081,7 @@ def _run_video_workflow(agent, user_profile, current_username):
         print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
         try:
             result = subprocess.run(
-                [git_bash, "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
+                [git_bash, "-l", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
                 cwd=str(presentation_dir),
                 capture_output=True,
                 text=True,
