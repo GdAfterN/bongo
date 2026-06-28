@@ -859,20 +859,47 @@ def _run_video_workflow(agent, user_profile, current_username):
     scaffold_script = VIDEO_SKILL_DIR / "scripts" / "scaffold.sh"
     presentation_dir = work_dir / "presentation"
 
-    # Windows 路径转为 bash 兼容的正斜杠路径
-    scaffold_script_bash = str(scaffold_script).replace("\\", "/")
-    work_dir_bash = str(work_dir).replace("\\", "/")
+    # Windows 路径转为 Git Bash 兼容的 /d/ 前缀路径
+    def _to_git_bash_path(p):
+        """将 Windows 路径转为 Git Bash 的 /<drive>/ 前缀格式。"""
+        s = str(p).replace("\\", "/")
+        if len(s) >= 2 and s[1] == ':':
+            return "/" + s[0].lower() + s[2:]
+        return s
 
-    print("\n[固定步骤] 正在创建 Vite 项目...")
+    def _find_git_bash():
+        """查找 Git Bash 可执行文件路径。"""
+        import shutil as _shutil
+        # 优先查找 Git 安装目录下的 bash
+        for candidate in [
+            "D:/Git/usr/bin/bash.exe",
+            "C:/Program Files/Git/usr/bin/bash.exe",
+        ]:
+            if os.path.isfile(candidate):
+                return candidate
+        # 回退到 PATH 中的 bash
+        found = _shutil.which("bash")
+        if found:
+            return found
+        raise FileNotFoundError("找不到 bash，请安装 Git for Windows")
+
+    scaffold_script_bash = _to_git_bash_path(scaffold_script)
+
+    print(f"\n[固定步骤] 正在创建 Vite 项目...")
+    print(f"  脚本: {scaffold_script_bash}")
+    print(f"  工作目录: {work_dir}")
     import subprocess
+    git_bash = _find_git_bash()
     try:
-        # 使用相对路径避免 npm create vite@latest 的路径解析问题
+        # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
         result = subprocess.run(
-            ["bash", scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
-            cwd=work_dir_bash,
+            [git_bash, scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
+            cwd=str(work_dir),
             capture_output=True,
             text=True,
-            timeout=180
+            encoding="utf-8",
+            errors="replace",
+            timeout=300
         )
         if result.returncode != 0:
             print(f"✗ scaffold 失败: {result.stderr}")
@@ -1031,13 +1058,14 @@ def _run_video_workflow(agent, user_profile, current_username):
 
         # 提取旁白
         print("\n[固定步骤] 正在提取旁白...")
-        presentation_dir_bash = str(presentation_dir).replace("\\", "/")
         try:
             result = subprocess.run(
                 ["npx", "tsx", "scripts/extract-narrations.ts"],
-                cwd=presentation_dir_bash,
+                cwd=str(presentation_dir),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60
             )
             if result.returncode == 0:
@@ -1052,10 +1080,12 @@ def _run_video_workflow(agent, user_profile, current_username):
         print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
         try:
             result = subprocess.run(
-                ["bash", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
-                cwd=presentation_dir_bash,
+                [git_bash, "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
+                cwd=str(presentation_dir),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=600
             )
             if result.returncode == 0:
@@ -1076,7 +1106,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     print("按 Ctrl+C 停止服务器\n")
 
     try:
-        subprocess.run(["npm", "run", "dev"], cwd=presentation_dir_bash)
+        subprocess.run(["npm", "run", "dev"], cwd=str(presentation_dir))
     except KeyboardInterrupt:
         print("\n开发服务器已停止。")
 
