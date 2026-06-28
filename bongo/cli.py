@@ -695,21 +695,64 @@ def _run_video_workflow(agent, user_profile, current_username):
     print(f"\n工作目录: {work_dir}")
     print(f"文档: {selected_file.name} ({len(article_content)} 字)")
 
+    # ── 状态管理（resume 机制）──
+    state_file = work_dir / ".video-state.json"
+    import json
+
+    def _load_state():
+        if state_file.exists():
+            try:
+                return json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_state(state):
+        state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state = _load_state()
+    resuming = False
+
+    # 检测是否有可恢复的状态
+    if state.get("script_done"):
+        completed = state.get("completed_chapters", [])
+        total = state.get("total_chapters", 0)
+        print(f"\n检测到未完成的工作流：")
+        print(f"  script.md: ✓")
+        print(f"  outline.md: {'✓' if state.get('outline_done') else '✗'}")
+        print(f"  主题: {state.get('selected_theme', '未选择')}")
+        print(f"  scaffold: {'✓' if state.get('scaffold_done') else '✗'}")
+        print(f"  章节: {len(completed)}/{total} 已完成")
+        resume_choice = _styled_input("\n从断点继续？[Y/n/取消]: ").strip().lower()
+        if resume_choice == "n":
+            state = {}
+            state_file.unlink(missing_ok=True)
+            print("  已清除旧状态，重新开始。")
+        elif resume_choice in ("c", "取消"):
+            print("已取消。")
+            return
+        else:
+            resuming = True
+            print("  从断点继续...")
+
     # 创建 LLM 调用上下文
     ctx = PracticeContext(agent.model_client, agent.work_dir)
-
-    # ── Phase 1: 内容写作 ──
-    print(f"\n{'='*50}")
-    print("Phase 1: 内容写作")
-    print(f"{'='*50}")
 
     # 加载 reference 文档
     script_style = (VIDEO_SKILL_DIR / "references" / "SCRIPT-STYLE.md").read_text(encoding="utf-8")
     outline_format = (VIDEO_SKILL_DIR / "references" / "OUTLINE-FORMAT.md").read_text(encoding="utf-8")
     chapter_craft = (VIDEO_SKILL_DIR / "references" / "CHAPTER-CRAFT.md").read_text(encoding="utf-8")
 
-    # LLM 节点1: 生成 script.md
-    script_prompt = f"""你是专业的视频口播稿作者。请根据以下风格指南，将用户的文章转换为口播稿。
+    # ── Phase 1: 内容写作 ──
+    if not resuming or not state.get("script_done"):
+        print(f"\n{'='*50}")
+        print("Phase 1: 内容写作")
+        print(f"{'='*50}")
+
+    # ── 生成 script.md ──
+    if not resuming or not state.get("script_done"):
+        # LLM 节点1: 生成 script.md
+        script_prompt = f"""你是专业的视频口播稿作者。请根据以下风格指南，将用户的文章转换为口播稿。
 
 ## 风格指南
 {script_style}
@@ -718,13 +761,13 @@ def _run_video_workflow(agent, user_profile, current_username):
 {article_content[:8000]}
 
 请直接输出口播稿内容（markdown 格式），不要添加任何前缀说明。"""
-    print("\n[LLM 节点1] 正在生成口播稿...")
-    script_content = ctx.complete(script_prompt, max_tokens=6000, spinner_message="生成 script.md...")
-    (work_dir / "script.md").write_text(script_content, encoding="utf-8")
-    print(f"✓ script.md 已生成 ({len(script_content)} 字)")
+        print("\n[LLM 节点1] 正在生成口播稿...")
+        script_content = ctx.complete(script_prompt, max_tokens=6000, spinner_message="生成 script.md...")
+        (work_dir / "script.md").write_text(script_content, encoding="utf-8")
+        print(f"✓ script.md 已生成 ({len(script_content)} 字)")
 
-    # LLM 节点2: script 自检
-    check_prompt = f"""请检查以下口播稿是否符合要求：
+        # LLM 节点2: script 自检
+        check_prompt = f"""请检查以下口播稿是否符合要求：
 1. 信息保留度 ≥ 60%（与原文对比）
 2. 口语化，无 AI 味
 3. 短句为主（每句 ≤ 20 字）
@@ -738,12 +781,11 @@ def _run_video_workflow(agent, user_profile, current_username):
 {article_content[:4000]}
 
 如果存在问题，请指出并给出修改建议。如果合格，回复"合格"。"""
-    print("[LLM 节点2] 正在自检口播稿...")
-    check_result = ctx.complete(check_prompt, max_tokens=2000, spinner_message="自检 script.md...")
-    if "合格" not in check_result:
-        print(f"⚠ 口播稿需要修改：\n{check_result[:200]}")
-        # 重新生成
-        revise_prompt = f"""请根据以下修改建议，重新生成口播稿。
+        print("[LLM 节点2] 正在自检口播稿...")
+        check_result = ctx.complete(check_prompt, max_tokens=2000, spinner_message="自检 script.md...")
+        if "合格" not in check_result:
+            print(f"⚠ 口播稿需要修改：\n{check_result[:200]}")
+            revise_prompt = f"""请根据以下修改建议，重新生成口播稿。
 
 ## 修改建议
 {check_result}
@@ -755,13 +797,21 @@ def _run_video_workflow(agent, user_profile, current_username):
 {article_content[:8000]}
 
 请直接输出修改后的口播稿内容（markdown 格式）。"""
-        print("[LLM 节点1] 正在重新生成口播稿...")
-        script_content = ctx.complete(revise_prompt, max_tokens=6000, spinner_message="重新生成 script.md...")
-        (work_dir / "script.md").write_text(script_content, encoding="utf-8")
-        print(f"✓ script.md 已重新生成 ({len(script_content)} 字)")
+            print("[LLM 节点1] 正在重新生成口播稿...")
+            script_content = ctx.complete(revise_prompt, max_tokens=6000, spinner_message="重新生成 script.md...")
+            (work_dir / "script.md").write_text(script_content, encoding="utf-8")
+            print(f"✓ script.md 已重新生成 ({len(script_content)} 字)")
 
-    # LLM 节点3: 生成 outline.md
-    outline_prompt = f"""你是专业的视频策划师。请根据以下格式规范，为口播稿生成章节大纲。
+        state["script_done"] = True
+        _save_state(state)
+    else:
+        script_content = (work_dir / "script.md").read_text(encoding="utf-8")
+        print(f"\n[resume] script.md 已存在 ({len(script_content)} 字)，跳过")
+
+    # ── 生成 outline.md ──
+    if not resuming or not state.get("outline_done"):
+        # LLM 节点3: 生成 outline.md
+        outline_prompt = f"""你是专业的视频策划师。请根据以下格式规范，为口播稿生成章节大纲。
 
 ## 格式规范
 {outline_format}
@@ -773,13 +823,13 @@ def _run_video_workflow(agent, user_profile, current_username):
 {article_content[:6000]}
 
 请直接输出 outline.md 内容（markdown 格式），不要添加任何前缀说明。"""
-    print("\n[LLM 节点3] 正在生成大纲...")
-    outline_content = ctx.complete(outline_prompt, max_tokens=6000, spinner_message="生成 outline.md...")
-    (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
-    print(f"✓ outline.md 已生成 ({len(outline_content)} 字)")
+        print("\n[LLM 节点3] 正在生成大纲...")
+        outline_content = ctx.complete(outline_prompt, max_tokens=6000, spinner_message="生成 outline.md...")
+        (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
+        print(f"✓ outline.md 已生成 ({len(outline_content)} 字)")
 
-    # LLM 节点4: outline 自检
-    outline_check_prompt = f"""请检查以下大纲是否符合要求：
+        # LLM 节点4: outline 自检
+        outline_check_prompt = f"""请检查以下大纲是否符合要求：
 1. 包含 metadata block（主题、总时长、章节数）
 2. 每章有信息池
 3. 每章有开发计划（step 列表）
@@ -789,11 +839,11 @@ def _run_video_workflow(agent, user_profile, current_username):
 {outline_content[:4000]}
 
 如果存在问题，请指出。如果合格，回复"合格"。"""
-    print("[LLM 节点4] 正在自检大纲...")
-    outline_check = ctx.complete(outline_check_prompt, max_tokens=2000, spinner_message="自检 outline.md...")
-    if "合格" not in outline_check:
-        print(f"⚠ 大纲需要修改：\n{outline_check[:200]}")
-        revise_outline = f"""请根据以下修改建议，重新生成大纲。
+        print("[LLM 节点4] 正在自检大纲...")
+        outline_check = ctx.complete(outline_check_prompt, max_tokens=2000, spinner_message="自检 outline.md...")
+        if "合格" not in outline_check:
+            print(f"⚠ 大纲需要修改：\n{outline_check[:200]}")
+            revise_outline = f"""请根据以下修改建议，重新生成大纲。
 
 ## 修改建议
 {outline_check}
@@ -808,47 +858,61 @@ def _run_video_workflow(agent, user_profile, current_username):
 {article_content[:6000]}
 
 请直接输出修改后的 outline.md 内容（markdown 格式）。"""
-        print("[LLM 节点3] 正在重新生成大纲...")
-        outline_content = ctx.complete(revise_outline, max_tokens=6000, spinner_message="重新生成 outline.md...")
-        (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
-        print(f"✓ outline.md 已重新生成 ({len(outline_content)} 字)")
+            print("[LLM 节点3] 正在重新生成大纲...")
+            outline_content = ctx.complete(revise_outline, max_tokens=6000, spinner_message="重新生成 outline.md...")
+            (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
+            print(f"✓ outline.md 已重新生成 ({len(outline_content)} 字)")
+
+        state["outline_done"] = True
+        _save_state(state)
+    else:
+        outline_content = (work_dir / "outline.md").read_text(encoding="utf-8")
+        print(f"[resume] outline.md 已存在 ({len(outline_content)} 字)，跳过")
 
     # ── Checkpoint Plan: 用户确认 ──
-    print(f"\n{'='*50}")
-    print("Checkpoint Plan")
-    print(f"{'='*50}")
+    if not resuming or not state.get("checkpoint_done"):
+        print(f"\n{'='*50}")
+        print("Checkpoint Plan")
+        print(f"{'='*50}")
 
-    # 展示 script 摘要
-    print("\n【口播稿摘要】")
-    print(script_content[:500] + "..." if len(script_content) > 500 else script_content)
+        # 展示 script 摘要
+        print("\n【口播稿摘要】")
+        print(script_content[:500] + "..." if len(script_content) > 500 else script_content)
 
-    # 展示 outline
-    print("\n【大纲】")
-    print(outline_content[:800] + "..." if len(outline_content) > 800 else outline_content)
+        # 展示 outline
+        print("\n【大纲】")
+        print(outline_content[:800] + "..." if len(outline_content) > 800 else outline_content)
 
-    # 主题选择
-    themes = [d.name for d in VIDEO_THEMES_DIR.iterdir() if d.is_dir()]
-    themes.sort()
-    print("\n【可选主题】")
-    for idx, theme in enumerate(themes, 1):
-        print(f"  {idx}. {theme}")
+        # 主题选择
+        themes = [d.name for d in VIDEO_THEMES_DIR.iterdir() if d.is_dir()]
+        themes.sort()
+        print("\n【可选主题】")
+        for idx, theme in enumerate(themes, 1):
+            print(f"  {idx}. {theme}")
 
-    try:
-        theme_choice = _styled_input("\n选择主题 [编号] (默认 12-midnight-press): ").strip()
-        if theme_choice:
-            theme_idx = int(theme_choice) - 1
-            selected_theme = themes[theme_idx]
-        else:
+        try:
+            theme_choice = _styled_input("\n选择主题 [编号] (默认 12-midnight-press): ").strip()
+            if theme_choice:
+                theme_idx = int(theme_choice) - 1
+                selected_theme = themes[theme_idx]
+            else:
+                selected_theme = "midnight-press"
+        except (ValueError, IndexError):
             selected_theme = "midnight-press"
-    except (ValueError, IndexError):
-        selected_theme = "midnight-press"
 
-    print(f"\n已选择主题: {selected_theme}")
+        print(f"\n已选择主题: {selected_theme}")
 
-    confirm = _styled_input("\n确认继续？[Y/n]: ").strip().lower()
-    if confirm == "n":
-        print("已取消。")
-        return
+        confirm = _styled_input("\n确认继续？[Y/n]: ").strip().lower()
+        if confirm == "n":
+            print("已取消。")
+            return
+
+        state["checkpoint_done"] = True
+        state["selected_theme"] = selected_theme
+        _save_state(state)
+    else:
+        selected_theme = state.get("selected_theme", "midnight-press")
+        print(f"[resume] checkpoint 已完成，主题: {selected_theme}")
 
     # ── Phase 2: Web 开发 ──
     print(f"\n{'='*50}")
@@ -885,9 +949,12 @@ def _run_video_workflow(agent, user_profile, current_username):
 
     scaffold_script_bash = _to_git_bash_path(scaffold_script)
 
-    # 如果 presentation 目录已存在，询问是否覆盖
+    # resume 时 scaffold 已完成则跳过
     skip_scaffold = False
-    if presentation_dir.exists() and any(presentation_dir.iterdir()):
+    if resuming and state.get("scaffold_done") and presentation_dir.exists():
+        print(f"[resume] scaffold 已完成，跳过")
+        skip_scaffold = True
+    elif presentation_dir.exists() and any(presentation_dir.iterdir()):
         overwrite = _styled_input(f"\n  {presentation_dir} 已存在，是否删除并重新创建？[y/N]: ").strip().lower()
         if overwrite == "y":
             import shutil
@@ -930,6 +997,8 @@ def _run_video_workflow(agent, user_profile, current_username):
                 print(f"✗ scaffold 失败 (exit {proc.returncode})")
                 return
             print(f"✓ Vite 项目已创建: {presentation_dir}")
+            state["scaffold_done"] = True
+            _save_state(state)
         except Exception as exc:
             print(f"✗ scaffold 执行异常: {exc}")
             return
@@ -960,71 +1029,29 @@ def _run_video_workflow(agent, user_profile, current_username):
     if tokens_path.exists():
         tokens_css = tokens_path.read_text(encoding="utf-8")
 
-    # LLM 节点5: 实现章节1（作为 style anchor）
-    ch1 = chapters[0]
-    ch1_dir = presentation_dir / "src" / "chapters" / f"01-{ch1['id']}"
-    ch1_dir.mkdir(parents=True, exist_ok=True)
+    # 初始化已完成章节列表
+    completed_chapters = state.get("completed_chapters", [])
+    state["total_chapters"] = len(chapters)
+    _save_state(state)
 
-    chapter_prompt = f"""你是专业的 React 前端开发者。请根据以下指引，实现视频演示的第 1 个章节。
-
-## 章节开发指引
-{chapter_craft[:4000]}
-
-## 主题 CSS Tokens
-{tokens_css[:2000]}
-
-## 大纲（第 1 章节）
-{outline_content[:2000]}
-
-## 口播稿
-{script_content[:4000]}
-
-## 原文（用于信息池）
-{article_content[:4000]}
-
-请生成以下文件：
-1. {ch1['id']}.tsx - React 组件（使用 step 属性驱动逐步揭示）
-2. {ch1['id']}.css - 样式文件（使用主题 token）
-3. narrations.ts - 旁白数组（每个 step 一句旁白）
-
-输出格式：
-```tsx
-// {ch1['id']}.tsx
-{{代码}}
-```
-
-```css
-// {ch1['id']}.css
-{{代码}}
-```
-
-```ts
-// narrations.ts
-{{代码}}
-```"""
-
-    print(f"\n[LLM 节点5] 正在实现章节 1: {ch1['id']}...")
-    ch1_code = ctx.complete(chapter_prompt, max_tokens=8000, spinner_message=f"实现章节 {ch1['id']}...")
-
-    # 解析并保存文件
-    _save_chapter_files(ch1_code, ch1_dir, ch1['id'])
-    print(f"✓ 章节 {ch1['id']} 已实现")
-
-    # 用户确认章节 1
-    confirm_ch1 = _styled_input("\n章节 1 已完成，确认继续？[Y/n]: ").strip().lower()
-    if confirm_ch1 == "n":
-        print("已取消。")
-        return
-
-    # LLM 节点6: 实现章节 2~N
-    for ch in chapters[1:]:
+    # ── 实现所有章节（支持 resume 跳过已完成的）──
+    for ch in chapters:
         ch_num = ch['num']
         ch_id = ch['id']
+
+        # resume 时跳过已完成章节
+        if ch_id in completed_chapters:
+            print(f"[resume] 章节 {ch_num} ({ch_id}) 已完成，跳过")
+            continue
+
         ch_dir = presentation_dir / "src" / "chapters" / f"{ch_num:02d}-{ch_id}"
         ch_dir.mkdir(parents=True, exist_ok=True)
 
-        # 提取该章节对应的 outline 内容
-        ch_outline = _extract_chapter_outline(outline_content, ch_num)
+        # 第 1 章作为 style anchor，使用完整 outline；其余章节提取对应部分
+        if ch_num == 1:
+            ch_outline = outline_content[:2000]
+        else:
+            ch_outline = _extract_chapter_outline(outline_content, ch_num)
 
         chapter_prompt_n = f"""你是专业的 React 前端开发者。请根据以下指引，实现视频演示的第 {ch_num} 个章节。
 
@@ -1064,10 +1091,22 @@ def _run_video_workflow(agent, user_profile, current_username):
 {{代码}}
 ```"""
 
-        print(f"\n[LLM 节点6] 正在实现章节 {ch_num}: {ch_id}...")
+        print(f"\n[LLM 节点] 正在实现章节 {ch_num}: {ch_id}...")
         ch_code = ctx.complete(chapter_prompt_n, max_tokens=8000, spinner_message=f"实现章节 {ch_id}...")
         _save_chapter_files(ch_code, ch_dir, ch_id)
         print(f"✓ 章节 {ch_id} 已实现")
+
+        # 更新状态
+        completed_chapters.append(ch_id)
+        state["completed_chapters"] = completed_chapters
+        _save_state(state)
+
+        # 第 1 章完成后用户确认
+        if ch_num == 1:
+            confirm_ch1 = _styled_input("\n章节 1 已完成，确认继续？[Y/n]: ").strip().lower()
+            if confirm_ch1 == "n":
+                print("已取消。")
+                return
 
     # ── Checkpoint Audio ──
     print(f"\n{'='*50}")
