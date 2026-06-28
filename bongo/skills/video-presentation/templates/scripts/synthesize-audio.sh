@@ -71,9 +71,8 @@ if [[ ! -f "$SEGMENTS" ]]; then
   echo "✗ $SEGMENTS not found. Run: npm run extract-narrations" >&2
   exit 1
 fi
-if ! command -v jq >/dev/null; then
-  echo "✗ jq is required to read audio-segments.json" >&2
-  echo "  Install: brew install jq   (or apt-get install jq, etc.)" >&2
+if ! command -v node >/dev/null; then
+  echo "✗ node is required to read audio-segments.json" >&2
   exit 1
 fi
 if [[ ! -f "$PROVIDER_FILE" ]]; then
@@ -109,17 +108,14 @@ if declare -F tts_check >/dev/null; then
 fi
 
 # ── Main loop ─────────────────────────────────────────────────────────
-total=$(jq 'length' "$SEGMENTS")
+total=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$SEGMENTS','utf8')).length)")
 i=0
 synthesized=0
 skipped=0
 failed=0
 
-while IFS= read -r row; do
+while IFS=$'\t' read -r chapter step text; do
   i=$((i + 1))
-  chapter=$(echo "$row" | jq -r '.chapter')
-  step=$(echo "$row" | jq -r '.step')
-  text=$(echo "$row" | jq -r '.text')
   out="$OUT_DIR/$chapter/$step.mp3"
 
   if [[ -f "$out" && "$FORCE" != true ]]; then
@@ -138,7 +134,10 @@ while IFS= read -r row; do
     failed=$((failed + 1))
     printf "[%3d/%d] %-20s ✗ FAILED\n" "$i" "$total" "$chapter/$step.mp3" >&2
   fi
-done < <(jq -c '.[]' "$SEGMENTS")
+done < <(node -e "
+const d=JSON.parse(require('fs').readFileSync('$SEGMENTS','utf8'));
+d.forEach(s=>process.stdout.write(s.chapter+'\t'+s.step+'\t'+s.text+'\n'));
+")
 
 echo
 echo "✓ done (provider=$PROVIDER) — synthesized $synthesized, skipped $skipped, failed $failed"

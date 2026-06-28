@@ -1037,10 +1037,15 @@ def _run_video_workflow(agent, user_profile, current_username):
         ch_num = ch['num']
         ch_id = ch['id']
 
-        # resume 时跳过已完成章节
+        # resume 时跳过已完成章节（但验证文件确实存在）
         if ch_id in completed_chapters:
-            print(f"[resume] 章节 {ch_num} ({ch_id}) 已完成，跳过")
-            continue
+            ch_dir_check = presentation_dir / "src" / "chapters" / f"{ch_num:02d}-{ch_id}"
+            if ch_dir_check.exists() and list(ch_dir_check.glob("*.tsx")):
+                print(f"[resume] 章节 {ch_num} ({ch_id}) 已完成，跳过")
+                continue
+            else:
+                print(f"[resume] 章节 {ch_num} ({ch_id}) state 标记完成但文件缺失，重新生成")
+                completed_chapters.remove(ch_id)
 
         ch_dir = presentation_dir / "src" / "chapters" / f"{ch_num:02d}-{ch_id}"
         ch_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,34 +1170,87 @@ def _run_video_workflow(agent, user_profile, current_username):
     print(f"{'='*50}")
 
     print(f"\n项目目录: {presentation_dir}")
-    print("启动开发服务器...")
-    print("访问 http://localhost:5173/?auto=1 进入自动播放模式")
-    print("按 Ctrl+C 停止服务器\n")
+    print("启动开发服务器...\n")
 
     try:
-        subprocess.run("npm run dev", cwd=str(presentation_dir), shell=True)
+        proc = subprocess.Popen(
+            "npm run dev",
+            cwd=str(presentation_dir),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        detected_port = None
+        for line in proc.stdout:
+            print(line, end="")
+            # 从 Vite 输出中提取实际端口
+            if not detected_port and "localhost:" in line:
+                import re
+                m = re.search(r'localhost:(\d+)', line)
+                if m:
+                    detected_port = m.group(1)
+
+        proc.wait()
     except KeyboardInterrupt:
-        print("\n开发服务器已停止。")
+        print("\n\n开发服务器已停止。")
+
+    # 显示录制指引
+    port = detected_port or "5173"
+    print(f"\n{'='*50}")
+    print("录制指引")
+    print(f"{'='*50}")
+    print(f"""
+  1. 浏览器打开 http://localhost:{port}/
+     - 点击舞台任意位置推进 step
+     - 按 M 键切换播放模式
+
+  2. 自动播放模式（推荐录制用）：
+     http://localhost:{port}/?auto=1
+     - 按 SPACE 开始自动播放
+     - 音频与 step 自动同步
+
+  3. 录制工具推荐：
+     - OBS Studio（免费，推荐）
+     - 浏览器自带录屏（F12 → Performance）
+
+  4. 音频文件位置：
+     {presentation_dir / 'public' / 'audio'}
+""")
 
 
 def _save_chapter_files(code_text, chapter_dir, chapter_id):
     """从 LLM 输出中解析并保存章节文件。"""
     import re
 
-    # 解析 tsx 文件
-    tsx_match = re.search(r'```tsx?\s*\n(.*?)```', code_text, re.DOTALL)
+    saved = []
+
+    # 解析 tsx 文件（只匹配 ```tsx，不匹配 ```ts）
+    tsx_match = re.search(r'```tsx\s*\n(.*?)```', code_text, re.DOTALL)
     if tsx_match:
         (chapter_dir / f"{chapter_id}.tsx").write_text(tsx_match.group(1).strip(), encoding="utf-8")
+        saved.append(f"{chapter_id}.tsx")
 
     # 解析 css 文件
     css_match = re.search(r'```css\s*\n(.*?)```', code_text, re.DOTALL)
     if css_match:
         (chapter_dir / f"{chapter_id}.css").write_text(css_match.group(1).strip(), encoding="utf-8")
+        saved.append(f"{chapter_id}.css")
 
-    # 解析 narrations.ts
-    ts_match = re.search(r'```ts\s*\n(.*?)```', code_text, re.DOTALL)
+    # 解析 narrations.ts（匹配 ```ts 或 ```typescript）
+    ts_match = re.search(r'```(?:ts|typescript)\s*\n(.*?)```', code_text, re.DOTALL)
     if ts_match:
         (chapter_dir / "narrations.ts").write_text(ts_match.group(1).strip(), encoding="utf-8")
+        saved.append("narrations.ts")
+
+    if not saved:
+        print(f"  ⚠ 未能从 LLM 输出中解析出任何文件，尝试保存原始输出...")
+        (chapter_dir / f"{chapter_id}_raw.txt").write_text(code_text, encoding="utf-8")
+        print(f"  已保存原始输出到 {chapter_dir / f'{chapter_id}_raw.txt'}")
+    elif len(saved) < 3:
+        print(f"  ⚠ 只解析到: {', '.join(saved)}（期望 3 个文件）")
 
 
 def _extract_chapter_outline(outline_content, chapter_num):
