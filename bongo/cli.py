@@ -698,6 +698,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     # ── 状态管理（resume 机制）──
     state_file = work_dir / ".video-state.json"
     import json
+    import subprocess
 
     def _load_state():
         if state_file.exists():
@@ -972,7 +973,6 @@ def _run_video_workflow(agent, user_profile, current_username):
         lint_choice = _styled_input("\n  选择代码检查工具 [1-Oxlint / 2-ESLint] (默认 1): ").strip()
         lint_flag = "--eslint" if lint_choice == "2" else "--no-eslint"
 
-        import subprocess
         git_bash = _find_git_bash()
         try:
             # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
