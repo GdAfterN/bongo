@@ -1221,6 +1221,22 @@ def _run_video_workflow(agent, user_profile, current_username):
     print("启动开发服务器...\n")
 
     import re as _re
+    import threading
+
+    detected_port = [None]
+    port_detected = threading.Event()
+
+    def _read_output(pipe):
+        """后台线程：持续读取 Vite 输出并提取端口"""
+        for line in iter(pipe.readline, ''):
+            print(line, end="", flush=True)
+            if not detected_port[0] and "localhost:" in line:
+                m = _re.search(r'localhost:(\d+)', line)
+                if m:
+                    detected_port[0] = m.group(1)
+                    port_detected.set()
+        pipe.close()
+
     try:
         proc = subprocess.Popen(
             "npm run dev",
@@ -1231,24 +1247,20 @@ def _run_video_workflow(agent, user_profile, current_username):
             text=True,
             encoding="utf-8",
             errors="replace",
+            bufsize=1,
         )
-        detected_port = None
-        guidance_printed = False
-        for line in proc.stdout:
-            print(line, end="")
-            # 从 Vite 输出中提取实际端口
-            if not detected_port and "localhost:" in line:
-                m = _re.search(r'localhost:(\d+)', line)
-                if m:
-                    detected_port = m.group(1)
-            # 端口检测到后立即显示录制指引（在服务器运行期间）
-            if detected_port and not guidance_printed:
-                guidance_printed = True
-                port = detected_port
-                print(f"\n{'='*50}")
-                print("录制指引")
-                print(f"{'='*50}")
-                print(f"""
+        reader = threading.Thread(target=_read_output, args=(proc.stdout,), daemon=True)
+        reader.start()
+
+        # 等待端口检测（最多 30 秒）
+        port_detected.wait(timeout=30)
+
+        if detected_port[0]:
+            port = detected_port[0]
+            print(f"\n{'='*50}")
+            print("录制指引")
+            print(f"{'='*50}")
+            print(f"""
   1. 浏览器打开 http://localhost:{port}/
      - 点击舞台任意位置推进 step
      - 按 M 键切换播放模式
@@ -1267,6 +1279,9 @@ def _run_video_workflow(agent, user_profile, current_username):
 
   按 Ctrl+C 停止开发服务器。
 """)
+        else:
+            print("\n  提示: 打开 http://localhost:5174/ 查看演示")
+
         proc.wait()
     except KeyboardInterrupt:
         print("\n\n开发服务器已停止。")
