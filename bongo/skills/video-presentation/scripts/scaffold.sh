@@ -98,7 +98,7 @@ fi
 echo "▸ 在 $TARGET 创建 Vite + React + TS 项目"
 echo "▸ 使用主题：$THEME"
 
-npm create vite@latest "$TARGET" -- --template react-ts "$LINT_FLAG"
+npm create vite@latest "$TARGET" -- --template react-ts "$LINT_FLAG" --no-immediate
 
 cd "$TARGET"
 echo "▸ 安装依赖（可能要等一会）..."
