@@ -893,17 +893,24 @@ def _run_video_workflow(agent, user_profile, current_username):
     try:
         # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
         # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
-        result = subprocess.run(
+        # 实时输出让用户看到进度
+        proc = subprocess.Popen(
             [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
             cwd=str(work_dir),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=300
         )
-        if result.returncode != 0:
-            print(f"✗ scaffold 失败: {result.stderr}")
+        for line in proc.stdout:
+            try:
+                print(f"  {line}", end="")
+            except UnicodeEncodeError:
+                print(line.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding, errors="replace"), end="")
+        proc.wait(timeout=300)
+        if proc.returncode != 0:
+            print(f"✗ scaffold 失败 (exit {proc.returncode})")
             return
         print(f"✓ Vite 项目已创建: {presentation_dir}")
     except Exception as exc:
