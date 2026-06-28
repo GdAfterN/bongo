@@ -888,6 +888,11 @@ def _run_video_workflow(agent, user_profile, current_username):
     print(f"\n[固定步骤] 正在创建 Vite 项目...")
     print(f"  脚本: {scaffold_script_bash}")
     print(f"  工作目录: {work_dir}")
+
+    # Linter 选择（原版 create-vite 的交互，翻译成中文）
+    lint_choice = _styled_input("\n  选择代码检查工具 [1-Oxlint / 2-ESLint] (默认 1): ").strip()
+    lint_flag = "--eslint" if lint_choice == "2" else "--no-eslint"
+
     import subprocess
     git_bash = _find_git_bash()
     try:
@@ -895,7 +900,7 @@ def _run_video_workflow(agent, user_profile, current_username):
         # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
         # 实时输出让用户看到进度
         proc = subprocess.Popen(
-            [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}"],
+            [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}", lint_flag],
             cwd=str(work_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

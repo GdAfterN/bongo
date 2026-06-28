@@ -45,6 +45,7 @@ list_themes() {
 # ── 解析参数 ──
 TARGET=""
 THEME="$DEFAULT_THEME"
+LINT_FLAG="--no-eslint"
 for arg in "$@"; do
   case "$arg" in
     --list-themes)
@@ -53,6 +54,12 @@ for arg in "$@"; do
       ;;
     --theme=*)
       THEME="${arg#--theme=}"
+      ;;
+    --eslint)
+      LINT_FLAG="--eslint"
+      ;;
+    --no-eslint)
+      LINT_FLAG="--no-eslint"
       ;;
     --*)
       echo "✗ 未知参数: $arg" >&2
@@ -90,7 +97,8 @@ fi
 
 echo "▸ 在 $TARGET 创建 Vite + React + TS 项目"
 echo "▸ 使用主题：$THEME"
-npm create vite@latest "$TARGET" -- --template react-ts --no-eslint
+
+npm create vite@latest "$TARGET" -- --template react-ts "$LINT_FLAG"
 
 cd "$TARGET"
 echo "▸ 安装依赖（可能要等一会）..."
