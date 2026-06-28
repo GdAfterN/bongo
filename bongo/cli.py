@@ -885,6 +885,15 @@ def _run_video_workflow(agent, user_profile, current_username):
 
     scaffold_script_bash = _to_git_bash_path(scaffold_script)
 
+    # 如果 presentation 目录已存在，询问是否覆盖
+    if presentation_dir.exists() and any(presentation_dir.iterdir()):
+        overwrite = _styled_input(f"\n  {presentation_dir} 已存在，是否删除并重新创建？[y/N]: ").strip().lower()
+        if overwrite == "y":
+            import shutil
+            shutil.rmtree(presentation_dir)
+        else:
+            print("  跳过 scaffold，使用已有项目。")
+
     print(f"\n[固定步骤] 正在创建 Vite 项目...")
     print(f"  脚本: {scaffold_script_bash}")
     print(f"  工作目录: {work_dir}")

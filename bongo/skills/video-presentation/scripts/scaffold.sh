@@ -61,6 +61,9 @@ for arg in "$@"; do
     --no-eslint)
       LINT_FLAG="--no-eslint"
       ;;
+    --immediate|--no-immediate)
+      # 接受但忽略，scaffold.sh 自行管理安装流程
+      ;;
     --*)
       echo "✗ 未知参数: $arg" >&2
       exit 1
