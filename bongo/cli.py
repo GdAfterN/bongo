@@ -149,6 +149,10 @@ HELP_DETAILS = textwrap.dedent(
                     2. 深度求索：从信任路径中选择文档出题
                     3. 朝花夕拾：错题复习（答对移除，答错累加）
 
+    视频功能：
+    [cyan]/video[/]           从信任路径选择技术文档，转换为视频演示。
+                    工作流：文档→口播稿→大纲→React演示项目→音频→录制。
+
     用户管理：
     [cyan]/user[/]            显示当前用户和所有用户列表。
     [cyan]/user[/] <name>     切换到另一个用户。
@@ -623,6 +627,490 @@ class PracticeContext:
         except Exception as exc:
             print(f"\n总评生成失败: {exc}")
         print(f"{'='*50}")
+
+
+# ── /video 工作流 ──────────────────────────────────────────────────────────────
+
+VIDEO_SKILL_DIR = Path(__file__).parent / "skills" / "video-presentation"
+VIDEO_THEMES_DIR = VIDEO_SKILL_DIR / "themes"
+
+
+def _run_video_workflow(agent, user_profile, current_username):
+    """从信任路径选择技术文档，转换为视频演示的工作流。"""
+    from rich.panel import Panel
+    from rich.table import Table
+
+    # ── Step 1: 选择文档 ──
+    trusted = user_profile.get_trusted_paths()
+    if not trusted:
+        print("暂无信任路径。请先使用 /ask 让大模型添加笔记时关联文件。")
+        return
+
+    C.print(Panel("[bold cyan]视频工作流[/] — 技术文档 → 视频演示", border_style="cyan"))
+    print("\n信任路径：")
+    for idx, path in enumerate(trusted, 1):
+        print(f"  {idx}. {path}")
+
+    try:
+        path_choice = _styled_input("\n选择路径 [编号]: ").strip()
+        path_idx = int(path_choice) - 1
+        selected_path = trusted[path_idx]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("无效选择。")
+        return
+
+    p = Path(selected_path)
+    md_files = []
+    if p.is_file() and p.suffix.lower() == '.md':
+        md_files.append(p)
+    elif p.is_dir():
+        md_files.extend(p.glob("**/*.md"))
+
+    if not md_files:
+        print("该路径下未找到 md 文件。")
+        return
+
+    print(f"\n{selected_path} 中的 md 文档：")
+    for idx, f in enumerate(md_files, 1):
+        print(f"  {idx}. {f.name}")
+
+    try:
+        file_choice = _styled_input("\n选择文档 [编号]: ").strip()
+        file_idx = int(file_choice) - 1
+        selected_file = md_files[file_idx]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("无效选择。")
+        return
+
+    try:
+        article_content = selected_file.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"读取文件失败: {exc}")
+        return
+
+    # 创建工作目录
+    work_dir = agent.work_dir / "my-video"
+    work_dir.mkdir(exist_ok=True)
+    (work_dir / "article.md").write_text(article_content, encoding="utf-8")
+    print(f"\n工作目录: {work_dir}")
+    print(f"文档: {selected_file.name} ({len(article_content)} 字)")
+
+    # 创建 LLM 调用上下文
+    ctx = PracticeContext(agent.model_client, agent.work_dir)
+
+    # ── Phase 1: 内容写作 ──
+    print(f"\n{'='*50}")
+    print("Phase 1: 内容写作")
+    print(f"{'='*50}")
+
+    # 加载 reference 文档
+    script_style = (VIDEO_SKILL_DIR / "references" / "SCRIPT-STYLE.md").read_text(encoding="utf-8")
+    outline_format = (VIDEO_SKILL_DIR / "references" / "OUTLINE-FORMAT.md").read_text(encoding="utf-8")
+    chapter_craft = (VIDEO_SKILL_DIR / "references" / "CHAPTER-CRAFT.md").read_text(encoding="utf-8")
+
+    # LLM 节点1: 生成 script.md
+    script_prompt = f"""你是专业的视频口播稿作者。请根据以下风格指南，将用户的文章转换为口播稿。
+
+## 风格指南
+{script_style}
+
+## 用户文章
+{article_content[:8000]}
+
+请直接输出口播稿内容（markdown 格式），不要添加任何前缀说明。"""
+    print("\n[LLM 节点1] 正在生成口播稿...")
+    script_content = ctx.complete(script_prompt, max_tokens=6000, spinner_message="生成 script.md...")
+    (work_dir / "script.md").write_text(script_content, encoding="utf-8")
+    print(f"✓ script.md 已生成 ({len(script_content)} 字)")
+
+    # LLM 节点2: script 自检
+    check_prompt = f"""请检查以下口播稿是否符合要求：
+1. 信息保留度 ≥ 60%（与原文对比）
+2. 口语化，无 AI 味
+3. 短句为主（每句 ≤ 20 字）
+4. 第二人称
+5. 开头有钩子
+
+口播稿：
+{script_content[:4000]}
+
+原文：
+{article_content[:4000]}
+
+如果存在问题，请指出并给出修改建议。如果合格，回复"合格"。"""
+    print("[LLM 节点2] 正在自检口播稿...")
+    check_result = ctx.complete(check_prompt, max_tokens=2000, spinner_message="自检 script.md...")
+    if "合格" not in check_result:
+        print(f"⚠ 口播稿需要修改：\n{check_result[:200]}")
+        # 重新生成
+        revise_prompt = f"""请根据以下修改建议，重新生成口播稿。
+
+## 修改建议
+{check_result}
+
+## 风格指南
+{script_style}
+
+## 用户文章
+{article_content[:8000]}
+
+请直接输出修改后的口播稿内容（markdown 格式）。"""
+        print("[LLM 节点1] 正在重新生成口播稿...")
+        script_content = ctx.complete(revise_prompt, max_tokens=6000, spinner_message="重新生成 script.md...")
+        (work_dir / "script.md").write_text(script_content, encoding="utf-8")
+        print(f"✓ script.md 已重新生成 ({len(script_content)} 字)")
+
+    # LLM 节点3: 生成 outline.md
+    outline_prompt = f"""你是专业的视频策划师。请根据以下格式规范，为口播稿生成章节大纲。
+
+## 格式规范
+{outline_format}
+
+## 口播稿
+{script_content[:6000]}
+
+## 原文（用于信息池）
+{article_content[:6000]}
+
+请直接输出 outline.md 内容（markdown 格式），不要添加任何前缀说明。"""
+    print("\n[LLM 节点3] 正在生成大纲...")
+    outline_content = ctx.complete(outline_prompt, max_tokens=6000, spinner_message="生成 outline.md...")
+    (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
+    print(f"✓ outline.md 已生成 ({len(outline_content)} 字)")
+
+    # LLM 节点4: outline 自检
+    outline_check_prompt = f"""请检查以下大纲是否符合要求：
+1. 包含 metadata block（主题、总时长、章节数）
+2. 每章有信息池
+3. 每章有开发计划（step 列表）
+4. 每章有口播节选
+
+大纲：
+{outline_content[:4000]}
+
+如果存在问题，请指出。如果合格，回复"合格"。"""
+    print("[LLM 节点4] 正在自检大纲...")
+    outline_check = ctx.complete(outline_check_prompt, max_tokens=2000, spinner_message="自检 outline.md...")
+    if "合格" not in outline_check:
+        print(f"⚠ 大纲需要修改：\n{outline_check[:200]}")
+        revise_outline = f"""请根据以下修改建议，重新生成大纲。
+
+## 修改建议
+{outline_check}
+
+## 格式规范
+{outline_format}
+
+## 口播稿
+{script_content[:6000]}
+
+## 原文（用于信息池）
+{article_content[:6000]}
+
+请直接输出修改后的 outline.md 内容（markdown 格式）。"""
+        print("[LLM 节点3] 正在重新生成大纲...")
+        outline_content = ctx.complete(revise_outline, max_tokens=6000, spinner_message="重新生成 outline.md...")
+        (work_dir / "outline.md").write_text(outline_content, encoding="utf-8")
+        print(f"✓ outline.md 已重新生成 ({len(outline_content)} 字)")
+
+    # ── Checkpoint Plan: 用户确认 ──
+    print(f"\n{'='*50}")
+    print("Checkpoint Plan")
+    print(f"{'='*50}")
+
+    # 展示 script 摘要
+    print("\n【口播稿摘要】")
+    print(script_content[:500] + "..." if len(script_content) > 500 else script_content)
+
+    # 展示 outline
+    print("\n【大纲】")
+    print(outline_content[:800] + "..." if len(outline_content) > 800 else outline_content)
+
+    # 主题选择
+    themes = [d.name for d in VIDEO_THEMES_DIR.iterdir() if d.is_dir()]
+    themes.sort()
+    print("\n【可选主题】")
+    for idx, theme in enumerate(themes, 1):
+        print(f"  {idx}. {theme}")
+
+    try:
+        theme_choice = _styled_input("\n选择主题 [编号] (默认 12-midnight-press): ").strip()
+        if theme_choice:
+            theme_idx = int(theme_choice) - 1
+            selected_theme = themes[theme_idx]
+        else:
+            selected_theme = "midnight-press"
+    except (ValueError, IndexError):
+        selected_theme = "midnight-press"
+
+    print(f"\n已选择主题: {selected_theme}")
+
+    confirm = _styled_input("\n确认继续？[Y/n]: ").strip().lower()
+    if confirm == "n":
+        print("已取消。")
+        return
+
+    # ── Phase 2: Web 开发 ──
+    print(f"\n{'='*50}")
+    print("Phase 2: Web 开发")
+    print(f"{'='*50}")
+
+    # 运行 scaffold.sh
+    scaffold_script = VIDEO_SKILL_DIR / "scripts" / "scaffold.sh"
+    presentation_dir = work_dir / "presentation"
+
+    print("\n[固定步骤] 正在创建 Vite 项目...")
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["bash", str(scaffold_script), str(presentation_dir), f"--theme={selected_theme}"],
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        if result.returncode != 0:
+            print(f"✗ scaffold 失败: {result.stderr}")
+            return
+        print(f"✓ Vite 项目已创建: {presentation_dir}")
+    except Exception as exc:
+        print(f"✗ scaffold 执行异常: {exc}")
+        return
+
+    # 解析 outline 获取章节列表
+    import re
+    chapters = []
+    for line in outline_content.split("\n"):
+        m = re.match(r'^##\s+(\d+)\.\s+(\S+)\s+—\s+(.+?)(?:（|$)', line)
+        if m:
+            chapters.append({
+                "num": int(m.group(1)),
+                "id": m.group(2),
+                "title": m.group(3).strip(),
+            })
+
+    if not chapters:
+        print("⚠ 无法从大纲中解析章节，跳过章节实现。")
+        return
+
+    print(f"\n共 {len(chapters)} 个章节：")
+    for ch in chapters:
+        print(f"  {ch['num']}. {ch['id']} — {ch['title']}")
+
+    # 读取主题 tokens
+    tokens_css = ""
+    tokens_path = VIDEO_THEMES_DIR / selected_theme / "tokens.css"
+    if tokens_path.exists():
+        tokens_css = tokens_path.read_text(encoding="utf-8")
+
+    # LLM 节点5: 实现章节1（作为 style anchor）
+    ch1 = chapters[0]
+    ch1_dir = presentation_dir / "src" / "chapters" / f"01-{ch1['id']}"
+    ch1_dir.mkdir(parents=True, exist_ok=True)
+
+    chapter_prompt = f"""你是专业的 React 前端开发者。请根据以下指引，实现视频演示的第 1 个章节。
+
+## 章节开发指引
+{chapter_craft[:4000]}
+
+## 主题 CSS Tokens
+{tokens_css[:2000]}
+
+## 大纲（第 1 章节）
+{outline_content[:2000]}
+
+## 口播稿
+{script_content[:4000]}
+
+## 原文（用于信息池）
+{article_content[:4000]}
+
+请生成以下文件：
+1. {ch1['id']}.tsx - React 组件（使用 step 属性驱动逐步揭示）
+2. {ch1['id']}.css - 样式文件（使用主题 token）
+3. narrations.ts - 旁白数组（每个 step 一句旁白）
+
+输出格式：
+```tsx
+// {ch1['id']}.tsx
+{{代码}}
+```
+
+```css
+// {ch1['id']}.css
+{{代码}}
+```
+
+```ts
+// narrations.ts
+{{代码}}
+```"""
+
+    print(f"\n[LLM 节点5] 正在实现章节 1: {ch1['id']}...")
+    ch1_code = ctx.complete(chapter_prompt, max_tokens=8000, spinner_message=f"实现章节 {ch1['id']}...")
+
+    # 解析并保存文件
+    _save_chapter_files(ch1_code, ch1_dir, ch1['id'])
+    print(f"✓ 章节 {ch1['id']} 已实现")
+
+    # 用户确认章节 1
+    confirm_ch1 = _styled_input("\n章节 1 已完成，确认继续？[Y/n]: ").strip().lower()
+    if confirm_ch1 == "n":
+        print("已取消。")
+        return
+
+    # LLM 节点6: 实现章节 2~N
+    for ch in chapters[1:]:
+        ch_num = ch['num']
+        ch_id = ch['id']
+        ch_dir = presentation_dir / "src" / "chapters" / f"{ch_num:02d}-{ch_id}"
+        ch_dir.mkdir(parents=True, exist_ok=True)
+
+        # 提取该章节对应的 outline 内容
+        ch_outline = _extract_chapter_outline(outline_content, ch_num)
+
+        chapter_prompt_n = f"""你是专业的 React 前端开发者。请根据以下指引，实现视频演示的第 {ch_num} 个章节。
+
+## 章节开发指引
+{chapter_craft[:4000]}
+
+## 主题 CSS Tokens
+{tokens_css[:2000]}
+
+## 大纲（第 {ch_num} 章节）
+{ch_outline}
+
+## 口播稿
+{script_content[:4000]}
+
+## 原文（用于信息池）
+{article_content[:4000]}
+
+请生成以下文件：
+1. {ch_id}.tsx - React 组件（使用 step 属性驱动逐步揭示）
+2. {ch_id}.css - 样式文件（使用主题 token）
+3. narrations.ts - 旁白数组（每个 step 一句旁白）
+
+输出格式：
+```tsx
+// {ch_id}.tsx
+{{代码}}
+```
+
+```css
+// {ch_id}.css
+{{代码}}
+```
+
+```ts
+// narrations.ts
+{{代码}}
+```"""
+
+        print(f"\n[LLM 节点6] 正在实现章节 {ch_num}: {ch_id}...")
+        ch_code = ctx.complete(chapter_prompt_n, max_tokens=8000, spinner_message=f"实现章节 {ch_id}...")
+        _save_chapter_files(ch_code, ch_dir, ch_id)
+        print(f"✓ 章节 {ch_id} 已实现")
+
+    # ── Checkpoint Audio ──
+    print(f"\n{'='*50}")
+    print("Checkpoint Audio")
+    print(f"{'='*50}")
+
+    audio_choice = _styled_input("\n是否合成音频？[y/N]: ").strip().lower()
+    if audio_choice == "y":
+        # ── Phase 3: 音频合成 ──
+        print(f"\n{'='*50}")
+        print("Phase 3: 音频合成")
+        print(f"{'='*50}")
+
+        # 提取旁白
+        print("\n[固定步骤] 正在提取旁白...")
+        try:
+            result = subprocess.run(
+                ["npx", "tsx", "scripts/extract-narrations.ts"],
+                cwd=str(presentation_dir),
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                print("✓ 旁白已提取")
+            else:
+                print(f"⚠ 提取旁白失败: {result.stderr}")
+        except Exception as exc:
+            print(f"⚠ 提取旁白异常: {exc}")
+
+        # 合成音频
+        tts_provider = _styled_input("\n选择 TTS 提供商 [minimax/openai] (默认 minimax): ").strip() or "minimax"
+        print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
+        try:
+            result = subprocess.run(
+                ["bash", "scripts/synthesize-audio.sh", f"--provider={tts_provider}"],
+                cwd=str(presentation_dir),
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+            if result.returncode == 0:
+                print("✓ 音频已合成")
+            else:
+                print(f"⚠ 合成音频失败: {result.stderr}")
+        except Exception as exc:
+            print(f"⚠ 合成音频异常: {exc}")
+
+    # ── Phase 4: 启动开发服务器 ──
+    print(f"\n{'='*50}")
+    print("Phase 4: 启动开发服务器")
+    print(f"{'='*50}")
+
+    print(f"\n项目目录: {presentation_dir}")
+    print("启动开发服务器...")
+    print("访问 http://localhost:5173/?auto=1 进入自动播放模式")
+    print("按 Ctrl+C 停止服务器\n")
+
+    try:
+        subprocess.run(["npm", "run", "dev"], cwd=str(presentation_dir))
+    except KeyboardInterrupt:
+        print("\n开发服务器已停止。")
+
+
+def _save_chapter_files(code_text, chapter_dir, chapter_id):
+    """从 LLM 输出中解析并保存章节文件。"""
+    import re
+
+    # 解析 tsx 文件
+    tsx_match = re.search(r'```tsx?\s*\n(.*?)```', code_text, re.DOTALL)
+    if tsx_match:
+        (chapter_dir / f"{chapter_id}.tsx").write_text(tsx_match.group(1).strip(), encoding="utf-8")
+
+    # 解析 css 文件
+    css_match = re.search(r'```css\s*\n(.*?)```', code_text, re.DOTALL)
+    if css_match:
+        (chapter_dir / f"{chapter_id}.css").write_text(css_match.group(1).strip(), encoding="utf-8")
+
+    # 解析 narrations.ts
+    ts_match = re.search(r'```ts\s*\n(.*?)```', code_text, re.DOTALL)
+    if ts_match:
+        (chapter_dir / "narrations.ts").write_text(ts_match.group(1).strip(), encoding="utf-8")
+
+
+def _extract_chapter_outline(outline_content, chapter_num):
+    """从 outline.md 中提取指定章节的内容。"""
+    lines = outline_content.split("\n")
+    in_chapter = False
+    chapter_lines = []
+
+    for line in lines:
+        if line.startswith(f"## {chapter_num}."):
+            in_chapter = True
+            chapter_lines.append(line)
+        elif in_chapter and line.startswith("## ") and not line.startswith(f"## {chapter_num}."):
+            break
+        elif in_chapter:
+            chapter_lines.append(line)
+
+    return "\n".join(chapter_lines) if chapter_lines else "（未找到该章节的 outline 内容）"
 
 
 def _run_practice_review(ctx, user_profile):
@@ -1769,6 +2257,12 @@ def main(argv=None):
                 print(f"\n  总计: 7 天内 {total} 个任务")
             except Exception as exc:
                 print(f"加载学习进度失败: {exc}")
+            continue
+        if user_input.startswith(("/video", "-video")):
+            try:
+                _run_video_workflow(agent, user_profile, current_username)
+            except Exception as exc:
+                print(f"视频工作流失败: {exc}")
             continue
         if user_input in ("/practice", "-practice"):
             # 练习模式
