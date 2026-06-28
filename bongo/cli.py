@@ -1073,26 +1073,24 @@ def _run_video_workflow(agent, user_profile, current_username):
 ## 原文（用于信息池）
 {article_content[:4000]}
 
-请生成以下文件：
-1. {ch_id}.tsx - React 组件（使用 step 属性驱动逐步揭示）
-2. {ch_id}.css - 样式文件（使用主题 token）
-3. narrations.ts - 旁白数组（每个 step 一句旁白）
+请生成以下 3 个文件，必须用 markdown 代码块包裹，不要输出其他内容：
 
-输出格式：
 ```tsx
 // {ch_id}.tsx
-{{代码}}
+{{React 组件代码，使用 step 属性驱动逐步揭示}}
 ```
 
 ```css
 // {ch_id}.css
-{{代码}}
+{{样式代码，使用主题 token}}
 ```
 
 ```ts
 // narrations.ts
-{{代码}}
-```"""
+{{旁白数组，每个 step 一句旁白，export default narrations}}
+```
+
+重要：严格按上述 3 个代码块输出，不要省略任何文件，不要在代码块外输出解释文字。"""
 
         print(f"\n[LLM 节点] 正在实现章节 {ch_num}: {ch_id}...")
         ch_code = ctx.complete(chapter_prompt_n, max_tokens=8000, spinner_message=f"实现章节 {ch_id}...")
@@ -1275,33 +1273,63 @@ def _run_video_workflow(agent, user_profile, current_username):
 
 
 def _save_chapter_files(code_text, chapter_dir, chapter_id):
-    """从 LLM 输出中解析并保存章节文件。"""
+    """从 LLM 输出中解析并保存章节文件。支持两种格式：
+    1. Markdown 代码块: ```tsx ... ```
+    2. 注释分隔符: // filename.tsx ... // narrations.ts
+    """
     import re
 
     saved = []
 
-    # 解析 tsx 文件（只匹配 ```tsx，不匹配 ```ts）
+    # ── 策略1: Markdown 代码块 ──
     tsx_match = re.search(r'```tsx\s*\n(.*?)```', code_text, re.DOTALL)
     if tsx_match:
         (chapter_dir / f"{chapter_id}.tsx").write_text(tsx_match.group(1).strip(), encoding="utf-8")
         saved.append(f"{chapter_id}.tsx")
 
-    # 解析 css 文件
     css_match = re.search(r'```css\s*\n(.*?)```', code_text, re.DOTALL)
     if css_match:
         (chapter_dir / f"{chapter_id}.css").write_text(css_match.group(1).strip(), encoding="utf-8")
         saved.append(f"{chapter_id}.css")
 
-    # 解析 narrations.ts（匹配 ```ts 或 ```typescript）
     ts_match = re.search(r'```(?:ts|typescript)\s*\n(.*?)```', code_text, re.DOTALL)
     if ts_match:
         (chapter_dir / "narrations.ts").write_text(ts_match.group(1).strip(), encoding="utf-8")
         saved.append("narrations.ts")
 
+    if saved:
+        if len(saved) < 3:
+            print(f"  ⚠ 只解析到: {', '.join(saved)}（期望 3 个文件）")
+        return
+
+    # ── 策略2: 注释分隔符（LLM 直接输出代码，无代码块包裹）──
+    # 匹配 // filename.tsx 或 /* filename.css */ 或 // narrations.ts
+    all_markers = list(re.finditer(
+        r'^(?://\s*(' + re.escape(chapter_id) + r'\.tsx|' + re.escape(chapter_id) + r'\.css|narrations\.ts)\s*$'
+        r'|/\*\s*(' + re.escape(chapter_id) + r'\.tsx|' + re.escape(chapter_id) + r'\.css|narrations\.ts)\s*\*/)',
+        code_text, re.MULTILINE
+    ))
+    # 对重复的 filename 取最后一个（LLM 可能重写了同名文件）
+    seen = {}
+    for m in all_markers:
+        fname = m.group(1) or m.group(2)
+        seen[fname] = m
+    markers = sorted(seen.values(), key=lambda m: m.start())
+
+    if markers:
+        for i, m in enumerate(markers):
+            fname = m.group(1) or m.group(2)
+            start = m.end()
+            end = markers[i + 1].start() if i + 1 < len(markers) else len(code_text)
+            content = code_text[start:end].strip()
+            # 去掉开头的空行
+            content = re.sub(r'^\s*\n', '', content, count=1)
+            (chapter_dir / fname).write_text(content, encoding="utf-8")
+            saved.append(fname)
+
     if not saved:
-        print(f"  ⚠ 未能从 LLM 输出中解析出任何文件，尝试保存原始输出...")
+        print(f"  ⚠ 未能从 LLM 输出中解析出任何文件，保存原始输出...")
         (chapter_dir / f"{chapter_id}_raw.txt").write_text(code_text, encoding="utf-8")
-        print(f"  已保存原始输出到 {chapter_dir / f'{chapter_id}_raw.txt'}")
     elif len(saved) < 3:
         print(f"  ⚠ 只解析到: {', '.join(saved)}（期望 3 个文件）")
 
