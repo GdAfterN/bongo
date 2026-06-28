@@ -1109,6 +1109,33 @@ def _run_video_workflow(agent, user_profile, current_username):
                 print("已取消。")
                 return
 
+    # ── 更新 chapters.ts 注册表 ──
+    print("\n[固定步骤] 更新章节注册表...")
+    imports = []
+    entries = []
+    for ch in chapters:
+        ch_id = ch['id']
+        ch_num = ch['num']
+        folder = f"{ch_num:02d}-{ch_id}"
+        var_name = ch_id.replace('-', '') + 'Narrations'
+        # 驼峰组件名
+        cmp_name = ''.join(w.capitalize() for w in ch_id.split('-')) + 'Chapter'
+        imports.append(f'import {cmp_name} from "../chapters/{folder}/{ch_id}";')
+        imports.append(f'import {{ narrations as {var_name} }} from "../chapters/{folder}/narrations";')
+        entries.append(f'  {{\n    id: "{ch_id}",\n    title: "{ch["title"]}",\n    narrations: {var_name},\n    Component: {cmp_name},\n  }},')
+
+    registry_content = f'''import type {{ ChapterDef }} from "./types";
+
+{chr(10).join(imports)}
+
+export const CHAPTERS: ChapterDef[] = [
+{chr(10).join(entries)}
+];
+'''
+    registry_path = presentation_dir / "src" / "registry" / "chapters.ts"
+    registry_path.write_text(registry_content, encoding="utf-8")
+    print(f"✓ 已注册 {len(chapters)} 个章节到 registry/chapters.ts")
+
     # ── Checkpoint Audio ──
     print(f"\n{'='*50}")
     print("Checkpoint Audio")
