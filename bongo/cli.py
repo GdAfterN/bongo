@@ -1124,8 +1124,9 @@ def _run_video_workflow(agent, user_profile, current_username):
         print("\n[固定步骤] 正在提取旁白...")
         try:
             result = subprocess.run(
-                ["npx", "tsx", "scripts/extract-narrations.ts"],
+                "npx tsx scripts/extract-narrations.ts",
                 cwd=str(presentation_dir),
+                shell=True,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1140,7 +1141,8 @@ def _run_video_workflow(agent, user_profile, current_username):
             print(f"⚠ 提取旁白异常: {exc}")
 
         # 合成音频
-        tts_provider = _styled_input("\n选择 TTS 提供商 [minimax/openai] (默认 minimax): ").strip() or "minimax"
+        tts_choice = _styled_input("\n选择 TTS 提供商 [1-minimax / 2-openai] (默认 1): ").strip()
+        tts_provider = "openai" if tts_choice == "2" else "minimax"
         print(f"\n[固定步骤] 正在合成音频 (provider: {tts_provider})...")
         try:
             result = subprocess.run(
@@ -1170,7 +1172,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     print("按 Ctrl+C 停止服务器\n")
 
     try:
-        subprocess.run(["npm", "run", "dev"], cwd=str(presentation_dir))
+        subprocess.run("npm run dev", cwd=str(presentation_dir), shell=True)
     except KeyboardInterrupt:
         print("\n开发服务器已停止。")
 
