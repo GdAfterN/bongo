@@ -700,6 +700,30 @@ def _run_video_workflow(agent, user_profile, current_username):
     import json
     import subprocess
 
+    # Windows 路径转为 Git Bash 兼容的 /d/ 前缀路径
+    def _to_git_bash_path(p):
+        """将 Windows 路径转为 Git Bash 的 /<drive>/ 前缀格式。"""
+        s = str(p).replace("\\", "/")
+        if len(s) >= 2 and s[1] == ':':
+            return "/" + s[0].lower() + s[2:]
+        return s
+
+    def _find_git_bash():
+        """查找 Git Bash 可执行文件路径。"""
+        import shutil as _shutil
+        for candidate in [
+            "D:/Git/usr/bin/bash.exe",
+            "C:/Program Files/Git/usr/bin/bash.exe",
+        ]:
+            if os.path.isfile(candidate):
+                return candidate
+        found = _shutil.which("bash")
+        if found:
+            return found
+        raise FileNotFoundError("找不到 bash，请安装 Git for Windows")
+
+    git_bash = _find_git_bash()
+
     def _load_state():
         if state_file.exists():
             try:
@@ -923,31 +947,6 @@ def _run_video_workflow(agent, user_profile, current_username):
     # 运行 scaffold.sh
     scaffold_script = VIDEO_SKILL_DIR / "scripts" / "scaffold.sh"
     presentation_dir = work_dir / "presentation"
-
-    # Windows 路径转为 Git Bash 兼容的 /d/ 前缀路径
-    def _to_git_bash_path(p):
-        """将 Windows 路径转为 Git Bash 的 /<drive>/ 前缀格式。"""
-        s = str(p).replace("\\", "/")
-        if len(s) >= 2 and s[1] == ':':
-            return "/" + s[0].lower() + s[2:]
-        return s
-
-    def _find_git_bash():
-        """查找 Git Bash 可执行文件路径。"""
-        import shutil as _shutil
-        # 优先查找 Git 安装目录下的 bash
-        for candidate in [
-            "D:/Git/usr/bin/bash.exe",
-            "C:/Program Files/Git/usr/bin/bash.exe",
-        ]:
-            if os.path.isfile(candidate):
-                return candidate
-        # 回退到 PATH 中的 bash
-        found = _shutil.which("bash")
-        if found:
-            return found
-        raise FileNotFoundError("找不到 bash，请安装 Git for Windows")
-
     scaffold_script_bash = _to_git_bash_path(scaffold_script)
 
     # resume 时 scaffold 已完成则跳过
@@ -973,7 +972,6 @@ def _run_video_workflow(agent, user_profile, current_username):
         lint_choice = _styled_input("\n  选择代码检查工具 [1-Oxlint / 2-ESLint] (默认 1): ").strip()
         lint_flag = "--eslint" if lint_choice == "2" else "--no-eslint"
 
-        git_bash = _find_git_bash()
         try:
             # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
             # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
