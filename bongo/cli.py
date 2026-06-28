@@ -886,6 +886,7 @@ def _run_video_workflow(agent, user_profile, current_username):
     scaffold_script_bash = _to_git_bash_path(scaffold_script)
 
     # 如果 presentation 目录已存在，询问是否覆盖
+    skip_scaffold = False
     if presentation_dir.exists() and any(presentation_dir.iterdir()):
         overwrite = _styled_input(f"\n  {presentation_dir} 已存在，是否删除并重新创建？[y/N]: ").strip().lower()
         if overwrite == "y":
@@ -893,43 +894,45 @@ def _run_video_workflow(agent, user_profile, current_username):
             shutil.rmtree(presentation_dir)
         else:
             print("  跳过 scaffold，使用已有项目。")
+            skip_scaffold = True
 
-    print(f"\n[固定步骤] 正在创建 Vite 项目...")
-    print(f"  脚本: {scaffold_script_bash}")
-    print(f"  工作目录: {work_dir}")
+    if not skip_scaffold:
+        print(f"\n[固定步骤] 正在创建 Vite 项目...")
+        print(f"  脚本: {scaffold_script_bash}")
+        print(f"  工作目录: {work_dir}")
 
-    # Linter 选择（原版 create-vite 的交互，翻译成中文）
-    lint_choice = _styled_input("\n  选择代码检查工具 [1-Oxlint / 2-ESLint] (默认 1): ").strip()
-    lint_flag = "--eslint" if lint_choice == "2" else "--no-eslint"
+        # Linter 选择（原版 create-vite 的交互，翻译成中文）
+        lint_choice = _styled_input("\n  选择代码检查工具 [1-Oxlint / 2-ESLint] (默认 1): ").strip()
+        lint_flag = "--eslint" if lint_choice == "2" else "--no-eslint"
 
-    import subprocess
-    git_bash = _find_git_bash()
-    try:
-        # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
-        # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
-        # 实时输出让用户看到进度
-        proc = subprocess.Popen(
-            [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}", lint_flag],
-            cwd=str(work_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        for line in proc.stdout:
-            try:
-                print(f"  {line}", end="")
-            except UnicodeEncodeError:
-                print(line.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding, errors="replace"), end="")
-        proc.wait(timeout=300)
-        if proc.returncode != 0:
-            print(f"✗ scaffold 失败 (exit {proc.returncode})")
+        import subprocess
+        git_bash = _find_git_bash()
+        try:
+            # cwd 用 Windows 原始路径；脚本路径用 /d/ 格式给 Git Bash
+            # 使用 login shell 确保 PATH 完整（dirname 等工具可用）
+            # 实时输出让用户看到进度
+            proc = subprocess.Popen(
+                [git_bash, "-l", scaffold_script_bash, "presentation", f"--theme={selected_theme}", lint_flag],
+                cwd=str(work_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            for line in proc.stdout:
+                try:
+                    print(f"  {line}", end="")
+                except UnicodeEncodeError:
+                    print(line.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding, errors="replace"), end="")
+            proc.wait(timeout=300)
+            if proc.returncode != 0:
+                print(f"✗ scaffold 失败 (exit {proc.returncode})")
+                return
+            print(f"✓ Vite 项目已创建: {presentation_dir}")
+        except Exception as exc:
+            print(f"✗ scaffold 执行异常: {exc}")
             return
-        print(f"✓ Vite 项目已创建: {presentation_dir}")
-    except Exception as exc:
-        print(f"✗ scaffold 执行异常: {exc}")
-        return
 
     # 解析 outline 获取章节列表
     import re

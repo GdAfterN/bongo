@@ -104,11 +104,15 @@ echo "▸ 使用主题：$THEME"
 npm create vite@latest "$TARGET" -- --template react-ts "$LINT_FLAG" --no-immediate
 
 cd "$TARGET"
-echo "▸ 安装依赖（可能要等一会）..."
-npm install
+if [[ -d "node_modules" ]]; then
+  echo "▸ node_modules 已存在，跳过依赖安装"
+else
+  echo "▸ 安装依赖（可能要等一会）..."
+  npm install
 
-echo "▸ 安装 tsx（用于 extract-narrations 脚本）..."
-npm install --save-dev tsx
+  echo "▸ 安装 tsx（用于 extract-narrations 脚本）..."
+  npm install --save-dev tsx
+fi
 
 echo "▸ 用演示骨架替换默认 boilerplate"
 
