@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bongo"
 version = "0.1.0"
-description = "Small local coding agent for Ollama and OpenAI-compatible models"
+description = "Local AI learning agent for notes, practice, review, and trusted-document assistance"
 requires-python = ">=3.10"
 dependencies = ["mcp", "rich>=13.0", "prompt_toolkit>=3.0"]
 

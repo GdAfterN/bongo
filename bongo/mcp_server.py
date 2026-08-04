@@ -18,7 +18,6 @@ mcp = FastMCP("bongo-learning-partner")
 current_username = load_current_user()
 profile = UserProfile(current_username)
 
-
 @mcp.tool()
 def record_task(
     task: str,

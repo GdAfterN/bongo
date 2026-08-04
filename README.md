@@ -1,318 +1,243 @@
-# bongo
+# bongo - 本地智能助学 Agent
 
-bongo 是一个 AI 辅助学习助手，帮助你阅读文档、记录笔记、整理错题并进行针对性练习。它有两套并行的核心链路：
+bongo 是一个以本地资料和个人学习数据为中心的智能助学 Agent。它可以阅读你授权的文档、整理学习笔记、维护错题本、生成针对性练习，并根据长期使用记录形成个人学习画像。
 
-- **`/ask`** — 基于 ReAct 的智能问答，大模型自主调用工具读写文件
-- **`/practice`** — 基于 Plan-and-Execute 的练习系统，出题、判分、记录错题全自动
+核心目标是让学习资料、练习反馈和长期记忆形成闭环。
 
-数据全部存在本地 `~/.bongo/` 目录，不依赖外部服务（除模型 API）。
+使用 Ollama 时，模型推理和学习数据都可以保留在本机；使用 OpenAI 或 Anthropic 兼容接口时，只有模型请求会发送到所配置的服务端。笔记、错题、画像、会话和运行记录始终保存在本地文件中。
+
+## 核心能力
+
+### `/ask`：基于资料的智能问答
+
+`/ask` 使用 ReAct 控制循环。模型可以根据问题自主选择工具，但只能在用户选定的范围内操作。
+
+| 模式 | 用途 | 工作范围 |
+|---|---|---|
+| 信任路径 | 阅读课程资料、分析文档、整理知识 | 用户选择的本地文件或目录 |
+| 笔记 | 查询、补充和整理学习笔记 | `~/.bongo/notes/` |
+| 错题 | 分析错误原因、归纳薄弱知识点 | `~/.bongo/mistakes/` |
+
+```text
+/ask 帮我总结最近的错题，并给出复习顺序
+/ask 对比装饰器和闭包的适用场景
+/ask 从这份课程讲义中整理一份知识提纲
+```
+
+文档模式采用渐进式加载：Agent 先获得轻量索引，只在需要时读取完整内容，最多在工作记忆中保留 5 份已加载文档。
+
+### `/practice`：针对性练习
+
+`/practice` 使用独立的 Plan-and-Execute 流程，不共享 `/ask` 的对话历史和工具上下文。
+
+| 模式 | 说明 |
+|---|---|
+| 快问快答 | 根据最近笔记生成问题 |
+| 深度求索 | 根据选定的 Markdown 学习资料生成问题 |
+| 朝花夕拾 | 复习错题；答对移除，答错累计错误次数 |
+
+每题由模型评分。低于 60 分的回答会写入错题本，同时保存题目、用户回答、参考答案、反馈、来源和标签。
+
+### 本地学习档案
+
+bongo 支持多个本地用户，每个用户拥有独立的：
+
+- 学习笔记与笔记索引
+- 错题本与错题索引
+- 信任路径
+- 常聊话题和薄弱领域
+- 学习偏好、连续学习天数和每日统计
+- 会话摘要与历史记录
+
+`/skills export` 可以将个人画像、笔记、错题和会话导出为一个可复用的本地 skill 目录。
 
 ## 快速开始
 
-需要 Python 3.10+。
+需要 Python 3.10 或更高版本。
 
 ```bash
-# 安装
 pip install -e .
 
 # 启动交互模式
 bongo
 
-# 直接跑一次性任务
-bongo "帮我分析这个项目的测试覆盖情况"
+# 执行一次问答后退出
+bongo "解释一下 TCP 三次握手，并给我一道检查理解的问题"
 
-# 指定工作目录
-bongo --cwd /path/to/project
+# 指定学习资料所在目录
+bongo --cwd /path/to/learning-materials
 ```
 
-## 支持的模型后端
+## 模型配置
 
-| Provider | 启动方式 |
+支持以下模型后端：
+
+| Provider | 使用方式 |
 |---|---|
-| Ollama | `ollama serve` 后 `bongo --provider ollama` |
-| OpenAI 兼容 | `bongo --provider openai --base-url ... --model ...` |
-| Anthropic 兼容 | `bongo --provider anthropic --base-url ... --model ...` |
+| Ollama | 启动 `ollama serve`，然后使用 `--provider ollama` |
+| OpenAI 兼容接口 | 使用 `--provider openai --base-url ... --model ...` |
+| Anthropic 兼容接口 | 使用 `--provider anthropic --base-url ... --model ...` |
 
-模型优先级：CLI `--model` > 环境变量 > 持久化配置 > 代码默认值。
+配置优先级为：命令行参数、环境变量、持久化配置、代码默认值。
 
 ```bash
-# 保存配置，以后不用重复传参
-bongo config --provider openai --api-key sk-xxx --base-url https://api.example.com/v1 --model gpt-4
+bongo config --provider openai \
+  --api-key sk-xxx \
+  --base-url https://api.example.com/v1 \
+  --model your-model
+
 bongo config --show
 ```
 
-## 核心功能
-
-### /ask — 智能问答（ReAct 链路）
-
-`/ask` 让大模型在受限环境中自主调用工具完成任务。支持三种文档类型：
-
-| 模式 | 说明 | agent 工作范围 |
-|---|---|---|
-| 信任路径 | 对指定目录下的文件进行读写操作 | 选定的目录 |
-| 笔记 | 查看、修改、补充学习笔记 | `~/.bongo/notes/` |
-| 错题 | 分析、整理错题本 | `~/.bongo/mistakes/` |
-
-```bash
-# 进入 /ask 后选择文档类型
-/ask 帮我总结最近的错题
-/ask 在 CC/README.md 末尾添加总结
-/ask 装饰器和闭包有什么区别
-```
-
-交互流程：
-```
-/ask <问题>
-
-请选择文档类型：
-  1. 信任路径（文件操作）
-  2. 笔记（学习笔记）
-  3. 错题（错题本）
-
-选择编号: 2
-
-笔记列表（共 15 条）：
-  1. [2026-05-29] 装饰器和闭包
-  2. [2026-05-28] Python GIL 机制
-  ...
-
-工作路径: ~/.bongo/notes
-/ask> 帮我补充装饰器的实际应用场景
-```
-
-### /practice — 练习模式（Plan-and-Execute 链路）
-
-练习模式走独立的上下文设计，不依赖 ReAct 的 memory/history，专注于出题、判分、记录错题。
-
-| 模式 | 说明 |
-|---|---|
-| 快问快答 | 从最近笔记中抽取 10 个问题 |
-| 深度求索 | 选择信任路径下的 md 文档，出 10 道题 |
-| 朝花夕拾 | 错题复习，答对移除，答错累加错误次数 |
-
-```bash
-/practice
-
-=== 练习模式 ===
-1. 快问快答（从最近笔记中抽取 10 个问题）
-2. 深度求索（选择 md 文档，10 道题）
-3. 朝花夕拾（错题复习）
-0. 退出练习
-```
-
-得分低于 60 分的题目自动记入错题本，并关联来源和标签。
-
-### 笔记与错题管理
-
-```bash
-# 笔记
-/note -7              # 查看最近 7 天的笔记（默认）
-/note -1              # 查看最近 1 天
-/note del <关键词>    # 按关键词删除笔记
-
-# 错题
-/mistake -7           # 查看最近 7 天的错题（默认）
-/mistake -1           # 查看最近 1 天
-
-# 学习档案
-/profile              # 显示技能水平、连续学习天数、任务统计
-/errors               # 显示按类型分组的错误历史
-/progress             # 显示过去 7 天的学习进度
-```
-
-### 用户管理
-
-支持多用户，每个用户有独立的笔记、错题和学习档案。
-
-```bash
-/user                 # 显示当前用户和所有用户列表
-/user <name>          # 切换到另一个用户
-/user new <name>      # 创建新用户并切换
-```
-
-## 工具
-
-bongo 提供 15 个工具，模型只能调用白名单中的工具：
-
-| 工具 | 参数 | 危险 | 说明 |
-|---|---|---|---|
-| `list_files` | `path='.'` | 否 | 列出目录文件 |
-| `read_file` | `path, start=1, end=200` | 否 | 按行号范围读文件 |
-| `search` | `pattern, path='.'` | 否 | 搜索关键词（优先用 rg） |
-| `run_shell` | `command, timeout=20` | 是 | 执行 shell 命令 |
-| `write_file` | `path, content` | 是 | 写文件 |
-| `patch_file` | `path, old_text, new_text` | 是 | 精确文本替换（old_text 必须恰好出现一次） |
-| `delete_file` | `path` | 是 | 删除文件 |
-| `delegate` | `task, max_steps=3` | 否 | 启动只读子 agent 做调查 |
-| `search_mistakes` | `query, limit=3` | 否 | 搜索错题索引 |
-| `get_mistake_detail` | `title` | 否 | 获取错题详情 |
-| `read_notes` | `limit=10` | 否 | 读取最近学习笔记 |
-| `write_note` | `title, content, file_path=''` | 否 | 保存学习笔记到 ~/.bongo/notes/ |
-| `read_entry` | `path, entry` | 否 | 按编号读取笔记/错题条目（O(1) 索引定位） |
-| `delete_entry` | `path, entry` | 是 | 按编号删除笔记/错题条目，自动重建索引 |
-| `read_cache` | `path` | 否 | 读取 ~/.bongo/cache/ 中的缓存输出文件 |
-
-所有文件类工具的路径被锚定在 workspace root 下，`../` 逃逸会被直接拦截。
-
-## 常用参数
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--cwd` | `.` | 工作目录 |
-| `--approval` | `ask` | 审批策略：`ask` / `auto` / `never` |
-| `--max-steps` | `20` | 每轮请求最大工具调用次数 |
-| `--max-new-tokens` | `2048` | 每步模型最大输出 token |
-| `--temperature` | `0.2` | 采样温度 |
-| `--resume` | 无 | 恢复会话：指定 ID 或 `latest` |
-| `--read-only` | false | 只读模式，禁止所有写操作 |
-
-## REPL 命令一览
+## REPL 命令
 
 | 命令 | 作用 |
 |---|---|
-| `/ask <问题>` | 选择文档类型后进入智能问答 |
-| `/practice` | 进入练习模式 |
-| `/note [-天数]` | 查询笔记 |
-| `/note del <关键词>` | 删除笔记 |
-| `/mistake [-天数]` | 查询错题 |
-| `/profile` | 显示学习档案 |
-| `/errors` | 显示错误历史 |
-| `/progress` | 显示学习进度 |
-| `/user` | 用户管理 |
-| `/memory` | 查看 agent 工作记忆 |
-| `/session` | 查看会话文件路径 |
+| `/ask <问题>` | 进入资料、笔记或错题问答 |
+| `/practice` | 进入针对性练习 |
+| `/note [-天数]` | 查看最近的学习笔记 |
+| `/note del <关键词>` | 删除匹配的笔记 |
+| `/mistake [-天数]` | 查看最近的错题 |
+| `/profile` | 查看学习档案摘要 |
+| `/skills` | 查看画像三要素 |
+| `/skills export` | 导出个人学习 skill |
+| `/errors` | 按类型查看错误历史 |
+| `/progress` | 查看最近 7 天的学习进度 |
+| `/user` | 查看、创建或切换用户 |
+| `/memory` | 查看当前 Agent 工作记忆 |
+| `/session` | 查看当前会话文件 |
+| `/resume [id]` | 列出或恢复历史会话 |
 | `/reset` | 清空当前会话 |
-| `/level` | 查看/切换审批策略 |
+| `/level [ask\|auto\|never]` | 查看或修改工具审批策略 |
 | `/help` | 查看帮助 |
 | `/exit` | 退出 |
 
-## 设计思想
+## 常用启动参数
 
-### 1. 双链路架构
-
-`/ask` 和 `/practice` 有完全独立的上下文设计：
-
-| | /ask | /practice |
+| 参数 | 默认值 | 说明 |
 |---|---|---|
-| 范式 | ReAct（观察→思考→行动→循环） | Plan-and-Execute（出题→判分→总结） |
-| 上下文 | prefix + memory + history + request | 阶段独立，无 history，无 memory |
-| 工具调用 | 有，模型决定调什么 | 无，流程固定 |
-| 状态 | 跨轮保持 | 无状态 |
+| `--cwd` | `.` | 本地资料或工作目录 |
+| `--provider` | `openai` | 模型后端 |
+| `--model` | 配置或代码默认值 | 模型名称 |
+| `--approval` | `ask` | 风险工具审批策略 |
+| `--max-steps` | `20` | 单次请求最大 Agent 轮数 |
+| `--max-new-tokens` | `2048` | 每轮模型最大输出 token |
+| `--temperature` | `0.2` | 采样温度 |
+| `--resume` | 无 | 恢复指定会话或 `latest` |
 
-### 2. /ask Memory：渐进式披露
+## Agent 工作方式
 
-`/ask` 的 memory 采用静态 + 动态分离设计：
+### 双链路
 
-- **静态部分**（prefix）：身份、行为规则、工具定义，只在启动时渲染一次
-- **动态部分**（ask_mode）：根据文档类型动态切换
+| | `/ask` | `/practice` |
+|---|---|---|
+| 范式 | ReAct | Plan-and-Execute |
+| 输入 | 当前问题、工作记忆、历史和本地资料 | 笔记、文档或错题 |
+| 工具 | 模型自主选择 | 不使用工具 |
+| 状态 | 跨轮保存 | 单次练习流程 |
+| 输出 | 基于资料的回答或笔记操作 | 题目、评分、错题和总结 |
 
-ask_mode 结构：
-```
-mode:        "notes" / "mistakes" / "trust_path"
-original_request: 用户首次提问
-index:       [{id, label, summary}, ...]  # 轻量索引，始终存在
-loaded:      {doc_id: {path, content, loaded_at}}  # 完整内容，最多 5 个
-```
+### 上下文与记忆
 
-工作流程：用户选择模式 → 填充索引 → agent 看到索引 → 调用 read_file → 自动加载到 loaded + fork 子线程生成摘要 → agent 看到完整内容 → 读写操作。超出 loaded 上限时淘汰最旧文档。
+每轮 `/ask` 的上下文按以下顺序组装：
 
-### 3. Prompt 结构与预算裁剪
-
-Prompt 按固定顺序组装为 5 段，总预算 24000 字符：
-
-```
-prefix（身份 + 行为规则）→ workspace（工作目录）→ memory（任务摘要 + 文件索引）→ history（对话记录）→ current_request（当前请求）
-```
-
-当 prompt 超过预算时按优先级压缩，当前用户请求始终完整保留。
-
-### 4. 安全护栏
-
-工具调用是一条带护栏的流水线：
-
-```
-工具是否存在 → 参数是否合法 → 是否重复调用 → 是否通过审批 → 真正执行
+```text
+prefix -> workspace -> memory -> history -> current_request
 ```
 
-关键安全机制：
-- **路径隔离**：所有文件操作锚定在 workspace root，`../` 解析后仍需在 root 下
-- **审批策略**：`ask`（每次询问）、`auto`（自动放行）、`never`（全部拒绝）
-- **只读模式**：`--read-only` 禁止所有写操作
-- **重复调用拦截**：连续两次相同参数的工具调用直接拦
-- **Shell 环境过滤**：只传递白名单环境变量
-- **敏感信息脱敏**：trace 和 report 中自动替换 API_KEY、TOKEN 等值
+总字符预算为 32,000。超出预算时依次压缩历史、工作区信息、记忆和稳定前缀，当前用户请求始终完整保留。历史超过阈值后会生成检查点摘要，并保留最近的完整交互。
 
-### 5. 用户画像系统
+### 工具与安全边界
 
-每个用户有独立的档案，记录学习轨迹：
+Agent 当前提供 18 个基础工具，并可在深度允许时增加一个只读 `delegate` 工具。能力包括：
 
-- **技能追踪**：自动统计使用频率，每 5 次升级一级（最高 L5）
-- **错题本**：按类型分组，支持标签检索，答对自动移除
-- **学习笔记**：Markdown 格式，支持关联文件路径
-- **信任路径**：笔记关联的文件自动加入信任路径，供 /ask 和 /practice 使用
-- **每日统计**：任务数、技能使用、错误计数、连续学习天数
+- 列出文件、读取元数据、分段读取和搜索
+- 写入、追加、精确替换、按行插入或删除文件内容
+- 执行经过审批的本地 Shell 命令
+- 查询和维护笔记、错题及其索引
+- 读取被截断后保存到本地缓存的大结果
+- 启动受限、只读的调查子 Agent
 
-### 6. MCP Server
+安全检查顺序如下：
 
-bongo 可以作为 MCP server 被 Claude Code 调用，暴露以下工具：
+```text
+工具存在 -> 参数合法 -> 非重复调用 -> 通过审批 -> 执行
+```
 
-| 工具 | 说明 |
+所有文件路径都锚定在当前工作根目录；解析后的路径不能逃逸。Shell 进程只继承白名单环境变量，trace 和 report 会对 API Key、Token、Secret、Password 等敏感值进行脱敏。
+
+## MCP Server
+
+`bongo-mcp` 通过 stdio 向兼容 MCP 的客户端提供学习工具：
+
+| 工具 | 作用 |
 |---|---|
-| `record_task` | 记录完成的任务、技能、易错点 |
-| `add_note` | 记录学习笔记和信任的文件路径 |
-| `get_profile` | 获取用户画像摘要 |
-| `get_mistakes` | 查询历史易错点 |
-| `get_mistakes_book` | 获取错题本内容 |
-| `get_progress` | 获取学习进度统计 |
-| `user` | 查看/切换/创建用户 |
-
-### 7. 检查点与恢复
-
-会话状态以 JSON 保存在 `.bongo/sessions/`，Trace 日志保存在 `.bongo/traces/`，运行报告保存在 `.bongo/reports/<run_id>/`。三类持久化分离：session 用于跨轮次恢复，trace 用于中断恢复时的工具链路回溯，report 用于单次执行审计。
+| `record_task` | 记录任务、话题、错误和学习收获 |
+| `add_note` | 保存学习笔记和关联资料路径 |
+| `get_profile` | 获取学习画像摘要 |
+| `get_mistakes` | 按类型查询错误历史 |
+| `get_mistakes_book` | 查询错题本内容 |
+| `get_progress` | 获取学习进度 |
+| `user` | 查看、创建或切换用户 |
 
 ```bash
-bongo --resume latest    # 恢复上一次会话
-bongo --resume abc123    # 恢复指定会话
+bongo-mcp
 ```
 
-### 8. 确定性测试
+## 本地数据
 
-模型客户端可替换为 `FakeModelClient`（脚本播放器），在不调用 API 的情况下完整运行控制循环，实现零成本确定性测试。
+用户级数据保存在 `~/.bongo/`：
+
+```text
+~/.bongo/
+├── config.json
+├── current_user
+├── profiles/{username}.json
+├── notes/{username}.md
+├── notes/{username}_index.md
+├── mistakes/{username}.md
+├── mistakes/{username}_index.md
+└── skills/{username}/
+```
+
+工作区级运行数据保存在 `<cwd>/.bongo/`：
+
+```text
+<cwd>/.bongo/
+├── sessions/{session_id}.json
+├── traces/{session_id}.jsonl
+└── reports/{run_id}/
+    ├── task_status.json
+    ├── trace.jsonl
+    └── report.json
+```
+
+Session 用于继续对话，trace 用于还原执行过程，report 用于单次请求审计。恢复会话时会检测工作目录和文件列表变化，并使过期文件摘要失效。
 
 ## 项目结构
 
-```
+```text
 bongo/
-├── __init__.py          # 公共 API 导出
-├── cli.py               # CLI 入口、REPL 循环、/ask 和 /practice 实现
-├── runtime.py           # 核心控制循环（ReAct: ask / run_tool / parse）
-├── tools.py             # 工具定义、校验、实现
-├── context_manager.py   # 5 段 prompt 组装与预算裁剪
-├── memory.py            # 结构化记忆（工作集、文件摘要、ask_mode 渐进式披露）
-├── models.py            # 模型后端适配（Ollama / OpenAI / Anthropic / Fake）
-├── profile.py           # 用户画像（技能、错题、笔记、信任路径）
-├── mcp_server.py        # MCP server，供 Claude Code 调用
-├── config.py            # 持久化用户配置（~/.bongo/config.json）
-├── utils.py             # 工具函数
-├── run_store.py         # 运行工件持久化
-├── task_status.py       # 执行状态机
-├── metrics.py           # 评测实验
-└── evaluator.py         # benchmark 评测器
+├── cli.py               # CLI、REPL、/ask 与 /practice
+├── runtime.py           # ReAct 控制循环、审批、恢复和审计
+├── tools.py             # Agent 工具定义、校验与实现
+├── models.py            # Ollama、OpenAI、Anthropic 和 Fake 模型适配
+├── context_manager.py   # Prompt 组装、裁剪和历史压缩
+├── memory.py            # 工作记忆和文档渐进式加载
+├── profile.py           # 用户、笔记、错题、画像和 skill 导出
+├── mcp_server.py        # 学习能力 MCP Server
+├── config.py            # 本地模型配置
+├── run_store.py         # 单次运行工件
+├── trace.py             # 会话事件记录
+├── task_status.py       # 运行状态机
+├── evaluator.py         # Benchmark 评估
+└── metrics.py           # 指标聚合与实验
 ```
 
-## 数据存储
+## 测试与评测
 
-```
-~/.bongo/
-├── config.json              # 用户配置（provider、api_key、base_url、model）
-├── current_user             # 当前活跃用户名
-├── profiles/
-│   └── {username}.json      # 用户画像（技能、错误、学习记录）
-├── notes/
-│   └── {username}.md        # 学习笔记（Markdown）
-├── mistakes/
-│   ├── {username}.md        # 错题本详情（Markdown）
-│   └── {username}_index.md  # 错题索引（轻量，供快速检索）
-└── sessions/
-    └── {session_id}.json    # 会话状态
+项目使用 pytest 和 `FakeModelClient` 进行无需模型费用的确定性测试，同时提供上下文、记忆、恢复、报告和工具安全 benchmark。涉及真实模型的实验需要提前配置对应的模型服务。
+
+```bash
+pytest
 ```
