@@ -398,6 +398,44 @@ def test_existing_algorithm_source_with_old_question_count_is_reprocessed(tmp_pa
         database.close()
 
 
+def test_algorithm_question_prompt_includes_title_for_existing_questions(tmp_path):
+    database = StudyDatabase(tmp_path / "study.db")
+    try:
+        source_id, _ = database.add_source(
+            tmp_path / "symmetric-tree.java",
+            "完整的对称二叉树递归实现代码，用于测试旧题目的显示兼容逻辑。",
+            "code",
+        )
+        database.set_source_algorithm_metadata(
+            source_id,
+            "对称二叉树",
+            "判断一棵二叉树是否轴对称。",
+            "递归比较镜像位置的节点。",
+        )
+        question_id = database.add_questions(
+            source_id,
+            [
+                {
+                    "question": "该实现的主要递归过程是什么？",
+                    "options": ["镜像比较", "层序求和", "中序排序", "统计节点"],
+                    "correct_index": 0,
+                    "explanation": "递归比较左右子树中处于镜像位置的节点。",
+                    "evidence": "代码交叉比较左右孩子。",
+                    "topic": "主要实现思路",
+                }
+            ],
+        )[0]
+
+        assert database.get_question(question_id)["prompt"].startswith(
+            "在《对称二叉树》这道题中，"
+        )
+        assert database.list_questions(source_id)[0]["prompt"].startswith(
+            "在《对称二叉树》这道题中，"
+        )
+    finally:
+        database.close()
+
+
 def test_algorithm_prompt_requires_rationale_and_alternative_analysis():
     prompt = algorithm_study_system_prompt()
     assert "为什么不适合" in prompt

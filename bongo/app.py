@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -52,6 +51,7 @@ from .pet import PetSettings, PetWindow
 from .providers import available_chat_backends, chat_backend_available, available_providers
 from .service import LearningService
 from .styles import APP_STYLE
+from .widgets import WrappedRadioButton
 
 
 APP_ICON_PATH = Path(__file__).parent / "assets" / "app-icon.ico"
@@ -336,8 +336,13 @@ class MainWindow(QMainWindow):
         self.practice_group = QButtonGroup(self)
         self.practice_options = []
         for index in range(4):
-            option = QRadioButton()
-            option.setStyleSheet("QRadioButton{padding:8px;} QRadioButton::indicator{width:16px;height:16px;}")
+            option = WrappedRadioButton()
+            option.setStyleSheet(
+                "QRadioButton{background:#eef3f1;border:1px solid #8eb6a7;border-radius:5px;}"
+                "QRadioButton:hover{background:#d8e9e3;}"
+                "QRadioButton:checked{background:#d8e9e3;border:2px solid #268060;}"
+                "QRadioButton::indicator{width:16px;height:16px;margin-left:8px;}"
+            )
             self.practice_group.addButton(option, index)
             self.practice_options.append(option)
             card_layout.addWidget(option)
@@ -808,7 +813,7 @@ class MainWindow(QMainWindow):
         self.practice_source.setText(f"来源：{question['source_name']}  ·  {question.get('topic', '')}")
         self.practice_prompt.setText(question["prompt"])
         for index, text in enumerate(question["options"]):
-            self.practice_options[index].setText(f"{chr(65 + index)}. {text}")
+            self.practice_options[index].set_wrapped_text(f"{chr(65 + index)}. {text}")
         self.submit_answer_button.setEnabled(True)
         self.next_question_button.setEnabled(True)
         if no_alternative:

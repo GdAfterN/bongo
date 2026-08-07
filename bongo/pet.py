@@ -10,7 +10,9 @@ from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+
+from .widgets import WrappedPushButton
 
 
 class InputSignals(QObject):
@@ -217,7 +219,7 @@ class PetWindow(QWidget):
         bubble_layout.addWidget(self.question_label)
         self.option_buttons = []
         for index in range(4):
-            button = QPushButton()
+            button = WrappedPushButton()
             button.clicked.connect(lambda _checked=False, choice=index: self._answer(choice))
             bubble_layout.addWidget(button)
             self.option_buttons.append(button)
@@ -300,7 +302,7 @@ class PetWindow(QWidget):
         self._question_pending = True
         self.question_label.setText(question["prompt"])
         for index, option in enumerate(question["options"]):
-            self.option_buttons[index].setText(f"{chr(65 + index)}. {option}")
+            self.option_buttons[index].set_wrapped_text(f"{chr(65 + index)}. {option}")
             self.option_buttons[index].show()
             self.option_buttons[index].setEnabled(True)
         self.feedback_label.clear()

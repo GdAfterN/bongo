@@ -342,12 +342,19 @@ class StudyDatabase:
             return None
         value = dict(row)
         value["options"] = json.loads(value.pop("options_json"))
+        problem_title = value.get("problem_title", "").strip()
+        if (
+            value.get("knowledge_type") == "code"
+            and problem_title
+            and problem_title not in value["prompt"]
+        ):
+            value["prompt"] = f"在《{problem_title}》这道题中，{value['prompt']}"
         return value
 
     def get_question(self, question_id: int) -> dict | None:
         with self._lock:
             row = self.conn.execute(
-                "SELECT q.*, s.name AS source_name FROM questions q "
+                "SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q "
                 "JOIN sources s ON s.id = q.source_id WHERE q.id = ?",
                 (question_id,),
             ).fetchone()
@@ -374,7 +381,7 @@ class StudyDatabase:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             rows = self.conn.execute(
-                "SELECT q.*, s.name AS source_name FROM questions q "
+                "SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q "
                 f"JOIN sources s ON s.id = q.source_id {where} ORDER BY q.id",
                 parameters,
             ).fetchall()
@@ -406,7 +413,7 @@ class StudyDatabase:
         with self._lock:
             row = self.conn.execute(
                 f"""
-                SELECT q.*, s.name AS source_name FROM questions q
+                SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q
                 JOIN sources s ON s.id = q.source_id
                 {where}
                 ORDER BY CASE WHEN q.last_asked_at IS NULL THEN 0 ELSE 1 END,
