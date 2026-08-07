@@ -265,7 +265,7 @@ class PetWindow(QWidget):
         self.setFixedSize(max(260, canvas_width + 16), canvas_height + 218)
         self.canvas.set_mirrored(settings.model_mirror)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
-        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, settings.pass_through)
+        self._sync_input_transparency()
         if self._question_pending:
             self.question_timer.start(max(1, settings.question_timeout) * 1000)
         if update_visibility:
@@ -305,6 +305,7 @@ class PetWindow(QWidget):
             self.option_buttons[index].setEnabled(True)
         self.feedback_label.clear()
         self.bubble.show()
+        self._sync_input_transparency()
         self.question_timer.start(max(1, self.pet_settings.question_timeout) * 1000)
         self.canvas.react("thinking")
 
@@ -341,6 +342,7 @@ class PetWindow(QWidget):
         for button in self.option_buttons:
             button.setEnabled(False)
         self.answer_selected.emit(question_id, selected_index)
+        self._sync_input_transparency()
 
     def _expire_question(self) -> None:
         if not self.current_question or not self._question_pending:
@@ -350,7 +352,18 @@ class PetWindow(QWidget):
         self.current_question = None
         self.question_timer.stop()
         self.bubble.hide()
+        self._sync_input_transparency()
         self.question_unanswered.emit(question_id)
+
+    def _sync_input_transparency(self) -> None:
+        transparent = self.pet_settings.pass_through and not self._question_pending
+        current = bool(self.windowFlags() & Qt.WindowType.WindowTransparentForInput)
+        if current == transparent:
+            return
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, transparent)
+        if was_visible:
+            self.show()
 
     def _follow_mouse(self, x: float, y: float) -> None:
         if not self.pet_settings.mouse_enabled:

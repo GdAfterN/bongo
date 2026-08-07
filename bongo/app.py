@@ -378,7 +378,7 @@ class MainWindow(QMainWindow):
         pet_form = QVBoxLayout(pet_tab)
         self.pet_visible_check = QCheckBox("显示桌宠")
         self.pet_always_top_check = QCheckBox("窗口置顶")
-        self.pet_pass_through_check = QCheckBox("点击穿透")
+        self.pet_pass_through_check = QCheckBox("点击穿透（答题时自动暂停）")
         self.pet_keep_screen_check = QCheckBox("保持在屏幕内")
         self.pet_model_mirror_check = QCheckBox("模型镜像")
         self.pet_mouse_mirror_check = QCheckBox("鼠标镜像")

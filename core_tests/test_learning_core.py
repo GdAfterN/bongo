@@ -373,3 +373,57 @@ def test_codex_cli_sends_prompt_over_stdin_in_read_only_mode(monkeypatch, tmp_pa
     assert captured["command"][-1] == "-"
     assert "用户: question" in captured["input"]
     assert "用户: question" not in captured["command"]
+
+
+def test_pet_click_through_is_suspended_while_answering(monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    import bongo.pet as pet_module
+
+    class FakeCatView(QWidget):
+        def set_mirrored(self, _mirrored):
+            pass
+
+        def react(self, _action):
+            pass
+
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(pet_module, "BongoCatView", FakeCatView)
+    pet = pet_module.PetWindow()
+    pet.apply_settings(
+        pet_module.PetSettings(pass_through=True),
+        update_visibility=False,
+    )
+    transparent_flag = Qt.WindowType.WindowTransparentForInput
+    assert bool(pet.windowFlags() & transparent_flag) is True
+
+    answers = []
+    pet.answer_selected.connect(lambda question_id, choice: answers.append((question_id, choice)))
+    pet.show_question(
+        {
+            "id": 7,
+            "prompt": "测试题目",
+            "options": ["A", "B", "C", "D"],
+        }
+    )
+    assert bool(pet.windowFlags() & transparent_flag) is False
+
+    pet.option_buttons[2].click()
+    assert answers == [(7, 2)]
+    assert bool(pet.windowFlags() & transparent_flag) is True
+
+    unanswered = []
+    pet.question_unanswered.connect(unanswered.append)
+    pet.show_question(
+        {
+            "id": 8,
+            "prompt": "超时题目",
+            "options": ["A", "B", "C", "D"],
+        }
+    )
+    assert bool(pet.windowFlags() & transparent_flag) is False
+    pet._expire_question()
+    assert unanswered == [8]
+    assert bool(pet.windowFlags() & transparent_flag) is True
+    pet.close()
