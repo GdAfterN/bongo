@@ -156,6 +156,47 @@ def test_database_search_practice_and_conversations(tmp_path):
         database.close()
 
 
+def test_pet_question_scope_can_be_selected_by_source(tmp_path):
+    database = StudyDatabase(tmp_path / "study.db")
+    try:
+        first_id, _ = database.add_source(tmp_path / "first.md", "第一份气泡范围测试知识。")
+        second_id, _ = database.add_source(tmp_path / "second.md", "第二份气泡范围测试知识。")
+        first_question = database.add_questions(
+            first_id,
+            [{
+                "question": "第一份知识应该如何回答这个测试问题？",
+                "options": ["一", "二", "三", "四"],
+                "correct_index": 0,
+                "explanation": "选择第一项。",
+                "evidence": "第一份知识。",
+                "topic": "范围",
+            }],
+        )[0]
+        second_question = database.add_questions(
+            second_id,
+            [{
+                "question": "第二份知识应该如何回答这个测试问题？",
+                "options": ["一", "二", "三", "四"],
+                "correct_index": 0,
+                "explanation": "选择第一项。",
+                "evidence": "第二份知识。",
+                "topic": "范围",
+            }],
+        )[0]
+
+        database.set_source_bubble_enabled(first_id, False)
+        assert database.next_question(bubble_only=True)["id"] == second_question
+        assert database.next_question()["id"] == first_question
+
+        database.set_source_bubble_enabled(second_id, False)
+        assert database.next_question(bubble_only=True) is None
+
+        database.set_source_bubble_enabled(first_id, True)
+        assert database.next_question(bubble_only=True)["id"] == first_question
+    finally:
+        database.close()
+
+
 def test_service_chat_resume_and_skill_export(tmp_path):
     service = LearningService(tmp_path / "data")
     provider = FakeProvider()

@@ -279,13 +279,13 @@ class MainWindow(QMainWindow):
             "document",
             "导入文档资料，按概念、论点、步骤和因果关系生成练习题。",
             "导入文档知识",
-            ["文件名", "上传时间", "题目数量", "题库"],
+            ["文件名", "上传时间", "题目数量", "气泡出题", "题库"],
         )
         code_module, self.code_source_table, self.code_import_button = create_module(
             "code",
             "导入算法题题解或代码，提取中文题名和摘要，生成主思路、数据结构、边界三道题。",
             "导入代码知识",
-            ["题名", "文件名", "上传时间", "题目数量", "题库"],
+            ["题名", "文件名", "上传时间", "题目数量", "气泡出题", "题库"],
         )
         self.import_buttons = {
             "document": self.document_import_button,
@@ -557,16 +557,34 @@ class MainWindow(QMainWindow):
                     QTableWidgetItem(uploaded),
                     QTableWidgetItem(str(source["question_count"])),
                 ]
-                bank_column = 4
+                bubble_column = 4
+                bank_column = 5
             else:
                 values = [
                     primary,
                     QTableWidgetItem(uploaded),
                     QTableWidgetItem(str(source["question_count"])),
                 ]
-                bank_column = 3
+                bubble_column = 3
+                bank_column = 4
             for column, value in enumerate(values):
                 table.setItem(row, column, value)
+            bubble_checkbox = QCheckBox()
+            bubble_checkbox.setChecked(bool(source.get("bubble_enabled", 1)))
+            bubble_checkbox.setToolTip("允许该知识来源的题目出现在桌宠气泡中")
+            bubble_checkbox.toggled.connect(
+                lambda enabled, source_id=source["id"]: self.service.database.set_source_bubble_enabled(
+                    source_id,
+                    enabled,
+                )
+            )
+            bubble_cell = QWidget()
+            bubble_layout = QHBoxLayout(bubble_cell)
+            bubble_layout.setContentsMargins(8, 0, 8, 0)
+            bubble_layout.addStretch()
+            bubble_layout.addWidget(bubble_checkbox)
+            bubble_layout.addStretch()
+            table.setCellWidget(row, bubble_column, bubble_cell)
             bank_button = QPushButton("查看题库")
             bank_button.setProperty("secondary", True)
             bank_button.setEnabled(source["question_count"] > 0)
@@ -1083,7 +1101,7 @@ def main(argv=None) -> int:
             raise RuntimeError(f"无法创建单实例服务：{instance_server.errorString()}")
     crash_log = (service.data_dir / "crash.log").open("a", encoding="utf-8")
     faulthandler.enable(crash_log)
-    pet = PetWindow(service.database.next_question)
+    pet = PetWindow(lambda: service.database.next_question(bubble_only=True))
     window = MainWindow(
         service,
         pet,

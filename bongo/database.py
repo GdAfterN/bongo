@@ -50,6 +50,7 @@ class StudyDatabase:
                     problem_title TEXT NOT NULL DEFAULT '',
                     problem_statement TEXT NOT NULL DEFAULT '',
                     solution_approach TEXT NOT NULL DEFAULT '',
+                    bubble_enabled INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL DEFAULT 'processing',
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
@@ -145,6 +146,10 @@ class StudyDatabase:
                     self.conn.execute(
                         f"ALTER TABLE sources ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                     )
+            if "bubble_enabled" not in source_columns:
+                self.conn.execute(
+                    "ALTER TABLE sources ADD COLUMN bubble_enabled INTEGER NOT NULL DEFAULT 1"
+                )
             if added_knowledge_type:
                 code_kinds = (
                     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
@@ -232,6 +237,13 @@ class StudyDatabase:
             self.conn.execute(
                 "UPDATE sources SET status = ?, error = ? WHERE id = ?",
                 (status, error, source_id),
+            )
+
+    def set_source_bubble_enabled(self, source_id: int, enabled: bool) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE sources SET bubble_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, source_id),
             )
 
     def list_sources(self) -> list[dict]:
@@ -393,6 +405,7 @@ class StudyDatabase:
         source_id: int | None = None,
         wrong_only: bool = False,
         unanswered_only: bool = False,
+        bubble_only: bool = False,
     ) -> dict | None:
         conditions = []
         parameters: list[object] = []
@@ -402,6 +415,8 @@ class StudyDatabase:
         if source_id is not None:
             conditions.append("q.source_id = ?")
             parameters.append(source_id)
+        if bubble_only:
+            conditions.append("s.bubble_enabled = 1")
         if wrong_only:
             conditions.append("q.ask_count > q.correct_count")
         if unanswered_only:
