@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,47 @@ from urllib.parse import urlsplit, urlunsplit
 
 class ProviderError(RuntimeError):
     pass
+
+
+TRANSIENT_REQUEST_ATTEMPTS = 3
+TRANSIENT_RETRY_DELAYS = (1.0, 2.0)
+
+
+def _is_transient_request_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in {408, 409, 429} or (isinstance(status_code, int) and status_code >= 500):
+        return True
+
+    detail = f"{getattr(exc, 'body', '')} {exc}".lower()
+    return any(
+        marker in detail
+        for marker in (
+            "upstream_error",
+            "overloaded",
+            "overload",
+            "rate limit",
+            "rate_limit",
+            "temporarily unavailable",
+        )
+    )
+
+
+def _request_with_transient_retry(request, provider_name: str):
+    for attempt in range(TRANSIENT_REQUEST_ATTEMPTS):
+        try:
+            return request()
+        except Exception as exc:
+            if not _is_transient_request_error(exc):
+                raise ProviderError(f"{provider_name} request failed: {exc}") from exc
+            if attempt == TRANSIENT_REQUEST_ATTEMPTS - 1:
+                raise ProviderError(
+                    f"{provider_name} 模型服务暂时繁忙或请求过多，"
+                    f"已自动重试 {TRANSIENT_REQUEST_ATTEMPTS} 次，请稍后再试。"
+                ) from exc
+            time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
+    raise ProviderError(f"{provider_name} request failed without a response")
 
 
 @dataclass(frozen=True)
@@ -66,10 +108,10 @@ class OpenAIProvider(ConversationProvider):
                 }
             }
         for attempt in range(2):
-            try:
-                response = self.client.responses.create(**kwargs)
-            except Exception as exc:
-                raise ProviderError(f"OpenAI request failed: {exc}") from exc
+            response = _request_with_transient_retry(
+                lambda: self.client.responses.create(**kwargs),
+                "OpenAI",
+            )
             text = (response.output_text or "").strip()
             if not text:
                 if attempt == 0:
@@ -115,16 +157,21 @@ class AnthropicProvider(ConversationProvider):
                 "\nReturn only JSON matching this JSON Schema. Do not use markdown fences:\n"
                 + json.dumps(response_schema, ensure_ascii=False)
             )
-        try:
-            response = self.client.messages.create(
+        def request():
+            return self.client.messages.create(
                 model=self.model,
                 max_tokens=4096,
                 temperature=0.2,
                 system=prompt,
                 messages=messages,
             )
+
+        try:
+            response = _request_with_transient_retry(request, "Anthropic")
             text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
             return _extract_json(text) if response_schema else text
+        except ProviderError:
+            raise
         except Exception as exc:
             raise ProviderError(f"Anthropic request failed: {exc}") from exc
 

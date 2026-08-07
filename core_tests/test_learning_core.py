@@ -398,6 +398,58 @@ def test_openai_provider_retries_one_empty_structured_response():
     assert provider.client.responses.calls == 2
 
 
+def test_openai_provider_retries_transient_overload(monkeypatch):
+    class OverloadedError(Exception):
+        status_code = 400
+        body = {"type": "upstream_error", "message": "servers are currently overloaded"}
+
+    class Response:
+        output_text = "answer"
+
+    class Responses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise OverloadedError("servers are currently overloaded")
+            return Response()
+
+    delays = []
+    monkeypatch.setattr("bongo.providers.time.sleep", delays.append)
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = type("Client", (), {"responses": Responses()})()
+    provider.model = "test-model"
+
+    assert provider.complete([{"role": "user", "content": "test"}], "test") == "answer"
+    assert provider.client.responses.calls == 3
+    assert delays == [1.0, 2.0]
+
+
+def test_openai_provider_shows_friendly_error_after_overload_retries(monkeypatch):
+    class OverloadedError(Exception):
+        status_code = 400
+        body = {"type": "upstream_error"}
+
+    class Responses:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise OverloadedError("servers are currently overloaded")
+
+    monkeypatch.setattr("bongo.providers.time.sleep", lambda _seconds: None)
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.client = type("Client", (), {"responses": Responses()})()
+    provider.model = "test-model"
+
+    with pytest.raises(ProviderError, match="已自动重试 3 次，请稍后再试"):
+        provider.complete([{"role": "user", "content": "test"}], "test")
+    assert provider.client.responses.calls == 3
+
+
 def test_claude_code_sends_prompt_over_stdin(monkeypatch, tmp_path):
     captured = {}
 
