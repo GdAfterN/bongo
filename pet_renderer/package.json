@@ -1,0 +1,14 @@
+{
+  "name": "bongo-study-pet-renderer",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "easy-live2d": "0.4.4",
+    "pixi.js": "8.18.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

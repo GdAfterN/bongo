@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 class ProviderError(RuntimeError):
@@ -44,29 +45,29 @@ class OpenAIProvider(ConversationProvider):
             raise ProviderError("OPENAI_API_KEY is not configured")
         kwargs: dict[str, str] = {"api_key": api_key}
         if config.base_url:
-            kwargs["base_url"] = config.base_url
+            kwargs["base_url"] = normalize_openai_base_url(config.base_url)
         self.client = OpenAI(**kwargs)
         self.model = config.model or os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
     def complete(self, messages, system, response_schema=None):
-        request_messages = [{"role": "system", "content": system}, *messages]
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": request_messages,
-            "temperature": 0.2,
+            "instructions": system,
+            "input": messages,
+            "max_output_tokens": 4096,
         }
         if response_schema:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
+            kwargs["text"] = {
+                "format": {
+                    "type": "json_schema",
                     "name": "bongo_response",
                     "strict": True,
                     "schema": response_schema,
-                },
+                }
             }
         try:
-            response = self.client.chat.completions.create(**kwargs)
-            text = response.choices[0].message.content or ""
+            response = self.client.responses.create(**kwargs)
+            text = response.output_text or ""
             return json.loads(text) if response_schema else text
         except Exception as exc:
             raise ProviderError(f"OpenAI request failed: {exc}") from exc
@@ -187,6 +188,14 @@ def _extract_json(text: str) -> dict:
         if start >= 0 and end > start:
             return json.loads(value[start : end + 1])
         raise ProviderError("The model did not return valid JSON")
+
+
+def normalize_openai_base_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    parsed = urlsplit(url)
+    if parsed.path in {"", "/"}:
+        parsed = parsed._replace(path="/v1")
+    return urlunsplit(parsed)
 
 
 def available_providers() -> list[str]:

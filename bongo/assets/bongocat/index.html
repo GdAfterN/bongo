@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      html, body, #stage { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+      #stage > * { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+      #background { z-index: 0; }
+      #live2d { z-index: 1; }
+      #key-overlay { z-index: 2; display: none; }
+      #error { z-index: 3; display: none; color: #a33d39; font: 12px sans-serif; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <img id="background" src="model/resources/background.png" alt="">
+      <canvas id="live2d"></canvas>
+      <img id="key-overlay" alt="">
+      <div id="error"></div>
+    </div>
+    <script src="live2dcubismcore.min.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>

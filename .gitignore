@@ -13,6 +13,7 @@ uv.lock
 *.egg-info/
 build/
 dist/
+node_modules/
 
 # Test and lint caches
 .pytest_cache/

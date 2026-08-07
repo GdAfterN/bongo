@@ -12,7 +12,7 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 ## 已实现功能
 
 - PySide6 原生桌面界面，包含对话、知识库、练习和设置页面
-- 透明、置顶、可拖动的桌宠窗口
+- 透明、置顶、可拖动的 BongoCat Live2D 桌宠窗口
 - 全局键盘、鼠标左右键和鼠标移动映射为桌宠动作
 - 导入 Markdown、纯文本及常见代码文件，单文件上限 2 MB
 - 导入后调用模型生成 3 到 5 道严格四选一题目
@@ -31,7 +31,7 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 | 模块 | 实现 |
 |---|---|
 | 桌面 UI | Python 3.11+、PySide6 / Qt 6 |
-| 桌宠绘制 | Qt `QPainter`，原创程序化绘制 |
+| 桌宠渲染 | Qt WebEngine、PixiJS、`easy-live2d`、ayangweb/BongoCat 模型 |
 | 全局输入 | `pynput` |
 | 本地存储 | SQLite、FTS5 |
 | 数据校验 | Pydantic |
@@ -67,7 +67,7 @@ python -m bongo --smoke-test --data-dir .bongo-smoke
 
 ## 模型配置
 
-应用只使用官方 SDK，不在数据库中保存 API Key。启动前设置相应环境变量：
+应用只使用官方 SDK。可以在“设置”页填写 Provider、模型、API Key 和 Base URL；这些配置只保存在本机 SQLite，不会写入项目文件。也可以通过环境变量提供 Key：
 
 ```powershell
 # OpenAI
@@ -79,7 +79,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."
 $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 ```
 
-在应用的“设置”页选择 `openai` 或 `anthropic`，可填写模型名和可选 Base URL。
+在应用的“设置”页选择 `openai` 或 `anthropic`。OpenAI 后端使用 Responses API；当 Base URL 只有服务根地址时，应用会自动补全 `/v1`。
 
 如果系统 `PATH` 中存在已登录的 `claude` 命令，应用会优先提供 `claude-code`。每次请求均使用非持久化、无工具参数运行：
 
@@ -108,9 +108,11 @@ Windows 默认数据位置：
 %APPDATA%\BongoStudy\bongo.db
 ```
 
-知识正文、切分结果、题目、作答统计、对话和设置均保存在本机。使用云模型或 Claude Code 时，请求所需的资料片段会发送给对应模型服务。
+知识正文、切分结果、题目、作答统计、对话和设置均保存在本机。API Key 当前以明文保存在本机 SQLite，请勿提交该数据库。使用云模型或 Claude Code 时，请求所需的资料片段会发送给对应模型服务。
 
 全局输入监听只把事件即时映射为动画信号：不记录具体按键，不保存鼠标坐标，也不把键鼠事件发送给模型。可使用 `--no-pet` 禁用桌宠及全局监听。
+
+桌宠模型及交互设计来源于 MIT 许可的 [ayangweb/BongoCat](https://github.com/ayangweb/BongoCat)，许可证和第三方说明见 `THIRD_PARTY_NOTICES.md`。
 
 ## 项目结构
 

@@ -7,7 +7,8 @@ import pytest
 from bongo.database import StudyDatabase
 from bongo.exporter import export_learning_skill
 from bongo.ingestion import KnowledgeIngestor, split_knowledge
-from bongo.providers import ConversationProvider, ProviderError
+from bongo.pet import GlobalInputMonitor
+from bongo.providers import ConversationProvider, ProviderError, normalize_openai_base_url
 from bongo.service import LearningService
 
 
@@ -136,3 +137,30 @@ def test_split_knowledge_preserves_all_text():
     assert "# 第二节" in merged
     assert "A" * 80 in merged
     assert "B" * 80 in merged
+
+
+def test_provider_config_is_persisted_and_base_url_is_normalized(tmp_path):
+    service = LearningService(tmp_path / "data")
+    try:
+        service.set_provider("openai", "test-model", "http://127.0.0.1:3000", "test-key")
+        config = service.provider_config()
+        assert config.name == "openai"
+        assert config.model == "test-model"
+        assert config.api_key == "test-key"
+        assert config.base_url == "http://127.0.0.1:3000"
+        assert normalize_openai_base_url(config.base_url) == "http://127.0.0.1:3000/v1"
+        assert normalize_openai_base_url("https://example.com/openai/v1/") == "https://example.com/openai/v1"
+    finally:
+        service.close()
+
+
+def test_bongocat_key_names_are_transiently_normalized():
+    class CharacterKey:
+        char = "a"
+
+    class SpecialKey:
+        char = None
+        name = "space"
+
+    assert GlobalInputMonitor._key_name(CharacterKey()) == "KeyA"
+    assert GlobalInputMonitor._key_name(SpecialKey()) == "Space"

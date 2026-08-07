@@ -1,29 +1,72 @@
 from __future__ import annotations
 
-import math
+import json
 import os
-import random
+from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QMouseEvent
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
 
 
 class InputSignals(QObject):
-    key_pressed = Signal()
-    mouse_clicked = Signal(str)
+    key_changed = Signal(str, bool)
+    mouse_button_changed = Signal(str, bool)
     mouse_moved = Signal(float, float)
 
 
 class GlobalInputMonitor:
-    """Maps global input to anonymous animation events; no key or position is stored."""
+    """Forwards transient input state to the pet without persisting user input."""
+
+    SPECIAL_KEYS = {
+        "alt": "Alt",
+        "alt_gr": "AltGr",
+        "backspace": "Backspace",
+        "caps_lock": "CapsLock",
+        "ctrl": "Control",
+        "ctrl_l": "ControlLeft",
+        "ctrl_r": "ControlRight",
+        "delete": "Delete",
+        "enter": "Return",
+        "esc": "Escape",
+        "left": "ArrowLeft",
+        "right": "ArrowRight",
+        "shift": "Shift",
+        "shift_l": "ShiftLeft",
+        "shift_r": "ShiftRight",
+        "space": "Space",
+        "tab": "Tab",
+        "up": "ArrowUp",
+        "down": "ArrowDown",
+        "cmd": "Meta",
+        "cmd_l": "Meta",
+        "cmd_r": "Meta",
+    }
+    CHARACTER_KEYS = {
+        "/": "Slash",
+        "`": "BackQuote",
+    }
 
     def __init__(self, signals: InputSignals):
         self.signals = signals
         self.keyboard_listener = None
         self.mouse_listener = None
         self._last_move = 0.0
+
+    @classmethod
+    def _key_name(cls, key) -> str:
+        character = getattr(key, "char", None)
+        if character:
+            if character.isalpha():
+                return f"Key{character.upper()}"
+            if character.isdigit():
+                return f"Num{character}"
+            return cls.CHARACTER_KEYS.get(character, "")
+        name = getattr(key, "name", "") or str(key).rsplit(".", 1)[-1]
+        return cls.SPECIAL_KEYS.get(name, "")
 
     def start(self) -> None:
         if os.environ.get("BONGO_DISABLE_GLOBAL_INPUT") == "1":
@@ -33,11 +76,17 @@ class GlobalInputMonitor:
         except ImportError:
             return
 
-        self.keyboard_listener = keyboard.Listener(on_press=lambda _key: self.signals.key_pressed.emit())
+        def on_press(key):
+            if name := self._key_name(key):
+                self.signals.key_changed.emit(name, True)
+
+        def on_release(key):
+            if name := self._key_name(key):
+                self.signals.key_changed.emit(name, False)
 
         def on_click(_x, _y, button, pressed):
-            if pressed:
-                self.signals.mouse_clicked.emit("right" if str(button).endswith("right") else "left")
+            name = "right" if str(button).endswith("right") else "left"
+            self.signals.mouse_button_changed.emit(name, bool(pressed))
 
         def on_move(x, y):
             import time
@@ -48,6 +97,7 @@ class GlobalInputMonitor:
             self._last_move = now
             self.signals.mouse_moved.emit(float(x), float(y))
 
+        self.keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.mouse_listener = mouse.Listener(on_click=on_click, on_move=on_move)
         self.keyboard_listener.start()
         self.mouse_listener.start()
@@ -56,122 +106,50 @@ class GlobalInputMonitor:
         for listener in (self.keyboard_listener, self.mouse_listener):
             if listener:
                 listener.stop()
+        self.keyboard_listener = None
+        self.mouse_listener = None
 
 
-class PetCanvas(QWidget):
+class BongoCatView(QWebEngineView):
+    """Hosts the MIT-licensed ayangweb/BongoCat Live2D model."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(250, 190)
-        self.action = "idle"
-        self.left_paw = False
-        self.look_x = 0.0
-        self.look_y = 0.0
-        self.blink = False
-        self._reset_timer = QTimer(self)
-        self._reset_timer.setSingleShot(True)
-        self._reset_timer.timeout.connect(self._reset_action)
-        self._blink_timer = QTimer(self)
-        self._blink_timer.timeout.connect(self._blink_once)
-        self._blink_timer.start(3200)
+        self.ready = False
+        self.setFixedSize(374, 187)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.page().setBackgroundColor(QColor(0, 0, 0, 0))
+        self.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+            True,
+        )
+        self.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            False,
+        )
+        self.loadFinished.connect(self._loaded)
+        renderer = Path(__file__).parent / "assets" / "bongocat" / "index.html"
+        self.load(QUrl.fromLocalFile(str(renderer.resolve())))
 
-    def react(self, action: str) -> None:
-        self.action = action
-        if action == "key":
-            self.left_paw = not self.left_paw
-        self.update()
-        self._reset_timer.start(190 if action in {"key", "left", "right"} else 500)
+    def _loaded(self, success: bool) -> None:
+        self.ready = success
+
+    def _call(self, method: str, *arguments) -> None:
+        payload = ",".join(json.dumps(value, ensure_ascii=True) for value in arguments)
+        self.page().runJavaScript(f"window.bongoPet?.{method}({payload})")
+
+    def set_key(self, key: str, pressed: bool) -> None:
+        self._call("setKey", key, pressed)
+
+    def set_mouse_button(self, button: str, pressed: bool) -> None:
+        self._call("setMouseButton", button, pressed)
 
     def look_at(self, normalized_x: float, normalized_y: float) -> None:
-        self.look_x = max(-1.0, min(1.0, normalized_x))
-        self.look_y = max(-1.0, min(1.0, normalized_y))
-        self.update()
+        self._call("lookAt", normalized_x, normalized_y)
 
-    def _reset_action(self) -> None:
-        self.action = "idle"
-        self.update()
-
-    def _blink_once(self) -> None:
-        self.blink = True
-        self.update()
-        QTimer.singleShot(130, self._end_blink)
-
-    def _end_blink(self) -> None:
-        self.blink = False
-        self.update()
-        self._blink_timer.start(random.randint(2600, 4800))
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.translate(5, 5)
-        ink = QColor("#273139")
-        fur = QColor("#f2a65a")
-        light = QColor("#fff1dc")
-        accent = QColor("#4b8f77")
-        painter.setPen(QPen(ink, 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-
-        # Tail follows the mouse direction.
-        tail_path = QPainterPath()
-        tail_path.moveTo(188, 132)
-        tail_path.cubicTo(225, 130, 228 + self.look_x * 8, 83, 211, 70 - self.look_y * 8)
-        painter.setPen(QPen(fur, 18, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawPath(tail_path)
-        painter.setPen(QPen(ink, 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-
-        painter.setBrush(fur)
-        painter.drawRoundedRect(QRectF(54, 77, 142, 91), 43, 43)
-        painter.setBrush(light)
-        painter.drawEllipse(QRectF(87, 110, 77, 51))
-
-        head = QPainterPath()
-        head.moveTo(63, 75)
-        head.lineTo(70, 24)
-        head.lineTo(101, 45)
-        head.cubicTo(125, 34, 151, 36, 170, 47)
-        head.lineTo(198, 26)
-        head.lineTo(195, 79)
-        head.cubicTo(186, 111, 158, 125, 128, 125)
-        head.cubicTo(94, 125, 68, 110, 63, 75)
-        painter.setBrush(fur)
-        painter.drawPath(head)
-
-        painter.setBrush(light)
-        painter.drawEllipse(QRectF(99, 80, 60, 39))
-        eye_offset_x = self.look_x * 3
-        eye_offset_y = self.look_y * 2
-        painter.setPen(QPen(ink, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        if self.blink:
-            painter.drawLine(97, 70, 110, 70)
-            painter.drawLine(151, 70, 164, 70)
-        else:
-            painter.setBrush(ink)
-            painter.drawEllipse(QRectF(99 + eye_offset_x, 63 + eye_offset_y, 9, 13))
-            painter.drawEllipse(QRectF(153 + eye_offset_x, 63 + eye_offset_y, 9, 13))
-        painter.drawLine(127, 96, 132, 99)
-        painter.drawLine(132, 99, 137, 96)
-
-        paw_y_left = 133 - (19 if self.action == "key" and self.left_paw else 0)
-        paw_y_right = 133 - (19 if self.action == "key" and not self.left_paw else 0)
-        if self.action == "left":
-            paw_y_left -= 18
-        if self.action == "right":
-            paw_y_right -= 18
-        painter.setBrush(fur)
-        painter.drawEllipse(QRectF(48, paw_y_left, 55, 39))
-        painter.drawEllipse(QRectF(159, paw_y_right, 55, 39))
-
-        painter.setBrush(QColor("#d9e8e2"))
-        painter.setPen(QPen(accent, 3))
-        painter.drawRoundedRect(QRectF(77, 158, 111, 19), 5, 5)
-        for x in range(88, 180, 15):
-            painter.drawLine(x, 165, x + 8, 165)
-
-        if self.action == "thinking":
-            painter.setBrush(accent)
-            painter.setPen(Qt.PenStyle.NoPen)
-            for index, radius in enumerate((4, 6, 8)):
-                angle = index * 2.1
-                painter.drawEllipse(QRectF(207 + math.cos(angle) * 13, 34 + math.sin(angle) * 13, radius, radius))
+    def react(self, action: str) -> None:
+        self._call("pulse", action)
 
 
 class PetWindow(QWidget):
@@ -197,11 +175,11 @@ class PetWindow(QWidget):
         layout.setSpacing(3)
         self.bubble = QFrame()
         self.bubble.setStyleSheet(
-            "QFrame{background:#fffdf8;border:2px solid #273139;border-radius:10px;}"
+            "QFrame{background:#fffdf8;border:2px solid #202429;border-radius:8px;}"
             "QLabel{color:#202429;font-size:12px;background:transparent;border:none;}"
-            "QPushButton{background:#e5f1ec;color:#23493d;border:1px solid #8eb6a7;"
+            "QPushButton{background:#eef3f1;color:#203d34;border:1px solid #8eb6a7;"
             "border-radius:4px;padding:4px;text-align:left;font-size:11px;}"
-            "QPushButton:hover{background:#cce5dc;}"
+            "QPushButton:hover{background:#d8e9e3;}"
         )
         bubble_layout = QVBoxLayout(self.bubble)
         bubble_layout.setContentsMargins(10, 8, 10, 8)
@@ -220,12 +198,12 @@ class PetWindow(QWidget):
         bubble_layout.addWidget(self.feedback_label)
         self.bubble.hide()
         layout.addWidget(self.bubble)
-        self.canvas = PetCanvas()
+        self.canvas = BongoCatView()
         layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
 
         self.signals = InputSignals()
-        self.signals.key_pressed.connect(lambda: self.canvas.react("key"))
-        self.signals.mouse_clicked.connect(self.canvas.react)
+        self.signals.key_changed.connect(self.canvas.set_key)
+        self.signals.mouse_button_changed.connect(self.canvas.set_mouse_button)
         self.signals.mouse_moved.connect(self._follow_mouse)
         self.monitor = GlobalInputMonitor(self.signals)
 
@@ -267,7 +245,7 @@ class PetWindow(QWidget):
         self.feedback_label.setStyleSheet(f"color:{color};font-weight:600;")
         self.feedback_label.setText(("答对了。" if correct else "再想一想。") + explanation)
         for button in self.option_buttons:
-            button.setEnabled(False)
+            button.hide()
         self.canvas.react("left" if correct else "thinking")
         QTimer.singleShot(7000, self.bubble.hide)
 

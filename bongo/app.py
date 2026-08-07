@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import faulthandler
 import os
 import sys
 import traceback
@@ -82,6 +83,7 @@ class MainWindow(QMainWindow):
         self.service = service
         self.pet = pet
         self.thread_pool = QThreadPool.globalInstance()
+        self.active_workers: set[Worker] = set()
         self.current_conversation_id: int | None = None
         self.current_practice_question: dict | None = None
         self.import_queue: deque[str] = deque()
@@ -282,6 +284,11 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("模型（留空使用后端默认值）"))
         self.model_input = QLineEdit()
         form.addWidget(self.model_input)
+        form.addWidget(QLabel("API Key（仅保存在本机 SQLite）"))
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText("OpenAI 或 Anthropic API Key")
+        form.addWidget(self.api_key_input)
         form.addWidget(QLabel("兼容接口 Base URL（可选）"))
         self.base_url_input = QLineEdit()
         form.addWidget(self.base_url_input)
@@ -340,6 +347,11 @@ class MainWindow(QMainWindow):
             self.refresh_sources()
         elif index == 2:
             self.load_next_practice()
+
+    def _start_worker(self, worker: Worker) -> None:
+        self.active_workers.add(worker)
+        worker.signals.finished.connect(lambda current=worker: self.active_workers.discard(current))
+        self.thread_pool.start(worker)
 
     def refresh_all(self):
         self.refresh_sources()
@@ -404,7 +416,7 @@ class MainWindow(QMainWindow):
         worker.signals.result.connect(self._chat_completed)
         worker.signals.error.connect(self._show_error)
         worker.signals.finished.connect(lambda: self.send_button.setEnabled(True))
-        self.thread_pool.start(worker)
+        self._start_worker(worker)
 
     def _chat_completed(self, result: dict):
         self.current_conversation_id = int(result["conversation_id"])
@@ -438,7 +450,7 @@ class MainWindow(QMainWindow):
         worker.signals.result.connect(lambda result, filename=Path(path).name: self._ingest_completed(filename, result))
         worker.signals.error.connect(self._show_error)
         worker.signals.finished.connect(self._ingest_next)
-        self.thread_pool.start(worker)
+        self._start_worker(worker)
 
     def _ingest_completed(self, filename: str, result: dict):
         if result["created"] or result.get("reprocessed"):
@@ -506,11 +518,15 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.provider_combo.setCurrentIndex(index)
         self.model_input.setText(config.model)
+        self.api_key_input.setText(config.api_key)
         self.base_url_input.setText(config.base_url)
 
     def save_settings(self):
         self.service.set_provider(
-            self.provider_combo.currentText(), self.model_input.text().strip(), self.base_url_input.text().strip()
+            self.provider_combo.currentText(),
+            self.model_input.text().strip(),
+            self.base_url_input.text().strip(),
+            self.api_key_input.text().strip(),
         )
         self.statusBar().showMessage("模型设置已保存", 5000)
         self.pet.show_message("新的大脑设置已经记住了。")
@@ -532,6 +548,9 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def exit_application(self):
+        if self.active_workers:
+            QMessageBox.information(self, "任务进行中", "请等待当前模型请求完成后再退出应用。")
+            return
         self.force_exit = True
         self.pet.stop_input_monitor()
         self.pet.close()
@@ -597,6 +616,8 @@ def main(argv=None) -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(APP_STYLE)
     service = LearningService(args.data_dir)
+    crash_log = (service.data_dir / "crash.log").open("a", encoding="utf-8")
+    faulthandler.enable(crash_log)
     pet = PetWindow(service.database.next_question)
     window = MainWindow(service, pet, start_hidden=args.smoke_test)
     if not args.no_pet and not args.smoke_test:
@@ -611,6 +632,7 @@ def main(argv=None) -> int:
     finally:
         pet.stop_input_monitor()
         service.close()
+        crash_log.close()
 
 
 if __name__ == "__main__":

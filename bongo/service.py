@@ -29,13 +29,21 @@ class LearningService:
         return ProviderConfig(
             name=self.database.get_setting("provider", default_name),
             model=self.database.get_setting("model", ""),
+            api_key=self.database.get_setting("api_key", ""),
             base_url=self.database.get_setting("base_url", ""),
         )
 
-    def set_provider(self, name: str, model: str = "", base_url: str = "") -> None:
+    def set_provider(
+        self,
+        name: str,
+        model: str = "",
+        base_url: str = "",
+        api_key: str = "",
+    ) -> None:
         self.database.set_setting("provider", name)
         self.database.set_setting("model", model)
         self.database.set_setting("base_url", base_url)
+        self.database.set_setting("api_key", api_key)
 
     def _provider(self):
         return build_provider(self.provider_config(), cwd=self.data_dir)

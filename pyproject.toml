@@ -26,3 +26,12 @@ dev = [
 
 [tool.setuptools]
 packages = ["bongo"]
+
+[tool.setuptools.package-data]
+bongo = [
+  "assets/bongocat/*",
+  "assets/bongocat/model/*",
+  "assets/bongocat/model/demomodel.1024/*",
+  "assets/bongocat/model/resources/*",
+  "assets/bongocat/model/resources/left-keys/*",
+]
