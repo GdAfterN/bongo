@@ -24,7 +24,7 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 - 对话必须绑定一份导入资料，检索和引用不会混入其他文档
 - 对话上下文、长期摘要、历史会话保存与恢复
 - OpenAI、Anthropic 官方 Python SDK
-- 对话后端可选自动、内置上下文或 Claude Code；自动模式失败时回落到内置上下文
+- 对话后端可选默认、CC 或 Codex；CLI 仅在实际可执行时可选
 - 将逐文档知识、题库、错题、学习画像和会话导出为本地 skill
 
 当前版本不包含工具调用、Shell/文件编辑 Agent、ReAct、MCP、评测系统、视频生成，也暂不实现宠物升级、亲密度和装备系统。
@@ -38,7 +38,7 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 | 全局输入 | `pynput` |
 | 本地存储 | SQLite、FTS5 |
 | 数据校验 | Pydantic |
-| 模型 | OpenAI SDK、Anthropic SDK、Claude Code CLI |
+| 模型 | OpenAI SDK、Anthropic SDK、Claude Code CLI、Codex CLI |
 
 ## 快速开始
 
@@ -86,9 +86,11 @@ $env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 文档对话后端可以单独选择：
 
-- `自动`：检测 `PATH` 中的 Claude Code，执行不可用时回落到内置上下文
-- `内置上下文`：使用本地文档检索、历史消息和长期摘要，再调用上方 SDK 模型
-- `Claude Code`：明确使用系统中的 Claude Code；不可用时直接报告错误
+- `默认`：使用本地文档检索、历史消息和长期摘要，再调用上方 SDK 模型
+- `CC`：使用系统 `PATH` 中可执行的 Claude Code CLI
+- `Codex`：使用系统 `PATH` 中可执行的 Codex CLI
+
+应用会实际执行 CLI 的 `--version` 检查，而不只判断文件是否存在。CC 或 Codex 未安装、未加入 `PATH` 或不可执行时，选择该项会立即提示并保留上一个可用后端；不会自动从默认后端切换到 CLI Agent。
 
 Claude Code 每次请求均使用非持久化、无工具参数运行：
 
@@ -97,6 +99,8 @@ Claude Code 每次请求均使用非持久化、无工具参数运行：
 ```
 
 Claude Code 不会获得文件、Shell 或其他工具；应用自身的 SQLite 数据库是会话记录的唯一真源。
+
+Codex 使用非交互 `exec` 模式并启用 `read-only` 沙箱；文档片段、历史消息和系统提示由应用通过标准输入传递。
 
 ## 使用流程
 
@@ -118,7 +122,7 @@ Windows 默认数据位置：
 %APPDATA%\BongoStudy\bongo.db
 ```
 
-知识正文、切分结果、题目、逐次作答记录、文档绑定对话和设置均保存在本机。API Key 当前以明文保存在本机 SQLite，请勿提交该数据库。使用云模型或 Claude Code 时，请求所需的资料片段会发送给对应模型服务。
+知识正文、切分结果、题目、逐次作答记录、文档绑定对话和设置均保存在本机。API Key 当前以明文保存在本机 SQLite，请勿提交该数据库。使用云模型、Claude Code 或 Codex 时，请求所需的资料片段会发送给对应模型服务。
 
 全局输入监听只把事件即时映射为动画信号：不记录具体按键，不保存鼠标坐标，也不把键鼠事件发送给模型。可使用 `--no-pet` 禁用桌宠及全局监听。
 
@@ -133,7 +137,7 @@ bongo/
 ├── pet.py          # 桌宠绘制、气泡答题和全局输入映射
 ├── database.py     # SQLite schema、检索、会话和答题记录
 ├── ingestion.py    # 文件读取、切分和选择题生成
-├── providers.py    # OpenAI、Anthropic、Claude Code 后端
+├── providers.py    # OpenAI、Anthropic、Claude Code、Codex 后端
 ├── memory.py       # 对话上下文、知识检索和来源
 ├── service.py      # 导入、对话、摘要与恢复流程
 ├── exporter.py     # 学习 skill 导出

@@ -9,9 +9,10 @@ from .ingestion import KnowledgeIngestor
 from .memory import ConversationContext
 from .providers import (
     ClaudeCodeProvider,
+    CodexCliProvider,
     ProviderConfig,
-    ProviderError,
     available_providers,
+    chat_backend_available,
     resolve_chat_backend,
     build_provider,
 )
@@ -53,10 +54,14 @@ class LearningService:
         self.database.set_setting("api_key", api_key)
 
     def chat_backend(self) -> str:
-        return self.database.get_setting("chat_backend", "auto")
+        return resolve_chat_backend(self.database.get_setting("chat_backend", "default"))
 
     def set_chat_backend(self, name: str) -> None:
-        self.database.set_setting("chat_backend", name)
+        backend = resolve_chat_backend(name)
+        if backend != "default" and not chat_backend_available(backend):
+            cli_name = "Claude Code" if backend == "cc" else "Codex"
+            raise ValueError(f"没有找到可执行的 {cli_name} CLI，请先安装并加入 PATH")
+        self.database.set_setting("chat_backend", backend)
 
     def _provider(self):
         return build_provider(self.provider_config(), cwd=self.data_dir)
@@ -104,19 +109,13 @@ class LearningService:
         self.database.add_message(conversation_id, "user", message)
         configured_backend = self.chat_backend()
         resolved_backend = resolve_chat_backend(configured_backend)
-        try:
-            provider = (
-                ClaudeCodeProvider(ProviderConfig(name="claude-code"), cwd=self.data_dir)
-                if resolved_backend == "claude-code"
-                else self._provider()
-            )
-            answer = str(provider.complete(messages, system)).strip()
-        except ProviderError:
-            if configured_backend != "auto" or resolved_backend == "builtin":
-                raise
-            resolved_backend = "builtin"
-            answer = str(self._provider().complete(messages, system)).strip()
-            self.database.set_conversation_provider(conversation_id, resolved_backend)
+        if resolved_backend == "cc":
+            provider = ClaudeCodeProvider(ProviderConfig(name="cc"), cwd=self.data_dir)
+        elif resolved_backend == "codex":
+            provider = CodexCliProvider(ProviderConfig(name="codex"), cwd=self.data_dir)
+        else:
+            provider = self._provider()
+        answer = str(provider.complete(messages, system)).strip()
         if not answer:
             raise RuntimeError("模型返回了空回答")
         self.database.add_message(conversation_id, "assistant", answer, citations)

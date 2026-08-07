@@ -179,6 +179,8 @@ class ClaudeCodeProvider(ConversationProvider):
             )
         except subprocess.TimeoutExpired as exc:
             raise ProviderError("Claude Code request timed out after 180 seconds") from exc
+        except OSError as exc:
+            raise ProviderError(f"Claude Code could not be started: {exc}") from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise ProviderError(f"Claude Code failed: {detail[:500]}")
@@ -194,6 +196,66 @@ class ClaudeCodeProvider(ConversationProvider):
             return structured
         result = payload.get("result", output)
         return result if isinstance(result, dict) else _extract_json(str(result))
+
+
+class CodexCliProvider(ConversationProvider):
+    """Read-only Codex CLI adapter. Application history remains the source of truth."""
+
+    def __init__(self, config: ProviderConfig, cwd: str | Path | None = None):
+        executable = shutil.which("codex")
+        if not executable:
+            raise ProviderError("Codex CLI was not found in PATH")
+        self.executable = executable
+        self.model = config.model
+        self.cwd = Path(cwd or Path.home()).resolve()
+
+    def complete(self, messages, system, response_schema=None):
+        transcript = []
+        for item in messages:
+            label = "用户" if item.get("role") == "user" else "助学伙伴"
+            transcript.append(f"{label}: {item.get('content', '')}")
+        prompt = f"{system}\n\n" + "\n\n".join(transcript)
+        if response_schema:
+            prompt += (
+                "\n\nReturn only JSON matching this JSON Schema. Do not use markdown fences:\n"
+                + json.dumps(response_schema, ensure_ascii=False)
+            )
+        command = [
+            self.executable,
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "-C",
+            str(self.cwd),
+        ]
+        if self.model:
+            command.extend(["--model", self.model])
+        command.append("-")
+        startup = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.cwd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                creationflags=startup,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderError("Codex CLI request timed out after 180 seconds") from exc
+        except OSError as exc:
+            raise ProviderError(f"Codex CLI could not be started: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise ProviderError(f"Codex CLI failed: {detail[:500]}")
+        output = completed.stdout.strip()
+        return _extract_json(output) if response_schema else output
 
 
 def _extract_json(text: str) -> dict:
@@ -223,28 +285,54 @@ def available_providers() -> list[str]:
 
 
 def available_chat_backends() -> list[str]:
-    return ["auto", "builtin", "claude-code"]
+    return ["default", "cc", "codex"]
+
+
+def normalize_chat_backend(name: str) -> str:
+    aliases = {
+        "auto": "default",
+        "builtin": "default",
+        "claude-code": "cc",
+    }
+    normalized = aliases.get(name, name)
+    return normalized if normalized in available_chat_backends() else "default"
+
+
+def _cli_agent_available(executable_name: str) -> bool:
+    executable = shutil.which(executable_name)
+    if not executable:
+        return False
+    startup = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=startup,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def chat_backend_available(name: str) -> bool:
-    if name in {"auto", "builtin"}:
+    normalized = normalize_chat_backend(name)
+    if normalized == "default":
         return True
-    if name == "claude-code":
-        return shutil.which("claude") is not None
-    return False
+    executable = "claude" if normalized == "cc" else "codex"
+    return _cli_agent_available(executable)
 
 
 def resolve_chat_backend(name: str) -> str:
-    if name == "auto":
-        return "claude-code" if chat_backend_available("claude-code") else "builtin"
-    if name not in available_chat_backends():
-        return "builtin"
-    return name
+    return normalize_chat_backend(name)
 
 
 def build_provider(config: ProviderConfig, cwd: str | Path | None = None) -> ConversationProvider:
-    if config.name == "claude-code":
+    if config.name in {"cc", "claude-code"}:
         return ClaudeCodeProvider(config, cwd=cwd)
+    if config.name == "codex":
+        return CodexCliProvider(config, cwd=cwd)
     if config.name == "openai":
         return OpenAIProvider(config)
     if config.name == "anthropic":

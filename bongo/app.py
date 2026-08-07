@@ -348,16 +348,17 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("文档对话后端"))
         self.chat_backend_combo = QComboBox()
         backend_labels = {
-            "auto": "自动（优先本地 Agent）",
-            "builtin": "内置上下文（SDK + 本地检索）",
-            "claude-code": "Claude Code",
+            "default": "默认",
+            "cc": "CC",
+            "codex": "Codex",
         }
         for backend in available_chat_backends():
-            suffix = "" if chat_backend_available(backend) else "（当前未检测到）"
-            self.chat_backend_combo.addItem(backend_labels[backend] + suffix, backend)
+            self.chat_backend_combo.addItem(backend_labels[backend], backend)
+        self._last_chat_backend = "default"
+        self.chat_backend_combo.currentIndexChanged.connect(self._chat_backend_changed)
         form.addWidget(self.chat_backend_combo)
         env_status = QLabel(
-            "自动模式检测 PATH 中的 Claude Code；不可执行时回落到内置上下文。"
+            "默认使用内置上下文；CC 和 Codex 仅在对应 CLI 可执行时可选。"
             "导入和出题始终使用上方配置的官方 SDK。"
         )
         env_status.setObjectName("muted")
@@ -756,6 +757,22 @@ class MainWindow(QMainWindow):
             self.current_practice_question = None
             self.load_next_practice()
 
+    def _chat_backend_changed(self, *_args) -> None:
+        backend = str(self.chat_backend_combo.currentData())
+        if chat_backend_available(backend):
+            self._last_chat_backend = backend
+            return
+        cli_name = "Claude Code" if backend == "cc" else "Codex"
+        QMessageBox.warning(
+            self,
+            "对话后端不可用",
+            f"没有找到可执行的 {cli_name} CLI，请先安装并加入 PATH。",
+        )
+        fallback_index = self.chat_backend_combo.findData(self._last_chat_backend)
+        self.chat_backend_combo.blockSignals(True)
+        self.chat_backend_combo.setCurrentIndex(max(0, fallback_index))
+        self.chat_backend_combo.blockSignals(False)
+
     def load_settings(self):
         config = self.service.provider_config()
         index = self.provider_combo.findText(config.name)
@@ -764,8 +781,15 @@ class MainWindow(QMainWindow):
         self.model_input.setText(config.model)
         self.api_key_input.setText(config.api_key)
         self.base_url_input.setText(config.base_url)
-        backend_index = self.chat_backend_combo.findData(self.service.chat_backend())
+        backend = self.service.chat_backend()
+        if not chat_backend_available(backend):
+            backend = "default"
+            self.service.database.set_setting("chat_backend", backend)
+        backend_index = self.chat_backend_combo.findData(backend)
+        self.chat_backend_combo.blockSignals(True)
         self.chat_backend_combo.setCurrentIndex(max(0, backend_index))
+        self.chat_backend_combo.blockSignals(False)
+        self._last_chat_backend = backend
 
         database = self.service.database
         checks = {

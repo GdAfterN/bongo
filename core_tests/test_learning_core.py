@@ -10,10 +10,12 @@ from bongo.ingestion import KnowledgeIngestor, question_system_prompt, split_kno
 from bongo.pet import GlobalInputMonitor
 from bongo.providers import (
     ClaudeCodeProvider,
+    CodexCliProvider,
     ConversationProvider,
     OpenAIProvider,
     ProviderConfig,
     ProviderError,
+    chat_backend_available,
     normalize_openai_base_url,
 )
 from bongo.service import LearningService
@@ -124,7 +126,7 @@ def test_service_chat_resume_and_skill_export(tmp_path):
             source_id,
             [{"heading": "TCP", "content": "TCP 使用三次握手建立可靠连接，并同步连接双方的初始状态。"}],
         )
-        service.set_chat_backend("builtin")
+        service.set_chat_backend("default")
         result = service.chat(source_id, None, "请解释三次握手")
         assert result["conversation_id"] > 0
         assert result["source_id"] == source_id
@@ -225,7 +227,7 @@ def test_conversation_retrieval_is_scoped_to_selected_document(tmp_path):
     service = LearningService(tmp_path / "data")
     provider = FakeProvider()
     service._provider = lambda: provider
-    service.set_chat_backend("builtin")
+    service.set_chat_backend("default")
     try:
         first_id, _ = service.database.add_source(tmp_path / "first.md", "握手概念只属于第一份资料。")
         second_id, _ = service.database.add_source(tmp_path / "second.md", "握手概念只属于第二份资料。")
@@ -289,34 +291,85 @@ def test_claude_code_sends_prompt_over_stdin(monkeypatch, tmp_path):
 
     monkeypatch.setattr("bongo.providers.shutil.which", lambda _name: "claude")
     monkeypatch.setattr("bongo.providers.subprocess.run", fake_run)
-    provider = ClaudeCodeProvider(ProviderConfig(name="claude-code"), cwd=tmp_path)
+    provider = ClaudeCodeProvider(ProviderConfig(name="cc"), cwd=tmp_path)
     result = provider.complete([{"role": "user", "content": "question"}], "system")
     assert result == "answer"
     assert captured["input"] == "用户: question"
     assert "用户: question" not in captured["command"]
 
 
-def test_auto_chat_backend_falls_back_to_builtin(monkeypatch, tmp_path):
+def test_default_chat_backend_uses_internal_conversation(tmp_path):
     service = LearningService(tmp_path / "data")
-    builtin = FakeProvider()
-    claude = FakeProvider(fail=True)
-    service._provider = lambda: builtin
-    service.set_chat_backend("auto")
-    monkeypatch.setattr("bongo.providers.shutil.which", lambda _name: "claude")
-    monkeypatch.setattr("bongo.service.ClaudeCodeProvider", lambda *_args, **_kwargs: claude)
+    internal = FakeProvider()
+    service._provider = lambda: internal
+    service.set_chat_backend("default")
     try:
-        source_id, _ = service.database.add_source(tmp_path / "fallback.md", "自动回退测试材料。")
+        source_id, _ = service.database.add_source(tmp_path / "default.md", "默认后端测试材料。")
         service.database.replace_chunks(
             source_id,
-            [{"heading": "回退", "content": "自动模式在外部 Agent 失败时使用内置对话后端。"}],
+            [{"heading": "默认", "content": "默认模式使用内部简易对话系统。"}],
         )
 
-        result = service.chat(source_id, None, "外部后端失败时怎么办？")
+        result = service.chat(source_id, None, "默认后端如何工作？")
 
-        assert claude.calls == 1
-        assert builtin.calls == 1
-        assert result["backend"] == "builtin"
+        assert internal.calls == 1
+        assert result["backend"] == "default"
         conversation = service.database.get_conversation(result["conversation_id"])
-        assert conversation["provider"] == "builtin"
+        assert conversation["provider"] == "default"
     finally:
         service.close()
+
+
+@pytest.mark.parametrize(
+    ("legacy_name", "expected"),
+    [("auto", "default"), ("builtin", "default"), ("claude-code", "cc")],
+)
+def test_legacy_chat_backend_names_are_migrated(tmp_path, legacy_name, expected):
+    service = LearningService(tmp_path / legacy_name)
+    try:
+        service.database.set_setting("chat_backend", legacy_name)
+        assert service.chat_backend() == expected
+    finally:
+        service.close()
+
+
+def test_cli_backend_requires_executable_version_command(monkeypatch):
+    monkeypatch.setattr("bongo.providers.shutil.which", lambda _name: "codex.exe")
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr("bongo.providers.subprocess.run", denied)
+    assert chat_backend_available("codex") is False
+
+
+def test_unavailable_codex_backend_is_rejected(monkeypatch, tmp_path):
+    service = LearningService(tmp_path / "data")
+    monkeypatch.setattr("bongo.service.chat_backend_available", lambda _name: False)
+    try:
+        with pytest.raises(ValueError, match="没有找到可执行的 Codex CLI"):
+            service.set_chat_backend("codex")
+        assert service.chat_backend() == "default"
+    finally:
+        service.close()
+
+
+def test_codex_cli_sends_prompt_over_stdin_in_read_only_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs["input"]
+        return type("Completed", (), {"returncode": 0, "stdout": "answer", "stderr": ""})()
+
+    monkeypatch.setattr("bongo.providers.shutil.which", lambda _name: "codex")
+    monkeypatch.setattr("bongo.providers.subprocess.run", fake_run)
+    provider = CodexCliProvider(ProviderConfig(name="codex"), cwd=tmp_path)
+    result = provider.complete([{"role": "user", "content": "question"}], "system")
+
+    assert result == "answer"
+    assert captured["command"][1:4] == ["exec", "--sandbox", "read-only"]
+    assert "--skip-git-repo-check" in captured["command"]
+    assert captured["command"][-1] == "-"
+    assert "用户: question" in captured["input"]
+    assert "用户: question" not in captured["command"]
