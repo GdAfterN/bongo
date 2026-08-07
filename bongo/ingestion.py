@@ -64,6 +64,72 @@ QUESTION_SCHEMA = {
 }
 
 
+DOCUMENT_EXTENSIONS = {".md", ".markdown", ".txt", ".rst"}
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".swift",
+}
+WEB_STYLE_EXTENSIONS = {".html", ".css", ".scss"}
+DATA_EXTENSIONS = {".json", ".yaml", ".yml"}
+SCRIPT_EXTENSIONS = {".sh", ".ps1"}
+
+
+def knowledge_profile(suffix: str) -> tuple[str, str]:
+    suffix = suffix.lower()
+    if suffix in DOCUMENT_EXTENSIONS:
+        return (
+            "结构化文档",
+            "按概念、论点、步骤、条件和因果关系拆解。题目应检验理解与应用，"
+            "避免只考标题、措辞或孤立数字。",
+        )
+    if suffix in CODE_EXTENSIONS:
+        return (
+            "程序代码",
+            "按模块职责、调用关系、数据流、分支条件、状态变化、异常与边界条件拆解。"
+            "题目应要求阅读代码推断行为，不考无意义的语法记忆。",
+        )
+    if suffix == ".sql":
+        return (
+            "SQL",
+            "按表结构、字段约束、连接关系、过滤聚合、事务和查询结果拆解。"
+            "题目应检验数据关系和语句实际效果。",
+        )
+    if suffix in DATA_EXTENSIONS:
+        return (
+            "配置或结构化数据",
+            "按层级、字段语义、取值约束、引用关系和配置影响拆解。"
+            "题目应检验修改某字段会产生的结果。",
+        )
+    if suffix in WEB_STYLE_EXTENSIONS:
+        return (
+            "界面结构与样式",
+            "按页面结构、组件职责、选择器作用、布局规则、层叠关系和交互状态拆解。"
+            "题目应检验渲染或交互结果。",
+        )
+    if suffix in SCRIPT_EXTENSIONS:
+        return (
+            "自动化脚本",
+            "按执行顺序、输入输出、环境依赖、失败条件和有副作用的操作拆解。"
+            "题目应检验执行效果与安全边界。",
+        )
+    return (
+        "通用文本",
+        "按主题、事实、关系、步骤和约束拆解，题目应检验理解而非表面记忆。",
+    )
+
+
+def question_system_prompt(suffix: str) -> str:
+    profile, guidance = knowledge_profile(suffix)
+    return (
+        "你是严谨的助学题目设计器。只能依据用户提供的材料出题。"
+        f"当前材料类型是：{profile}。{guidance}"
+        "生成 3 到 5 道单选题，每题恰好四个选项且只有一个正确答案。"
+        "题目之间应覆盖不同知识点；错误选项应当合理但能被材料排除。"
+        "evidence 必须引用或紧贴原文，explanation 要说明判断依据。"
+        "所有内容使用与材料一致的主要语言。"
+    )
+
+
 def read_knowledge_file(path: str | Path) -> str:
     file_path = Path(path)
     if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -86,9 +152,9 @@ def read_knowledge_file(path: str | Path) -> str:
 
 
 def split_knowledge(content: str, suffix: str, max_chars: int = 3200) -> list[dict]:
-    if suffix in {".md", ".markdown", ".rst"}:
+    if suffix in DOCUMENT_EXTENSIONS:
         boundaries = re.split(r"(?m)(?=^#{1,4}\s+|^[^\n]+\n[=-]{3,}\s*$)", content)
-    elif suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go", ".rs"}:
+    elif suffix in CODE_EXTENSIONS:
         boundaries = re.split(
             r"(?m)(?=^(?:async\s+def|def|class|function|export\s+(?:default\s+)?(?:class|function)|"
             r"(?:public|private|protected|static|final|async)\s+.*(?:class|\w+\s*\())\b)",
@@ -146,7 +212,12 @@ class KnowledgeIngestor:
             self.database.set_source_status(source_id, "processing")
             chunks = split_knowledge(content, file_path.suffix.lower())
             chunk_ids = self.database.replace_chunks(source_id, chunks)
-            questions = self._generate_questions(file_path.name, chunks, chunk_ids)
+            questions = self._generate_questions(
+                file_path.name,
+                file_path.suffix.lower(),
+                chunks,
+                chunk_ids,
+            )
             question_ids = self.database.add_questions(source_id, questions)
             self.database.set_source_status(source_id, "ready")
             return {
@@ -159,7 +230,13 @@ class KnowledgeIngestor:
             self.database.set_source_status(source_id, "failed", str(exc)[:800])
             raise
 
-    def _generate_questions(self, source_name: str, chunks: list[dict], chunk_ids: list[int]) -> list[dict]:
+    def _generate_questions(
+        self,
+        source_name: str,
+        suffix: str,
+        chunks: list[dict],
+        chunk_ids: list[int],
+    ) -> list[dict]:
         selected = chunks[:6]
         material_parts = []
         for index, chunk in enumerate(selected):
@@ -167,15 +244,18 @@ class KnowledgeIngestor:
                 f"[片段 {index + 1} | {chunk.get('heading') or '未命名'}]\n{chunk['content']}"
             )
         material = "\n\n".join(material_parts)
-        system = (
-            "你是严谨的助学题目设计器。只能依据用户提供的材料出题。"
-            "生成 3 到 5 道单选题，每题恰好四个选项且只有一个正确答案。"
-            "避免文字游戏，错误选项应当合理但能被材料排除。evidence 必须引用或紧贴原文，"
-            "explanation 要说明正确原因。所有内容使用与材料一致的主要语言。"
-        )
+        profile, _ = knowledge_profile(suffix)
+        system = question_system_prompt(suffix)
         try:
             raw = self.provider.complete(
-                [{"role": "user", "content": f"资料名：{source_name}\n\n{material}"}],
+                [{
+                    "role": "user",
+                    "content": (
+                        f"资料名：{source_name}\n资料类型：{profile}\n"
+                        "请先在内部识别最值得练习的知识单元，再直接返回题目结构。\n\n"
+                        f"{material}"
+                    ),
+                }],
                 system,
                 QUESTION_SCHEMA,
             )

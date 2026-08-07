@@ -54,7 +54,7 @@ class OpenAIProvider(ConversationProvider):
             "model": self.model,
             "instructions": system,
             "input": messages,
-            "max_output_tokens": 4096,
+            "max_output_tokens": 8192,
         }
         if response_schema:
             kwargs["text"] = {
@@ -65,12 +65,32 @@ class OpenAIProvider(ConversationProvider):
                     "schema": response_schema,
                 }
             }
-        try:
-            response = self.client.responses.create(**kwargs)
-            text = response.output_text or ""
-            return json.loads(text) if response_schema else text
-        except Exception as exc:
-            raise ProviderError(f"OpenAI request failed: {exc}") from exc
+        for attempt in range(2):
+            try:
+                response = self.client.responses.create(**kwargs)
+            except Exception as exc:
+                raise ProviderError(f"OpenAI request failed: {exc}") from exc
+            text = (response.output_text or "").strip()
+            if not text:
+                if attempt == 0:
+                    continue
+                status = getattr(response, "status", "unknown")
+                output_types = ", ".join(
+                    str(getattr(item, "type", type(item).__name__))
+                    for item in getattr(response, "output", [])
+                ) or "none"
+                raise ProviderError(
+                    f"OpenAI returned empty output (status: {status}, output: {output_types})"
+                )
+            if not response_schema:
+                return text
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                if attempt == 0:
+                    continue
+                raise ProviderError(f"OpenAI returned invalid structured output: {exc}") from exc
+        raise ProviderError("OpenAI request failed without a response")
 
 
 class AnthropicProvider(ConversationProvider):
@@ -143,12 +163,12 @@ class ClaudeCodeProvider(ConversationProvider):
             command.extend(
                 ["--output-format", "json", "--json-schema", json.dumps(response_schema, ensure_ascii=False)]
             )
-        command.append(prompt)
         startup = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             completed = subprocess.run(
                 command,
                 cwd=self.cwd,
+                input=prompt,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -199,11 +219,27 @@ def normalize_openai_base_url(value: str) -> str:
 
 
 def available_providers() -> list[str]:
-    values = []
-    if shutil.which("claude"):
-        values.append("claude-code")
-    values.extend(["openai", "anthropic"])
-    return values
+    return ["openai", "anthropic"]
+
+
+def available_chat_backends() -> list[str]:
+    return ["auto", "builtin", "claude-code"]
+
+
+def chat_backend_available(name: str) -> bool:
+    if name in {"auto", "builtin"}:
+        return True
+    if name == "claude-code":
+        return shutil.which("claude") is not None
+    return False
+
+
+def resolve_chat_backend(name: str) -> str:
+    if name == "auto":
+        return "claude-code" if chat_backend_available("claude-code") else "builtin"
+    if name not in available_chat_backends():
+        return "builtin"
+    return name
 
 
 def build_provider(config: ProviderConfig, cwd: str | Path | None = None) -> ConversationProvider:

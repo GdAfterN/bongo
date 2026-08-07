@@ -7,6 +7,7 @@ import os
 import sys
 import traceback
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
@@ -14,6 +15,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -29,18 +31,22 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QSlider,
+    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from .ingestion import SUPPORTED_EXTENSIONS
-from .pet import PetWindow
-from .providers import ProviderError, available_providers
+from .dialogs import QuestionBankDialog
+from .pet import PetSettings, PetWindow
+from .providers import available_chat_backends, chat_backend_available, available_providers
 from .service import LearningService
 from .styles import APP_STYLE
 
@@ -78,13 +84,21 @@ def panel() -> QFrame:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, service: LearningService, pet: PetWindow, start_hidden: bool = False):
+    def __init__(
+        self,
+        service: LearningService,
+        pet: PetWindow,
+        start_hidden: bool = False,
+        pet_enabled: bool = True,
+    ):
         super().__init__()
         self.service = service
         self.pet = pet
+        self.pet_enabled = pet_enabled
         self.thread_pool = QThreadPool.globalInstance()
         self.active_workers: set[Worker] = set()
         self.current_conversation_id: int | None = None
+        self.current_source_id: int | None = None
         self.current_practice_question: dict | None = None
         self.import_queue: deque[str] = deque()
         self.force_exit = False
@@ -95,6 +109,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._connect_pet()
         self.refresh_all()
+        self.pet.position_changed.connect(self._save_pet_position)
 
         self.bubble_timer = QTimer(self)
         self.bubble_timer.timeout.connect(self.pet.show_next_question)
@@ -163,8 +178,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
         history_panel = panel()
         history_layout = QVBoxLayout(history_panel)
-        history_layout.addWidget(QLabel("历史对话"))
-        new_button = QPushButton("新建对话")
+        history_layout.addWidget(QLabel("文档对话记录"))
+        new_button = QPushButton("开始新对话")
         new_button.setProperty("secondary", True)
         new_button.clicked.connect(self.new_conversation)
         history_layout.addWidget(new_button)
@@ -176,12 +191,19 @@ class MainWindow(QMainWindow):
 
         chat_panel = panel()
         chat_layout = QVBoxLayout(chat_panel)
+        source_bar = QHBoxLayout()
+        source_bar.addWidget(QLabel("对话文档"))
+        self.chat_source_combo = QComboBox()
+        self.chat_source_combo.setMinimumWidth(260)
+        self.chat_source_combo.currentIndexChanged.connect(self._chat_source_changed)
+        source_bar.addWidget(self.chat_source_combo, 1)
+        chat_layout.addLayout(source_bar)
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
         self.chat_view.setHtml(self._welcome_html())
         chat_layout.addWidget(self.chat_view, 1)
         self.chat_input = QPlainTextEdit()
-        self.chat_input.setPlaceholderText("针对已喂食的知识提问，Ctrl+Enter 发送")
+        self.chat_input.setPlaceholderText("先选择一份文档，再针对其内容提问，Ctrl+Enter 发送")
         self.chat_input.setMaximumHeight(90)
         self.send_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.chat_input)
         self.send_shortcut.activated.connect(self.send_chat)
@@ -219,13 +241,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(bar)
         table_panel = panel()
         table_layout = QVBoxLayout(table_panel)
-        self.source_table = QTableWidget(0, 5)
-        self.source_table.setHorizontalHeaderLabels(["文件", "类型", "片段", "题目", "状态"])
+        self.source_table = QTableWidget(0, 4)
+        self.source_table.setHorizontalHeaderLabels(["文件名", "上传时间", "题目数量", "题库"])
         self.source_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.source_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.source_table.verticalHeader().setVisible(False)
         self.source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 5):
+        for column in range(1, 4):
             self.source_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         table_layout.addWidget(self.source_table)
         layout.addWidget(table_panel, 1)
@@ -238,6 +260,17 @@ class MainWindow(QMainWindow):
         card = panel()
         card.setMaximumWidth(820)
         card_layout = QVBoxLayout(card)
+        filters = QHBoxLayout()
+        self.practice_source_combo = QComboBox()
+        self.practice_source_combo.addItem("全部文档", None)
+        self.practice_mode_combo = QComboBox()
+        self.practice_mode_combo.addItem("全部题目", False)
+        self.practice_mode_combo.addItem("错题复习", True)
+        self.practice_source_combo.currentIndexChanged.connect(self._practice_filter_changed)
+        self.practice_mode_combo.currentIndexChanged.connect(self._practice_filter_changed)
+        filters.addWidget(self.practice_source_combo, 1)
+        filters.addWidget(self.practice_mode_combo)
+        card_layout.addLayout(filters)
         self.practice_source = QLabel("尚未加载题目")
         self.practice_source.setObjectName("muted")
         self.practice_prompt = QLabel("先向 Bongo 喂食一个知识文件。")
@@ -259,11 +292,11 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.submit_answer_button = QPushButton("提交答案")
         self.submit_answer_button.clicked.connect(self.submit_practice_answer)
-        next_button = QPushButton("换一题")
-        next_button.setProperty("secondary", True)
-        next_button.clicked.connect(self.load_next_practice)
+        self.next_question_button = QPushButton("换一题")
+        self.next_question_button.setProperty("secondary", True)
+        self.next_question_button.clicked.connect(lambda: self.load_next_practice(advance=True))
         buttons.addStretch()
-        buttons.addWidget(next_button)
+        buttons.addWidget(self.next_question_button)
         buttons.addWidget(self.submit_answer_button)
         card_layout.addLayout(buttons)
         layout.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -275,9 +308,14 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 6, 0, 0)
         settings = panel()
-        settings.setMaximumWidth(760)
-        form = QVBoxLayout(settings)
-        form.addWidget(QLabel("对话与出题后端"))
+        settings.setMaximumWidth(820)
+        settings_layout = QVBoxLayout(settings)
+        tabs = QTabWidget()
+        settings_layout.addWidget(tabs)
+
+        model_tab = QWidget()
+        form = QVBoxLayout(model_tab)
+        form.addWidget(QLabel("导入出题模型（官方 SDK）"))
         self.provider_combo = QComboBox()
         self.provider_combo.addItems(available_providers())
         form.addWidget(self.provider_combo)
@@ -292,9 +330,21 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("兼容接口 Base URL（可选）"))
         self.base_url_input = QLineEdit()
         form.addWidget(self.base_url_input)
+        form.addSpacing(12)
+        form.addWidget(QLabel("文档对话后端"))
+        self.chat_backend_combo = QComboBox()
+        backend_labels = {
+            "auto": "自动（优先本地 Agent）",
+            "builtin": "内置上下文（SDK + 本地检索）",
+            "claude-code": "Claude Code",
+        }
+        for backend in available_chat_backends():
+            suffix = "" if chat_backend_available(backend) else "（当前未检测到）"
+            self.chat_backend_combo.addItem(backend_labels[backend] + suffix, backend)
+        form.addWidget(self.chat_backend_combo)
         env_status = QLabel(
-            "API Key 从环境变量 OPENAI_API_KEY / ANTHROPIC_API_KEY 读取，不写入本地数据库。\n"
-            "Claude Code 后端复用系统中的 claude 登录状态，并强制禁用全部工具。"
+            "自动模式检测 PATH 中的 Claude Code；不可执行时回落到内置上下文。"
+            "导入和出题始终使用上方配置的官方 SDK。"
         )
         env_status.setObjectName("muted")
         env_status.setWordWrap(True)
@@ -302,15 +352,59 @@ class MainWindow(QMainWindow):
         save = QPushButton("保存设置")
         save.clicked.connect(self.save_settings)
         form.addWidget(save, 0, Qt.AlignmentFlag.AlignRight)
-        form.addSpacing(18)
-        form.addWidget(QLabel("导出"))
+        form.addStretch()
+        tabs.addTab(model_tab, "模型与对话")
+
+        pet_tab = QWidget()
+        pet_form = QVBoxLayout(pet_tab)
+        self.pet_visible_check = QCheckBox("显示桌宠")
+        self.pet_always_top_check = QCheckBox("窗口置顶")
+        self.pet_pass_through_check = QCheckBox("点击穿透")
+        self.pet_keep_screen_check = QCheckBox("保持在屏幕内")
+        self.pet_model_mirror_check = QCheckBox("模型镜像")
+        self.pet_mouse_mirror_check = QCheckBox("鼠标镜像")
+        self.pet_keyboard_check = QCheckBox("响应键盘")
+        self.pet_mouse_check = QCheckBox("响应鼠标")
+        for control in (
+            self.pet_visible_check,
+            self.pet_always_top_check,
+            self.pet_pass_through_check,
+            self.pet_keep_screen_check,
+            self.pet_model_mirror_check,
+            self.pet_mouse_mirror_check,
+            self.pet_keyboard_check,
+            self.pet_mouse_check,
+        ):
+            pet_form.addWidget(control)
+        pet_form.addWidget(QLabel("不透明度"))
+        self.pet_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pet_opacity_slider.setRange(10, 100)
+        self.pet_opacity_slider.setTickInterval(10)
+        pet_form.addWidget(self.pet_opacity_slider)
+        pet_form.addWidget(QLabel("窗口尺寸（%）"))
+        self.pet_scale_spin = QSpinBox()
+        self.pet_scale_spin.setRange(50, 200)
+        self.pet_scale_spin.setSuffix("%")
+        pet_form.addWidget(self.pet_scale_spin)
+        pet_save = QPushButton("应用桌宠设置")
+        pet_save.clicked.connect(self.save_pet_settings)
+        pet_form.addWidget(pet_save, 0, Qt.AlignmentFlag.AlignRight)
+        pet_form.addStretch()
+        tabs.addTab(pet_tab, "桌宠")
+
+        export_tab = QWidget()
+        export_form = QVBoxLayout(export_tab)
+        export_form.addWidget(QLabel("学习 Skill"))
         export_help = QLabel("将知识来源、练习题和会话索引导出为可复用的本地 skill。")
         export_help.setObjectName("muted")
-        form.addWidget(export_help)
+        export_help.setWordWrap(True)
+        export_form.addWidget(export_help)
         export_button = QPushButton("导出学习 Skill")
         export_button.setProperty("secondary", True)
         export_button.clicked.connect(self.export_skill)
-        form.addWidget(export_button, 0, Qt.AlignmentFlag.AlignLeft)
+        export_form.addWidget(export_button, 0, Qt.AlignmentFlag.AlignLeft)
+        export_form.addStretch()
+        tabs.addTab(export_tab, "导出")
         layout.addWidget(settings, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch()
         return page
@@ -366,10 +460,45 @@ class MainWindow(QMainWindow):
             name = QTableWidgetItem(source["name"])
             name.setData(Qt.ItemDataRole.UserRole, source["id"])
             name.setToolTip(source["path"] + (f"\n{source['error']}" if source["error"] else ""))
-            values = [name, QTableWidgetItem(source["kind"] or "text"), QTableWidgetItem(str(source["chunk_count"])),
-                      QTableWidgetItem(str(source["question_count"])), QTableWidgetItem(source["status"])]
+            try:
+                uploaded = datetime.fromisoformat(source["created_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                uploaded = source["created_at"]
+            values = [name, QTableWidgetItem(uploaded), QTableWidgetItem(str(source["question_count"]))]
             for column, value in enumerate(values):
                 self.source_table.setItem(row, column, value)
+            bank_button = QPushButton("查看题库")
+            bank_button.setProperty("secondary", True)
+            bank_button.setEnabled(source["question_count"] > 0)
+            bank_button.clicked.connect(
+                lambda _checked=False, source_id=source["id"]: self.open_question_bank(source_id)
+            )
+            self.source_table.setCellWidget(row, 3, bank_button)
+        self._refresh_source_selectors(sources)
+
+    def _refresh_source_selectors(self, sources: list[dict]) -> None:
+        chat_selected = self.current_source_id
+        practice_selected = self.practice_source_combo.currentData()
+        self.chat_source_combo.blockSignals(True)
+        self.practice_source_combo.blockSignals(True)
+        self.chat_source_combo.clear()
+        self.chat_source_combo.addItem("请选择知识文档", None)
+        self.practice_source_combo.clear()
+        self.practice_source_combo.addItem("全部文档", None)
+        for source in sources:
+            if source["status"] != "ready":
+                continue
+            self.chat_source_combo.addItem(source["name"], source["id"])
+            self.practice_source_combo.addItem(source["name"], source["id"])
+        chat_index = self.chat_source_combo.findData(chat_selected)
+        self.chat_source_combo.setCurrentIndex(max(0, chat_index))
+        practice_index = self.practice_source_combo.findData(practice_selected)
+        self.practice_source_combo.setCurrentIndex(max(0, practice_index))
+        self.chat_source_combo.blockSignals(False)
+        self.practice_source_combo.blockSignals(False)
+
+    def open_question_bank(self, source_id: int) -> None:
+        QuestionBankDialog(self.service.database, source_id, self).exec()
 
     def refresh_conversations(self):
         selected = self.current_conversation_id
@@ -377,19 +506,41 @@ class MainWindow(QMainWindow):
         for conversation in self.service.database.list_conversations():
             item = QListWidgetItem(conversation["title"])
             item.setData(Qt.ItemDataRole.UserRole, conversation["id"])
-            item.setToolTip(conversation["updated_at"])
+            source = conversation.get("source_name") or "未绑定文档"
+            item.setToolTip(f"文档：{source}\n后端：{conversation['provider']}\n{conversation['updated_at']}")
             self.conversation_list.addItem(item)
             if conversation["id"] == selected:
                 self.conversation_list.setCurrentItem(item)
 
     def new_conversation(self):
         self.current_conversation_id = None
+        self.current_source_id = self.chat_source_combo.currentData()
         self.conversation_list.clearSelection()
         self.chat_view.setHtml(self._welcome_html())
+        if self.current_source_id is None:
+            self.chat_status.setText("请先选择一份知识文档")
+        else:
+            self.chat_status.setText("新对话将只使用所选文档")
         self.chat_input.setFocus()
+
+    def _chat_source_changed(self) -> None:
+        selected = self.chat_source_combo.currentData()
+        if selected == self.current_source_id:
+            return
+        self.current_source_id = selected
+        self.current_conversation_id = None
+        self.conversation_list.clearSelection()
+        self.chat_view.setHtml(self._welcome_html())
+        self.chat_status.setText("可以开始文档对话" if selected is not None else "请先选择一份知识文档")
 
     def load_conversation_item(self, item: QListWidgetItem):
         self.current_conversation_id = int(item.data(Qt.ItemDataRole.UserRole))
+        conversation = self.service.database.get_conversation(self.current_conversation_id) or {}
+        self.current_source_id = conversation.get("source_id")
+        self.chat_source_combo.blockSignals(True)
+        index = self.chat_source_combo.findData(self.current_source_id)
+        self.chat_source_combo.setCurrentIndex(max(0, index))
+        self.chat_source_combo.blockSignals(False)
         self.render_conversation()
 
     def render_conversation(self):
@@ -407,12 +558,15 @@ class MainWindow(QMainWindow):
         text = self.chat_input.toPlainText().strip()
         if not text or not self.send_button.isEnabled():
             return
+        if self.current_source_id is None:
+            self.chat_status.setText("请先选择要对话的知识文档")
+            return
         self.chat_input.clear()
         self.chat_view.append(self._message_html("user", text))
         self.chat_status.setText("Bongo 正在查找知识并思考...")
         self.send_button.setEnabled(False)
         self.pet.canvas.react("thinking")
-        worker = Worker(self.service.chat, self.current_conversation_id, text)
+        worker = Worker(self.service.chat, self.current_source_id, self.current_conversation_id, text)
         worker.signals.result.connect(self._chat_completed)
         worker.signals.error.connect(self._show_error)
         worker.signals.finished.connect(lambda: self.send_button.setEnabled(True))
@@ -420,9 +574,10 @@ class MainWindow(QMainWindow):
 
     def _chat_completed(self, result: dict):
         self.current_conversation_id = int(result["conversation_id"])
+        self.current_source_id = int(result["source_id"])
         self.render_conversation()
         self.refresh_conversations()
-        self.chat_status.setText("回答已保存，可随时恢复")
+        self.chat_status.setText(f"回答已保存 · {result['backend']}")
         self.pet.canvas.react("left")
 
     def choose_knowledge_files(self):
@@ -473,8 +628,30 @@ class MainWindow(QMainWindow):
         self.refresh_sources()
         self.load_next_practice()
 
-    def load_next_practice(self):
-        question = self.service.database.next_question()
+    def _practice_filter_changed(self) -> None:
+        self.current_practice_question = None
+        self.load_next_practice(advance=False)
+
+    def load_next_practice(self, advance: bool = False):
+        previous_id = (
+            int(self.current_practice_question["id"])
+            if advance and self.current_practice_question
+            else None
+        )
+        source_id = self.practice_source_combo.currentData()
+        wrong_only = bool(self.practice_mode_combo.currentData())
+        question = self.service.database.next_question(
+            exclude_id=previous_id,
+            source_id=source_id,
+            wrong_only=wrong_only,
+        )
+        no_alternative = False
+        if question is None and previous_id is not None:
+            previous = self.service.database.get_question(previous_id)
+            if previous and (source_id is None or previous["source_id"] == source_id):
+                if not wrong_only or previous["ask_count"] > previous["correct_count"]:
+                    question = previous
+                    no_alternative = True
         self.current_practice_question = question
         self.practice_group.setExclusive(False)
         for option in self.practice_options:
@@ -483,15 +660,19 @@ class MainWindow(QMainWindow):
         self.practice_group.setExclusive(True)
         self.practice_feedback.clear()
         if not question:
-            self.practice_source.setText("知识库中还没有练习题")
-            self.practice_prompt.setText("导入一个 Markdown 或代码文件开始练习。")
+            self.practice_source.setText("当前范围没有可练习的题目")
+            self.practice_prompt.setText("可切换文档或练习模式。")
             self.submit_answer_button.setEnabled(False)
+            self.next_question_button.setEnabled(False)
             return
         self.practice_source.setText(f"来源：{question['source_name']}  ·  {question.get('topic', '')}")
         self.practice_prompt.setText(question["prompt"])
         for index, text in enumerate(question["options"]):
             self.practice_options[index].setText(f"{chr(65 + index)}. {text}")
         self.submit_answer_button.setEnabled(True)
+        self.next_question_button.setEnabled(True)
+        if no_alternative:
+            self.practice_feedback.setText("当前范围只有这一题。")
 
     def submit_practice_answer(self):
         if not self.current_practice_question:
@@ -520,6 +701,32 @@ class MainWindow(QMainWindow):
         self.model_input.setText(config.model)
         self.api_key_input.setText(config.api_key)
         self.base_url_input.setText(config.base_url)
+        backend_index = self.chat_backend_combo.findData(self.service.chat_backend())
+        self.chat_backend_combo.setCurrentIndex(max(0, backend_index))
+
+        database = self.service.database
+        checks = {
+            self.pet_visible_check: ("pet_visible", "1"),
+            self.pet_always_top_check: ("pet_always_on_top", "1"),
+            self.pet_pass_through_check: ("pet_pass_through", "0"),
+            self.pet_keep_screen_check: ("pet_keep_in_screen", "1"),
+            self.pet_model_mirror_check: ("pet_model_mirror", "0"),
+            self.pet_mouse_mirror_check: ("pet_mouse_mirror", "0"),
+            self.pet_keyboard_check: ("pet_keyboard_enabled", "1"),
+            self.pet_mouse_check: ("pet_mouse_enabled", "1"),
+        }
+        for control, (key, default) in checks.items():
+            control.setChecked(database.get_setting(key, default) == "1")
+        self.pet_opacity_slider.setValue(int(database.get_setting("pet_opacity", "100")))
+        self.pet_scale_spin.setValue(int(database.get_setting("pet_scale", "100")))
+        self.pet.apply_settings(self._pet_settings_from_ui(), update_visibility=False)
+        if not self.pet_enabled:
+            self.pet.hide()
+        x = database.get_setting("pet_x", "")
+        y = database.get_setting("pet_y", "")
+        if x and y:
+            self.pet.move(int(x), int(y))
+            self.pet.keep_inside_screen()
 
     def save_settings(self):
         self.service.set_provider(
@@ -528,8 +735,46 @@ class MainWindow(QMainWindow):
             self.base_url_input.text().strip(),
             self.api_key_input.text().strip(),
         )
+        self.service.set_chat_backend(str(self.chat_backend_combo.currentData()))
         self.statusBar().showMessage("模型设置已保存", 5000)
         self.pet.show_message("新的大脑设置已经记住了。")
+
+    def _pet_settings_from_ui(self) -> PetSettings:
+        return PetSettings(
+            visible=self.pet_visible_check.isChecked(),
+            opacity=self.pet_opacity_slider.value(),
+            scale=self.pet_scale_spin.value(),
+            always_on_top=self.pet_always_top_check.isChecked(),
+            pass_through=self.pet_pass_through_check.isChecked(),
+            keep_in_screen=self.pet_keep_screen_check.isChecked(),
+            model_mirror=self.pet_model_mirror_check.isChecked(),
+            mouse_mirror=self.pet_mouse_mirror_check.isChecked(),
+            keyboard_enabled=self.pet_keyboard_check.isChecked(),
+            mouse_enabled=self.pet_mouse_check.isChecked(),
+        )
+
+    def save_pet_settings(self):
+        settings = self._pet_settings_from_ui()
+        values = {
+            "pet_visible": settings.visible,
+            "pet_opacity": settings.opacity,
+            "pet_scale": settings.scale,
+            "pet_always_on_top": settings.always_on_top,
+            "pet_pass_through": settings.pass_through,
+            "pet_keep_in_screen": settings.keep_in_screen,
+            "pet_model_mirror": settings.model_mirror,
+            "pet_mouse_mirror": settings.mouse_mirror,
+            "pet_keyboard_enabled": settings.keyboard_enabled,
+            "pet_mouse_enabled": settings.mouse_enabled,
+        }
+        for key, value in values.items():
+            self.service.database.set_setting(key, str(int(value)) if isinstance(value, bool) else str(value))
+        self.pet.apply_settings(settings)
+        self.statusBar().showMessage("桌宠设置已应用", 5000)
+
+    def _save_pet_position(self, x: int, y: int) -> None:
+        self.service.database.set_setting("pet_x", str(x))
+        self.service.database.set_setting("pet_y", str(y))
 
     def export_skill(self):
         directory = QFileDialog.getExistingDirectory(self, "选择 Skill 导出目录")
@@ -619,11 +864,17 @@ def main(argv=None) -> int:
     crash_log = (service.data_dir / "crash.log").open("a", encoding="utf-8")
     faulthandler.enable(crash_log)
     pet = PetWindow(service.database.next_question)
-    window = MainWindow(service, pet, start_hidden=args.smoke_test)
+    window = MainWindow(
+        service,
+        pet,
+        start_hidden=args.smoke_test,
+        pet_enabled=not args.no_pet and not args.smoke_test,
+    )
     if not args.no_pet and not args.smoke_test:
-        screen = app.primaryScreen().availableGeometry()
-        pet.move(screen.right() - pet.width() - 24, screen.bottom() - pet.height() - 20)
-        pet.show()
+        if not service.database.get_setting("pet_x", ""):
+            screen = app.primaryScreen().availableGeometry()
+            pet.move(screen.right() - pet.width() - 24, screen.bottom() - pet.height() - 20)
+        pet.setVisible(pet.pet_settings.visible)
         pet.start_input_monitor()
     if args.smoke_test:
         QTimer.singleShot(800, app.quit)

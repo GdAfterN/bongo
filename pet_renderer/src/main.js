@@ -32,6 +32,9 @@ function rangeValue(id, ratio, invert = false) {
 }
 
 window.bongoPet = {
+  setMirror(mirrored) {
+    stage.style.transform = mirrored ? "scaleX(-1)" : "none";
+  },
   setKey(key, pressed) {
     if (!/^[A-Za-z0-9]+$/.test(key)) return;
     if (pressed) {

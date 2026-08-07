@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -116,6 +117,7 @@ class BongoCatView(QWebEngineView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ready = False
+        self.mirrored = False
         self.setFixedSize(374, 187)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -134,6 +136,8 @@ class BongoCatView(QWebEngineView):
 
     def _loaded(self, success: bool) -> None:
         self.ready = success
+        if success:
+            self.set_mirrored(self.mirrored)
 
     def _call(self, method: str, *arguments) -> None:
         payload = ",".join(json.dumps(value, ensure_ascii=True) for value in arguments)
@@ -151,14 +155,35 @@ class BongoCatView(QWebEngineView):
     def react(self, action: str) -> None:
         self._call("pulse", action)
 
+    def set_mirrored(self, mirrored: bool) -> None:
+        self.mirrored = mirrored
+        if self.ready:
+            self._call("setMirror", mirrored)
+
+
+@dataclass(frozen=True)
+class PetSettings:
+    visible: bool = True
+    opacity: int = 100
+    scale: int = 100
+    always_on_top: bool = True
+    pass_through: bool = False
+    keep_in_screen: bool = True
+    model_mirror: bool = False
+    mouse_mirror: bool = False
+    keyboard_enabled: bool = True
+    mouse_enabled: bool = True
+
 
 class PetWindow(QWidget):
     answer_selected = Signal(int, int)
+    position_changed = Signal(int, int)
 
     def __init__(self, question_loader: Callable[[], dict | None] | None = None):
         super().__init__()
         self.question_loader = question_loader
         self.current_question: dict | None = None
+        self.pet_settings = PetSettings()
         self._drag_offset = QPoint()
         self.setObjectName("petWindow")
         self.setWindowTitle("Bongo Study Pet")
@@ -202,8 +227,8 @@ class PetWindow(QWidget):
         layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
 
         self.signals = InputSignals()
-        self.signals.key_changed.connect(self.canvas.set_key)
-        self.signals.mouse_button_changed.connect(self.canvas.set_mouse_button)
+        self.signals.key_changed.connect(self._set_key)
+        self.signals.mouse_button_changed.connect(self._set_mouse_button)
         self.signals.mouse_moved.connect(self._follow_mouse)
         self.monitor = GlobalInputMonitor(self.signals)
 
@@ -219,6 +244,42 @@ class PetWindow(QWidget):
         question = self.question_loader()
         if question:
             self.show_question(question)
+
+    def apply_settings(self, settings: PetSettings, update_visibility: bool = True) -> None:
+        was_visible = self.isVisible()
+        self.pet_settings = settings
+        self.setWindowOpacity(max(10, min(100, settings.opacity)) / 100)
+        scale = max(50, min(200, settings.scale)) / 100
+        canvas_width = round(374 * scale)
+        canvas_height = round(187 * scale)
+        self.canvas.setFixedSize(canvas_width, canvas_height)
+        self.setFixedSize(max(260, canvas_width + 16), canvas_height + 218)
+        self.canvas.set_mirrored(settings.model_mirror)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, settings.pass_through)
+        if update_visibility:
+            self.setVisible(settings.visible)
+        elif was_visible:
+            self.show()
+        if settings.keep_in_screen:
+            self.keep_inside_screen()
+
+    def keep_inside_screen(self) -> None:
+        screen = self.screen()
+        if not screen:
+            return
+        bounds = screen.availableGeometry()
+        x = min(max(self.x(), bounds.left()), max(bounds.left(), bounds.right() - self.width() + 1))
+        y = min(max(self.y(), bounds.top()), max(bounds.top(), bounds.bottom() - self.height() + 1))
+        self.move(x, y)
+
+    def _set_key(self, key: str, pressed: bool) -> None:
+        if self.pet_settings.keyboard_enabled:
+            self.canvas.set_key(key, pressed)
+
+    def _set_mouse_button(self, button: str, pressed: bool) -> None:
+        if self.pet_settings.mouse_enabled:
+            self.canvas.set_mouse_button(button, pressed)
 
     def show_question(self, question: dict) -> None:
         self.current_question = question
@@ -254,9 +315,13 @@ class PetWindow(QWidget):
             self.answer_selected.emit(int(self.current_question["id"]), selected_index)
 
     def _follow_mouse(self, x: float, y: float) -> None:
+        if not self.pet_settings.mouse_enabled:
+            return
         screen = self.screen().geometry()
         normalized_x = (x - screen.center().x()) / max(screen.width() / 2, 1)
         normalized_y = (y - screen.center().y()) / max(screen.height() / 2, 1)
+        if self.pet_settings.mouse_mirror:
+            normalized_x = -normalized_x
         self.canvas.look_at(normalized_x, normalized_y)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -269,3 +334,6 @@ class PetWindow(QWidget):
 
     def mouseReleaseEvent(self, _event: QMouseEvent) -> None:
         self._drag_offset = QPoint()
+        if self.pet_settings.keep_in_screen:
+            self.keep_inside_screen()
+        self.position_changed.emit(self.x(), self.y())

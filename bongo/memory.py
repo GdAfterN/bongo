@@ -20,7 +20,8 @@ class ConversationContext:
     def build(self, conversation_id: int, user_message: str) -> tuple[list[dict], list[dict], str]:
         conversation = self.database.get_conversation(conversation_id) or {}
         history = self.database.get_messages(conversation_id, limit=self.max_messages)
-        chunks = self.database.search_chunks(user_message, limit=6)
+        source_id = conversation.get("source_id")
+        chunks = self.database.search_chunks(user_message, limit=6, source_id=source_id)
         citations = []
         context_parts = []
         used = 0
@@ -45,6 +46,6 @@ class ConversationContext:
                 messages.append({"role": message["role"], "content": message["content"]})
         request = user_message
         if context_parts:
-            request += "\n\n以下是从本地知识库检索到的资料：\n\n" + "\n\n".join(context_parts)
+            request += "\n\n以下是从当前对话所选资料中检索到的片段：\n\n" + "\n\n".join(context_parts)
         messages.append({"role": "user", "content": request})
         return messages, citations, SYSTEM_PROMPT

@@ -7,7 +7,14 @@ from .database import StudyDatabase
 from .exporter import export_learning_skill
 from .ingestion import KnowledgeIngestor
 from .memory import ConversationContext
-from .providers import ProviderConfig, available_providers, build_provider
+from .providers import (
+    ClaudeCodeProvider,
+    ProviderConfig,
+    ProviderError,
+    available_providers,
+    resolve_chat_backend,
+    build_provider,
+)
 
 
 def default_data_dir() -> Path:
@@ -45,29 +52,82 @@ class LearningService:
         self.database.set_setting("base_url", base_url)
         self.database.set_setting("api_key", api_key)
 
+    def chat_backend(self) -> str:
+        return self.database.get_setting("chat_backend", "auto")
+
+    def set_chat_backend(self, name: str) -> None:
+        self.database.set_setting("chat_backend", name)
+
     def _provider(self):
         return build_provider(self.provider_config(), cwd=self.data_dir)
 
     def ingest(self, path: str | Path) -> dict:
         return KnowledgeIngestor(self.database, self._provider()).ingest(path)
 
-    def start_conversation(self, title: str = "新对话") -> int:
-        return self.database.create_conversation(title, self.provider_config().name)
+    def start_conversation(
+        self,
+        source_id: int,
+        title: str = "新对话",
+        backend: str | None = None,
+    ) -> int:
+        if not self.database.get_source(source_id):
+            raise ValueError("请选择有效的知识文档")
+        return self.database.create_conversation(
+            title,
+            backend or resolve_chat_backend(self.chat_backend()),
+            source_id,
+        )
 
-    def chat(self, conversation_id: int | None, user_message: str) -> dict:
+    def chat(self, source_id: int | None, conversation_id: int | None, user_message: str) -> dict:
         message = user_message.strip()
         if not message:
             raise ValueError("消息不能为空")
         if conversation_id is None:
-            conversation_id = self.start_conversation(message[:40])
+            if source_id is None:
+                raise ValueError("请先选择要对话的知识文档")
+            source = self.database.get_source(source_id)
+            if not source:
+                raise ValueError("所选知识文档不存在")
+            backend = resolve_chat_backend(self.chat_backend())
+            conversation_id = self.start_conversation(
+                source_id,
+                f"{source['name']} · {message[:36]}",
+                backend,
+            )
+        conversation = self.database.get_conversation(conversation_id)
+        if not conversation:
+            raise ValueError("对话不存在")
+        source_id = conversation.get("source_id")
+        if source_id is None:
+            raise ValueError("旧对话未绑定知识文档，请新建文档对话")
         messages, citations, system = self.context.build(conversation_id, message)
         self.database.add_message(conversation_id, "user", message)
-        answer = str(self._provider().complete(messages, system)).strip()
+        configured_backend = self.chat_backend()
+        resolved_backend = resolve_chat_backend(configured_backend)
+        try:
+            provider = (
+                ClaudeCodeProvider(ProviderConfig(name="claude-code"), cwd=self.data_dir)
+                if resolved_backend == "claude-code"
+                else self._provider()
+            )
+            answer = str(provider.complete(messages, system)).strip()
+        except ProviderError:
+            if configured_backend != "auto" or resolved_backend == "builtin":
+                raise
+            resolved_backend = "builtin"
+            answer = str(self._provider().complete(messages, system)).strip()
+            self.database.set_conversation_provider(conversation_id, resolved_backend)
         if not answer:
             raise RuntimeError("模型返回了空回答")
         self.database.add_message(conversation_id, "assistant", answer, citations)
         self._compact_if_needed(conversation_id)
-        return {"conversation_id": conversation_id, "answer": answer, "citations": citations}
+        return {
+            "conversation_id": conversation_id,
+            "source_id": source_id,
+            "backend": resolved_backend,
+            "answer": answer,
+            "citations": citations,
+        }
 
     def _compact_if_needed(self, conversation_id: int) -> None:
         messages = self.database.get_messages(conversation_id, limit=1000)

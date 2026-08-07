@@ -94,10 +94,29 @@ class StudyDatabase:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS question_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                    selected_index INTEGER NOT NULL,
+                    is_correct INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id, position);
                 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(source_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
+                CREATE INDEX IF NOT EXISTS idx_attempts_question ON question_attempts(question_id, id);
                 """
+            )
+            conversation_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(conversations)").fetchall()
+            }
+            if "source_id" not in conversation_columns:
+                self.conn.execute(
+                    "ALTER TABLE conversations ADD COLUMN source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL"
+                )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source_id, updated_at)"
             )
             try:
                 self.conn.execute(
@@ -156,6 +175,18 @@ class StudyDatabase:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_source(self, source_id: int) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT s.*, COUNT(DISTINCT c.id) AS chunk_count, "
+                "COUNT(DISTINCT q.id) AS question_count FROM sources s "
+                "LEFT JOIN chunks c ON c.source_id = s.id "
+                "LEFT JOIN questions q ON q.source_id = s.id "
+                "WHERE s.id = ? GROUP BY s.id",
+                (source_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def delete_source(self, source_id: int) -> None:
         with self._lock, self.conn:
@@ -250,17 +281,52 @@ class StudyDatabase:
             ).fetchone()
         return self._question(row)
 
-    def next_question(self) -> dict | None:
+    def list_questions(self, source_id: int | None = None, wrong_only: bool = False) -> list[dict]:
+        conditions = []
+        parameters: list[object] = []
+        if source_id is not None:
+            conditions.append("q.source_id = ?")
+            parameters.append(source_id)
+        if wrong_only:
+            conditions.append("q.ask_count > q.correct_count")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT q.*, s.name AS source_name FROM questions q "
+                f"JOIN sources s ON s.id = q.source_id {where} ORDER BY q.id",
+                parameters,
+            ).fetchall()
+        return [self._question(row) for row in rows]
+
+    def next_question(
+        self,
+        exclude_id: int | None = None,
+        source_id: int | None = None,
+        wrong_only: bool = False,
+    ) -> dict | None:
+        conditions = []
+        parameters: list[object] = []
+        if exclude_id is not None:
+            conditions.append("q.id != ?")
+            parameters.append(exclude_id)
+        if source_id is not None:
+            conditions.append("q.source_id = ?")
+            parameters.append(source_id)
+        if wrong_only:
+            conditions.append("q.ask_count > q.correct_count")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             row = self.conn.execute(
-                """
+                f"""
                 SELECT q.*, s.name AS source_name FROM questions q
                 JOIN sources s ON s.id = q.source_id
+                {where}
                 ORDER BY CASE WHEN q.last_asked_at IS NULL THEN 0 ELSE 1 END,
                          (q.correct_count * 1.0 / MAX(q.ask_count, 1)) ASC,
-                         COALESCE(q.last_asked_at, q.created_at) ASC
+                          COALESCE(q.last_asked_at, q.created_at) ASC
                 LIMIT 1
-                """
+                """,
+                parameters,
             ).fetchone()
         return self._question(row)
 
@@ -275,9 +341,32 @@ class StudyDatabase:
                 "correct_count = correct_count + ?, last_asked_at = ? WHERE id = ?",
                 (1 if correct else 0, utc_now(), question_id),
             )
+            self.conn.execute(
+                "INSERT INTO question_attempts(question_id, selected_index, is_correct, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (question_id, int(selected_index), 1 if correct else 0, utc_now()),
+            )
         return {"correct": correct, "question": question}
 
-    def search_chunks(self, query: str, limit: int = 6) -> list[dict]:
+    def list_wrong_questions(self, source_id: int | None = None) -> list[dict]:
+        return self.list_questions(source_id=source_id, wrong_only=True)
+
+    def list_attempts(self, question_id: int | None = None) -> list[dict]:
+        with self._lock:
+            if question_id is None:
+                rows = self.conn.execute(
+                    "SELECT a.*, q.source_id, q.prompt, q.topic, s.name AS source_name "
+                    "FROM question_attempts a JOIN questions q ON q.id = a.question_id "
+                    "JOIN sources s ON s.id = q.source_id ORDER BY a.id"
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM question_attempts WHERE question_id = ? ORDER BY id",
+                    (question_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def search_chunks(self, query: str, limit: int = 6, source_id: int | None = None) -> list[dict]:
         tokens = re.findall(r"[A-Za-z0-9_]{2,}|[\u3400-\u9fff]{2,}", query)
         fts_query = " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens[:12])
         with self._lock:
@@ -290,9 +379,9 @@ class StudyDatabase:
                         FROM chunks_fts
                         JOIN chunks c ON c.id = CAST(chunks_fts.chunk_id AS INTEGER)
                         JOIN sources s ON s.id = c.source_id
-                        WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?
+                        WHERE chunks_fts MATCH ? AND (? IS NULL OR s.id = ?) ORDER BY score LIMIT ?
                         """,
-                        (fts_query, limit),
+                        (fts_query, source_id, source_id, limit),
                     ).fetchall()
                     if rows:
                         return [dict(row) for row in rows]
@@ -313,28 +402,34 @@ class StudyDatabase:
             parameters: list[object] = []
             for term in search_terms:
                 parameters.extend((f"%{term}%", f"%{term}%"))
+            source_condition = " AND s.id = ?" if source_id is not None else ""
+            if source_id is not None:
+                parameters.append(source_id)
             parameters.append(limit)
             rows = self.conn.execute(
-                "SELECT c.id, c.content, c.heading, s.name AS source_name, 0 AS score "
+                "SELECT c.id, c.source_id, c.content, c.heading, s.name AS source_name, 0 AS score "
                 "FROM chunks c JOIN sources s ON s.id = c.source_id "
-                f"WHERE {conditions} LIMIT ?",
+                f"WHERE ({conditions}){source_condition} LIMIT ?",
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def create_conversation(self, title: str, provider: str) -> int:
+    def create_conversation(self, title: str, provider: str, source_id: int | None = None) -> int:
         now = utc_now()
         with self._lock, self.conn:
             cursor = self.conn.execute(
-                "INSERT INTO conversations(title, provider, created_at, updated_at) VALUES(?, ?, ?, ?)",
-                (title[:80] or "新对话", provider, now, now),
+                "INSERT INTO conversations(title, provider, source_id, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (title[:80] or "新对话", provider, source_id, now, now),
             )
             return int(cursor.lastrowid)
 
     def list_conversations(self, limit: int = 50) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM conversations ORDER BY updated_at DESC LIMIT ?", (limit,)
+                "SELECT c.*, s.name AS source_name FROM conversations c "
+                "LEFT JOIN sources s ON s.id = c.source_id "
+                "ORDER BY c.updated_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -369,6 +464,13 @@ class StudyDatabase:
             self.conn.execute(
                 "UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?",
                 (summary, utc_now(), conversation_id),
+            )
+
+    def set_conversation_provider(self, conversation_id: int, provider: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE conversations SET provider = ?, updated_at = ? WHERE id = ?",
+                (provider, utc_now(), conversation_id),
             )
 
     def get_conversation(self, conversation_id: int) -> dict | None:
