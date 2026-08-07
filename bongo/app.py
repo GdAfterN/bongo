@@ -649,8 +649,7 @@ class MainWindow(QMainWindow):
         self.load_next_practice()
 
     def _practice_filter_changed(self, *_args) -> None:
-        self.current_practice_question = None
-        self.load_next_practice(advance=False)
+        self.load_next_practice(advance=True)
 
     def _practice_mode(self) -> str:
         for mode, button in self.practice_mode_buttons.items():
