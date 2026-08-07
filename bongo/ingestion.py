@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -32,13 +33,14 @@ class QuestionSet(BaseModel):
 
 class GeneratedAlgorithmQuestion(GeneratedQuestion):
     explanation: str = Field(min_length=40, max_length=3000)
+    focus: Literal["main_approach", "data_structure", "boundary"]
 
 
 class AlgorithmStudySet(BaseModel):
     problem_title: str = Field(min_length=1, max_length=200)
     problem_statement: str = Field(min_length=10, max_length=5000)
     solution_approach: str = Field(min_length=20, max_length=5000)
-    questions: list[GeneratedAlgorithmQuestion] = Field(min_length=1, max_length=2)
+    questions: list[GeneratedAlgorithmQuestion] = Field(min_length=3, max_length=3)
 
 
 QUESTION_SCHEMA = {
@@ -84,8 +86,8 @@ ALGORITHM_STUDY_SCHEMA = {
         "solution_approach": {"type": "string"},
         "questions": {
             "type": "array",
-            "minItems": 1,
-            "maxItems": 2,
+            "minItems": 3,
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -101,9 +103,13 @@ ALGORITHM_STUDY_SCHEMA = {
                     "explanation": {"type": "string", "minLength": 40},
                     "evidence": {"type": "string"},
                     "topic": {"type": "string"},
+                    "focus": {
+                        "type": "string",
+                        "enum": ["main_approach", "data_structure", "boundary"],
+                    },
                 },
                 "required": [
-                    "question", "options", "correct_index", "explanation", "evidence", "topic"
+                    "question", "options", "correct_index", "explanation", "evidence", "topic", "focus"
                 ],
             },
         },
@@ -184,16 +190,25 @@ def algorithm_study_system_prompt() -> str:
         "只能依据材料整理，不得调用你记忆中的同名题目来补全材料。题名可依据文件名或类名归纳；"
         "题干、约束和示例只能记录材料明确给出的内容，代码行为可以标注为由实现归纳。材料没有"
         "提供的信息必须明确说明未提供，不得虚构常见题目的默认条件。先提取 problem_title、"
-        "problem_statement 和 solution_approach：题干应完整说明输入、输出、约束和示例中"
-        "能够确认的信息；解题思路应说明所选算法或数据结构、核心不变量、执行步骤、"
-        "时间与空间复杂度以及边界处理。然后生成 1 到 2 道便于快速复习的四选一题，且每题只有"
-        "一个正确答案。第 1 题必须直接检验整道题的主要实现思路，包括采用的算法或数据结构及"
-        "关键执行过程；仅当复杂度、关键边界或易错实现点值得单独复习时生成第 2 题。不要把次要"
+        "problem_statement 和 solution_approach：problem_title 必须是简洁的中文算法题名；"
+        "problem_statement 只写算法题的简要摘要，用几句话说明材料能够确认的任务目标、输入和"
+        "输出，不要复述代码结构，也不要扩写材料未提供的约束；解题思路应说明所选算法或数据"
+        "结构、核心不变量、执行步骤、时间与空间复杂度以及边界处理。然后固定生成 3 道便于快速"
+        "复习的四选一题，且每题只有一个正确答案。第 1 题的 focus 必须是 main_approach，直接"
+        "检验整道题的主要实现思路及关键执行过程；第 2 题的 focus 必须是 data_structure，检验"
+        "实现使用的数据结构、该数据结构的作用及选择原因；第 3 题的 focus 必须是 boundary，"
+        "检验最重要的边界条件或易错处理。不要把次要"
         "细节拆成大量题目。explanation 必须详细说明正确选项为什么成立，并逐项解释其余"
         "选项为什么不适合当前题目；例如两数之和使用哈希表时，应说明它通过 O(1) 平均查找"
         "补数把双重循环降为一次遍历 O(n)，代价是 O(n) 额外空间。evidence 必须紧贴题干、"
         "题解或代码。所有内容使用与材料一致的主要语言。"
     )
+
+
+def algorithm_title_hint(source_name: str) -> str:
+    stem = Path(source_name).stem.strip()
+    stem = re.sub(r"[_\-\s]*\d+$", "", stem).strip(" _-")
+    return stem if re.search(r"[\u4e00-\u9fff]", stem) else ""
 
 
 def read_knowledge_file(path: str | Path) -> str:
@@ -273,7 +288,12 @@ class KnowledgeIngestor:
         source_id, created = self.database.add_source(file_path, content, knowledge_type)
         if not created:
             existing = next(item for item in self.database.list_sources() if item["id"] == source_id)
-            if existing["status"] == "ready":
+            algorithm_questions_current = (
+                knowledge_type == "code" and existing["question_count"] == 3
+            )
+            if existing["status"] == "ready" and (
+                knowledge_type != "code" or algorithm_questions_current
+            ):
                 return {
                     "source_id": source_id,
                     "created": False,
@@ -375,12 +395,14 @@ class KnowledgeIngestor:
             f"[片段 {index + 1} | {chunk.get('heading') or '未命名'}]\n{chunk['content']}"
             for index, chunk in enumerate(selected)
         )
+        title_hint = algorithm_title_hint(source_name)
         try:
             raw = self.provider.complete(
                 [{
                     "role": "user",
                     "content": (
                         f"题解文件：{source_name}\n"
+                        f"中文题名提示：{title_hint or '请根据材料归纳并翻译为中文'}\n"
                         "请提取题名、题干和完整解题思路，再生成针对这道算法题的练习。\n\n"
                         f"{material}"
                     ),
@@ -396,14 +418,25 @@ class KnowledgeIngestor:
         for position, question in enumerate(parsed.questions):
             if len(question.options) != 4 or len(set(question.options)) != 4:
                 continue
+            expected_focus = ("main_approach", "data_structure", "boundary")[position]
+            if question.focus != expected_focus:
+                raise ProviderError(
+                    "算法题练习结构不正确：三题必须依次复习主要思路、数据结构和边界条件"
+                )
             value = question.model_dump()
+            value.pop("focus", None)
             value["chunk_id"] = chunk_ids[min(position, len(chunk_ids) - 1)] if chunk_ids else None
             questions.append(value)
-        if not questions:
-            raise ProviderError("模型没有生成可用的算法四选一题")
+        if len(questions) != 3:
+            raise ProviderError("模型没有生成完整的主思路、数据结构和边界条件三道题")
+        problem_title = title_hint or parsed.problem_title.strip()
+        problem_statement = (
+            f"题目名称：{problem_title}\n\n"
+            f"算法题简要摘要：{parsed.problem_statement.strip()}"
+        )
         return {
-            "problem_title": parsed.problem_title,
-            "problem_statement": parsed.problem_statement,
+            "problem_title": problem_title,
+            "problem_statement": problem_statement,
             "solution_approach": parsed.solution_approach,
             "questions": questions,
         }

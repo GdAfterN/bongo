@@ -64,7 +64,8 @@ class FakeAlgorithmProvider(ConversationProvider):
         self.system = system
         self.messages = messages
         questions = []
-        topics = ["主要实现思路", "复杂度与边界"]
+        topics = ["主要实现思路", "数据结构", "边界条件"]
+        focuses = ["main_approach", "data_structure", "boundary"]
         for index, topic in enumerate(topics):
             questions.append(
                 {
@@ -78,6 +79,7 @@ class FakeAlgorithmProvider(ConversationProvider):
                     ),
                     "evidence": "题解使用哈希表保存已经遍历的值及其索引。",
                     "topic": topic,
+                    "focus": focuses[index],
                 }
             )
         return {
@@ -316,15 +318,16 @@ def test_algorithm_knowledge_records_problem_and_generates_detailed_questions(tm
         source = database.get_source(result["source_id"])
         questions = database.list_questions(result["source_id"])
 
-        assert result["questions"] == 2
+        assert result["questions"] == 3
         assert source["knowledge_type"] == "code"
         assert source["problem_title"] == "两数之和"
+        assert source["problem_statement"].startswith("题目名称：两数之和\n\n算法题简要摘要：")
         assert "返回和为目标值" in source["problem_statement"]
         assert "时间 O(n)" in source["solution_approach"]
-        assert len(questions) == 2
+        assert len(questions) == 3
         assert all(len(question["explanation"]) >= 40 for question in questions)
         assert "主要实现思路" in provider.system
-        assert "1 到 2 道" in provider.system
+        assert "固定生成 3 道" in provider.system
         assert "哈希表" in provider.system
         assert "题解文件：two-sum.md" in provider.messages[0]["content"]
     finally:
@@ -360,12 +363,49 @@ def test_same_material_can_be_imported_into_both_knowledge_modules(tmp_path):
         database.close()
 
 
+def test_existing_algorithm_source_with_old_question_count_is_reprocessed(tmp_path):
+    solution = tmp_path / "two-sum.md"
+    solution.write_text(
+        "两数之和：遍历数组，用哈希表保存已经出现的值和下标，并查找目标值对应的补数。",
+        encoding="utf-8",
+    )
+    database = StudyDatabase(tmp_path / "study.db")
+    try:
+        source_id, _ = database.add_source(solution, solution.read_text(encoding="utf-8"), "code")
+        database.replace_chunks(source_id, [{"heading": "题解", "content": solution.read_text(encoding="utf-8")}])
+        database.add_questions(
+            source_id,
+            [
+                {
+                    "question": "旧版本为什么使用哈希表完成补数查找？",
+                    "options": ["快速查找", "排序", "递归", "回溯"],
+                    "correct_index": 0,
+                    "explanation": "旧版本题目。",
+                    "evidence": "使用哈希表。",
+                    "topic": "旧版本",
+                }
+            ],
+        )
+        database.set_source_status(source_id, "ready")
+
+        result = KnowledgeIngestor(database, FakeAlgorithmProvider()).ingest(solution, "code")
+
+        assert result["created"] is False
+        assert result["reprocessed"] is True
+        assert result["questions"] == 3
+        assert len(database.list_questions(source_id)) == 3
+    finally:
+        database.close()
+
+
 def test_algorithm_prompt_requires_rationale_and_alternative_analysis():
     prompt = algorithm_study_system_prompt()
     assert "为什么不适合" in prompt
     assert "时间与空间复杂度" in prompt
     assert "两数之和" in prompt
-    assert "第 1 题必须直接检验整道题的主要实现思路" in prompt
+    assert "第 1 题的 focus 必须是 main_approach" in prompt
+    assert "第 2 题的 focus 必须是 data_structure" in prompt
+    assert "第 3 题的 focus 必须是 boundary" in prompt
     assert "不得调用你记忆中的同名题目" in prompt
     assert "材料没有提供的信息必须明确说明未提供" in prompt
 

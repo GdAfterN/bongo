@@ -283,7 +283,7 @@ class MainWindow(QMainWindow):
         )
         code_module, self.code_source_table, self.code_import_button = create_module(
             "code",
-            "导入算法题题干、题解或代码，提取题名、题干和解题思路并生成 1 到 2 道速习题。",
+            "导入算法题题解或代码，提取中文题名和摘要，生成主思路、数据结构、边界三道题。",
             "导入代码知识",
             ["题名", "文件名", "上传时间", "题目数量", "题库"],
         )
