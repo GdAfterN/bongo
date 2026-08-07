@@ -263,13 +263,25 @@ class MainWindow(QMainWindow):
         filters = QHBoxLayout()
         self.practice_source_combo = QComboBox()
         self.practice_source_combo.addItem("全部文档", None)
-        self.practice_mode_combo = QComboBox()
-        self.practice_mode_combo.addItem("全部题目", False)
-        self.practice_mode_combo.addItem("错题复习", True)
-        self.practice_source_combo.currentIndexChanged.connect(self._practice_filter_changed)
-        self.practice_mode_combo.currentIndexChanged.connect(self._practice_filter_changed)
         filters.addWidget(self.practice_source_combo, 1)
-        filters.addWidget(self.practice_mode_combo)
+        self.practice_mode_group = QButtonGroup(self)
+        self.practice_mode_group.setExclusive(True)
+        self.practice_mode_buttons: dict[str, QPushButton] = {}
+        for mode, label in (("all", "全部题目"), ("wrong", "错题复习"), ("unanswered", "未回答")):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setMinimumWidth(112)
+            button.setStyleSheet(
+                "QPushButton{background:#e9edef;color:#30363d;}"
+                "QPushButton:hover{background:#dce2e5;}"
+                "QPushButton:checked{background:#268060;color:white;}"
+            )
+            self.practice_mode_group.addButton(button)
+            self.practice_mode_buttons[mode] = button
+            filters.addWidget(button)
+        self.practice_mode_buttons["all"].setChecked(True)
+        self.practice_source_combo.currentIndexChanged.connect(self._practice_filter_changed)
+        self.practice_mode_group.buttonClicked.connect(self._practice_filter_changed)
         card_layout.addLayout(filters)
         self.practice_source = QLabel("尚未加载题目")
         self.practice_source.setObjectName("muted")
@@ -386,6 +398,11 @@ class MainWindow(QMainWindow):
         self.pet_scale_spin.setRange(50, 200)
         self.pet_scale_spin.setSuffix("%")
         pet_form.addWidget(self.pet_scale_spin)
+        pet_form.addWidget(QLabel("题目气泡等待时间"))
+        self.pet_question_timeout_spin = QSpinBox()
+        self.pet_question_timeout_spin.setRange(10, 300)
+        self.pet_question_timeout_spin.setSuffix(" 秒")
+        pet_form.addWidget(self.pet_question_timeout_spin)
         pet_save = QPushButton("应用桌宠设置")
         pet_save.clicked.connect(self.save_pet_settings)
         pet_form.addWidget(pet_save, 0, Qt.AlignmentFlag.AlignRight)
@@ -433,6 +450,7 @@ class MainWindow(QMainWindow):
 
     def _connect_pet(self):
         self.pet.answer_selected.connect(self.answer_from_pet)
+        self.pet.question_unanswered.connect(self.question_unanswered_from_pet)
 
     def show_page(self, index: int, title: str):
         self.pages.setCurrentIndex(index)
@@ -628,9 +646,25 @@ class MainWindow(QMainWindow):
         self.refresh_sources()
         self.load_next_practice()
 
-    def _practice_filter_changed(self) -> None:
+    def _practice_filter_changed(self, *_args) -> None:
         self.current_practice_question = None
         self.load_next_practice(advance=False)
+
+    def _practice_mode(self) -> str:
+        for mode, button in self.practice_mode_buttons.items():
+            if button.isChecked():
+                return mode
+        return "all"
+
+    def _refresh_practice_mode_labels(self, source_id: int | None) -> None:
+        counts = {
+            "all": len(self.service.database.list_questions(source_id=source_id)),
+            "wrong": len(self.service.database.list_wrong_questions(source_id=source_id)),
+            "unanswered": len(self.service.database.list_unanswered_questions(source_id=source_id)),
+        }
+        labels = {"all": "全部题目", "wrong": "错题复习", "unanswered": "未回答"}
+        for mode, button in self.practice_mode_buttons.items():
+            button.setText(f"{labels[mode]} ({counts[mode]})")
 
     def load_next_practice(self, advance: bool = False):
         previous_id = (
@@ -639,17 +673,29 @@ class MainWindow(QMainWindow):
             else None
         )
         source_id = self.practice_source_combo.currentData()
-        wrong_only = bool(self.practice_mode_combo.currentData())
+        mode = self._practice_mode()
+        wrong_only = mode == "wrong"
+        unanswered_only = mode == "unanswered"
+        self._refresh_practice_mode_labels(source_id)
         question = self.service.database.next_question(
             exclude_id=previous_id,
             source_id=source_id,
             wrong_only=wrong_only,
+            unanswered_only=unanswered_only,
         )
         no_alternative = False
         if question is None and previous_id is not None:
             previous = self.service.database.get_question(previous_id)
             if previous and (source_id is None or previous["source_id"] == source_id):
-                if not wrong_only or previous["ask_count"] > previous["correct_count"]:
+                matches_mode = mode == "all" or (
+                    wrong_only and previous["ask_count"] > previous["correct_count"]
+                )
+                if unanswered_only:
+                    matches_mode = any(
+                        item["id"] == previous_id
+                        for item in self.service.database.list_unanswered_questions(source_id)
+                    )
+                if matches_mode:
                     question = previous
                     no_alternative = True
         self.current_practice_question = question
@@ -661,7 +707,12 @@ class MainWindow(QMainWindow):
         self.practice_feedback.clear()
         if not question:
             self.practice_source.setText("当前范围没有可练习的题目")
-            self.practice_prompt.setText("可切换文档或练习模式。")
+            empty_messages = {
+                "all": "请先导入知识文档并生成题目。",
+                "wrong": "还没有错题。答错的题目会自动沉淀在这里。",
+                "unanswered": "还没有未回答题目。桌宠题目气泡超时后会加入这里。",
+            }
+            self.practice_prompt.setText(empty_messages[mode])
             self.submit_answer_button.setEnabled(False)
             self.next_question_button.setEnabled(False)
             return
@@ -688,10 +739,21 @@ class MainWindow(QMainWindow):
         self.practice_feedback.setStyleSheet(f"color:{color};font-weight:600;padding:10px 0;")
         self.practice_feedback.setText(prefix + "\n" + question["explanation"])
         self.submit_answer_button.setEnabled(False)
+        self._refresh_practice_mode_labels(self.practice_source_combo.currentData())
 
     def answer_from_pet(self, question_id: int, selected_index: int):
         result = self.service.database.answer_question(question_id, selected_index)
         self.pet.set_answer_feedback(result["correct"], result["question"]["explanation"])
+        self._refresh_practice_mode_labels(self.practice_source_combo.currentData())
+
+    def question_unanswered_from_pet(self, question_id: int) -> None:
+        created = self.service.database.mark_question_unanswered(question_id)
+        self._refresh_practice_mode_labels(self.practice_source_combo.currentData())
+        if created:
+            self.statusBar().showMessage("题目气泡已超时，已加入未回答列表", 6000)
+        if self.pages.currentIndex() == 2 and self._practice_mode() == "unanswered":
+            self.current_practice_question = None
+            self.load_next_practice()
 
     def load_settings(self):
         config = self.service.provider_config()
@@ -719,6 +781,9 @@ class MainWindow(QMainWindow):
             control.setChecked(database.get_setting(key, default) == "1")
         self.pet_opacity_slider.setValue(int(database.get_setting("pet_opacity", "100")))
         self.pet_scale_spin.setValue(int(database.get_setting("pet_scale", "100")))
+        self.pet_question_timeout_spin.setValue(
+            int(database.get_setting("pet_question_timeout", "45"))
+        )
         self.pet.apply_settings(self._pet_settings_from_ui(), update_visibility=False)
         if not self.pet_enabled:
             self.pet.hide()
@@ -751,6 +816,7 @@ class MainWindow(QMainWindow):
             mouse_mirror=self.pet_mouse_mirror_check.isChecked(),
             keyboard_enabled=self.pet_keyboard_check.isChecked(),
             mouse_enabled=self.pet_mouse_check.isChecked(),
+            question_timeout=self.pet_question_timeout_spin.value(),
         )
 
     def save_pet_settings(self):
@@ -766,6 +832,7 @@ class MainWindow(QMainWindow):
             "pet_mouse_mirror": settings.mouse_mirror,
             "pet_keyboard_enabled": settings.keyboard_enabled,
             "pet_mouse_enabled": settings.mouse_enabled,
+            "pet_question_timeout": settings.question_timeout,
         }
         for key, value in values.items():
             self.service.database.set_setting(key, str(int(value)) if isinstance(value, bool) else str(value))

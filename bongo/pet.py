@@ -173,16 +173,19 @@ class PetSettings:
     mouse_mirror: bool = False
     keyboard_enabled: bool = True
     mouse_enabled: bool = True
+    question_timeout: int = 45
 
 
 class PetWindow(QWidget):
     answer_selected = Signal(int, int)
+    question_unanswered = Signal(int)
     position_changed = Signal(int, int)
 
     def __init__(self, question_loader: Callable[[], dict | None] | None = None):
         super().__init__()
         self.question_loader = question_loader
         self.current_question: dict | None = None
+        self._question_pending = False
         self.pet_settings = PetSettings()
         self._drag_offset = QPoint()
         self.setObjectName("petWindow")
@@ -222,6 +225,12 @@ class PetWindow(QWidget):
         self.feedback_label.setWordWrap(True)
         bubble_layout.addWidget(self.feedback_label)
         self.bubble.hide()
+        self.question_timer = QTimer(self)
+        self.question_timer.setSingleShot(True)
+        self.question_timer.timeout.connect(self._expire_question)
+        self.message_timer = QTimer(self)
+        self.message_timer.setSingleShot(True)
+        self.message_timer.timeout.connect(self.bubble.hide)
         layout.addWidget(self.bubble)
         self.canvas = BongoCatView()
         layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
@@ -257,6 +266,8 @@ class PetWindow(QWidget):
         self.canvas.set_mirrored(settings.model_mirror)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, settings.always_on_top)
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, settings.pass_through)
+        if self._question_pending:
+            self.question_timer.start(max(1, settings.question_timeout) * 1000)
         if update_visibility:
             self.setVisible(settings.visible)
         elif was_visible:
@@ -282,7 +293,11 @@ class PetWindow(QWidget):
             self.canvas.set_mouse_button(button, pressed)
 
     def show_question(self, question: dict) -> None:
+        if self._question_pending:
+            self._expire_question()
+        self.message_timer.stop()
         self.current_question = question
+        self._question_pending = True
         self.question_label.setText(question["prompt"])
         for index, option in enumerate(question["options"]):
             self.option_buttons[index].setText(f"{chr(65 + index)}. {option}")
@@ -290,29 +305,52 @@ class PetWindow(QWidget):
             self.option_buttons[index].setEnabled(True)
         self.feedback_label.clear()
         self.bubble.show()
+        self.question_timer.start(max(1, self.pet_settings.question_timeout) * 1000)
         self.canvas.react("thinking")
 
     def show_message(self, message: str, timeout_ms: int = 5000) -> None:
+        if self._question_pending:
+            self._expire_question()
+        self.question_timer.stop()
+        self.message_timer.stop()
         self.current_question = None
         self.question_label.setText(message)
         for button in self.option_buttons:
             button.hide()
         self.feedback_label.clear()
         self.bubble.show()
-        QTimer.singleShot(timeout_ms, self.bubble.hide)
+        self.message_timer.start(max(1, timeout_ms))
 
     def set_answer_feedback(self, correct: bool, explanation: str) -> None:
+        self.message_timer.stop()
         color = "#176b4d" if correct else "#a33d39"
         self.feedback_label.setStyleSheet(f"color:{color};font-weight:600;")
         self.feedback_label.setText(("答对了。" if correct else "再想一想。") + explanation)
         for button in self.option_buttons:
             button.hide()
         self.canvas.react("left" if correct else "thinking")
-        QTimer.singleShot(7000, self.bubble.hide)
+        self.message_timer.start(7000)
 
     def _answer(self, selected_index: int) -> None:
-        if self.current_question:
-            self.answer_selected.emit(int(self.current_question["id"]), selected_index)
+        if not self.current_question or not self._question_pending:
+            return
+        question_id = int(self.current_question["id"])
+        self._question_pending = False
+        self.current_question = None
+        self.question_timer.stop()
+        for button in self.option_buttons:
+            button.setEnabled(False)
+        self.answer_selected.emit(question_id, selected_index)
+
+    def _expire_question(self) -> None:
+        if not self.current_question or not self._question_pending:
+            return
+        question_id = int(self.current_question["id"])
+        self._question_pending = False
+        self.current_question = None
+        self.question_timer.stop()
+        self.bubble.hide()
+        self.question_unanswered.emit(question_id)
 
     def _follow_mouse(self, x: float, y: float) -> None:
         if not self.pet_settings.mouse_enabled:

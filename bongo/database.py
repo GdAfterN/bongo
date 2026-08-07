@@ -102,10 +102,20 @@ class StudyDatabase:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS unanswered_questions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id, position);
                 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(source_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_attempts_question ON question_attempts(question_id, id);
+                CREATE INDEX IF NOT EXISTS idx_unanswered_question ON unanswered_questions(question_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unanswered_open
+                    ON unanswered_questions(question_id) WHERE resolved_at IS NULL;
                 """
             )
             conversation_columns = {
@@ -281,7 +291,12 @@ class StudyDatabase:
             ).fetchone()
         return self._question(row)
 
-    def list_questions(self, source_id: int | None = None, wrong_only: bool = False) -> list[dict]:
+    def list_questions(
+        self,
+        source_id: int | None = None,
+        wrong_only: bool = False,
+        unanswered_only: bool = False,
+    ) -> list[dict]:
         conditions = []
         parameters: list[object] = []
         if source_id is not None:
@@ -289,6 +304,11 @@ class StudyDatabase:
             parameters.append(source_id)
         if wrong_only:
             conditions.append("q.ask_count > q.correct_count")
+        if unanswered_only:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM unanswered_questions u "
+                "WHERE u.question_id = q.id AND u.resolved_at IS NULL)"
+            )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             rows = self.conn.execute(
@@ -303,6 +323,7 @@ class StudyDatabase:
         exclude_id: int | None = None,
         source_id: int | None = None,
         wrong_only: bool = False,
+        unanswered_only: bool = False,
     ) -> dict | None:
         conditions = []
         parameters: list[object] = []
@@ -314,6 +335,11 @@ class StudyDatabase:
             parameters.append(source_id)
         if wrong_only:
             conditions.append("q.ask_count > q.correct_count")
+        if unanswered_only:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM unanswered_questions u "
+                "WHERE u.question_id = q.id AND u.resolved_at IS NULL)"
+            )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             row = self.conn.execute(
@@ -335,21 +361,40 @@ class StudyDatabase:
         if not question:
             raise KeyError(f"Question {question_id} does not exist")
         correct = int(selected_index) == int(question["correct_index"])
+        now = utc_now()
         with self._lock, self.conn:
             self.conn.execute(
                 "UPDATE questions SET ask_count = ask_count + 1, "
                 "correct_count = correct_count + ?, last_asked_at = ? WHERE id = ?",
-                (1 if correct else 0, utc_now(), question_id),
+                (1 if correct else 0, now, question_id),
             )
             self.conn.execute(
                 "INSERT INTO question_attempts(question_id, selected_index, is_correct, created_at) "
                 "VALUES(?, ?, ?, ?)",
-                (question_id, int(selected_index), 1 if correct else 0, utc_now()),
+                (question_id, int(selected_index), 1 if correct else 0, now),
+            )
+            self.conn.execute(
+                "UPDATE unanswered_questions SET resolved_at = ? "
+                "WHERE question_id = ? AND resolved_at IS NULL",
+                (now, question_id),
             )
         return {"correct": correct, "question": question}
 
     def list_wrong_questions(self, source_id: int | None = None) -> list[dict]:
         return self.list_questions(source_id=source_id, wrong_only=True)
+
+    def mark_question_unanswered(self, question_id: int) -> bool:
+        if not self.get_question(question_id):
+            raise KeyError(f"Question {question_id} does not exist")
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "INSERT OR IGNORE INTO unanswered_questions(question_id, created_at) VALUES(?, ?)",
+                (question_id, utc_now()),
+            )
+        return cursor.rowcount > 0
+
+    def list_unanswered_questions(self, source_id: int | None = None) -> list[dict]:
+        return self.list_questions(source_id=source_id, unanswered_only=True)
 
     def list_attempts(self, question_id: int | None = None) -> list[dict]:
         with self._lock:

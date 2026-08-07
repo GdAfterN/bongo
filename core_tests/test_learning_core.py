@@ -210,6 +210,13 @@ def test_question_rotation_and_wrong_answer_history(tmp_path):
         assert result["correct"] is False
         assert [item["id"] for item in database.list_wrong_questions()] == [question_ids[0]]
         assert database.list_attempts(question_ids[0])[0]["selected_index"] == 1
+
+        assert database.mark_question_unanswered(question_ids[1]) is True
+        assert database.mark_question_unanswered(question_ids[1]) is False
+        assert [item["id"] for item in database.list_unanswered_questions()] == [question_ids[1]]
+        assert database.next_question(unanswered_only=True)["id"] == question_ids[1]
+        database.answer_question(question_ids[1], 0)
+        assert database.list_unanswered_questions() == []
     finally:
         database.close()
 

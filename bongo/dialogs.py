@@ -34,8 +34,9 @@ class QuestionBankDialog(QDialog):
         bar.addWidget(QLabel(source.get("name", "题库")))
         bar.addStretch()
         self.filter_combo = QComboBox()
-        self.filter_combo.addItem("全部题目", False)
-        self.filter_combo.addItem("错题", True)
+        self.filter_combo.addItem("全部题目", "all")
+        self.filter_combo.addItem("错题", "wrong")
+        self.filter_combo.addItem("未回答", "unanswered")
         self.filter_combo.currentIndexChanged.connect(self.refresh)
         bar.addWidget(self.filter_combo)
         layout.addLayout(bar)
@@ -59,9 +60,13 @@ class QuestionBankDialog(QDialog):
         layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
         self.refresh()
 
-    def refresh(self) -> None:
-        wrong_only = bool(self.filter_combo.currentData())
-        self.questions = self.database.list_questions(self.source_id, wrong_only=wrong_only)
+    def refresh(self, *_args) -> None:
+        mode = str(self.filter_combo.currentData())
+        self.questions = self.database.list_questions(
+            self.source_id,
+            wrong_only=mode == "wrong",
+            unanswered_only=mode == "unanswered",
+        )
         self.table.setRowCount(len(self.questions))
         for row, question in enumerate(self.questions):
             asked = int(question["ask_count"])
