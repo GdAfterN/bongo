@@ -1,17 +1,6 @@
-from .cli import build_agent, build_arg_parser, build_welcome, main
-from .models import AnthropicCompatibleModelClient, FakeModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import MiniAgent, bongo, SessionStore
+"""Bongo Study desktop learning companion."""
 
-__all__ = [
-    "AnthropicCompatibleModelClient",
-    "FakeModelClient",
-    "bongo",
-    "build_agent",
-    "build_arg_parser",
-    "build_welcome",
-    "main",
-    "MiniAgent",
-    "OllamaModelClient",
-    "OpenAICompatibleModelClient",
-    "SessionStore",
-]
+from .service import LearningService
+
+__all__ = ["LearningService"]
+__version__ = "0.2.0"

@@ -35,6 +35,8 @@ htmlcov/
 tmp/
 .worktrees/
 .bongo/
+.bongo-local/
+.bongo-smoke/
 artifacts/
 readme_intro_locked/
 tests/results/
