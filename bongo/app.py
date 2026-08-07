@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import faulthandler
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -917,6 +919,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _instance_name(data_dir: Path) -> str:
+    digest = hashlib.sha256(str(data_dir.resolve()).encode("utf-8")).hexdigest()[:16]
+    return f"BongoStudy-{digest}"
+
+
+def _notify_existing_instance(name: str) -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    if not socket.waitForConnected(300):
+        return False
+    socket.write(b"show")
+    socket.flush()
+    socket.waitForBytesWritten(300)
+    socket.disconnectFromServer()
+    return True
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.smoke_test:
@@ -928,6 +947,19 @@ def main(argv=None) -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(APP_STYLE)
     service = LearningService(args.data_dir)
+    instance_name = _instance_name(service.data_dir)
+    if _notify_existing_instance(instance_name):
+        service.close()
+        return 0
+    instance_server = QLocalServer(app)
+    if not instance_server.listen(instance_name):
+        if _notify_existing_instance(instance_name):
+            service.close()
+            return 0
+        QLocalServer.removeServer(instance_name)
+        if not instance_server.listen(instance_name):
+            service.close()
+            raise RuntimeError(f"无法创建单实例服务：{instance_server.errorString()}")
     crash_log = (service.data_dir / "crash.log").open("a", encoding="utf-8")
     faulthandler.enable(crash_log)
     pet = PetWindow(service.database.next_question)
@@ -937,6 +969,14 @@ def main(argv=None) -> int:
         start_hidden=args.smoke_test,
         pet_enabled=not args.no_pet and not args.smoke_test,
     )
+
+    def activate_existing_window() -> None:
+        while instance_server.hasPendingConnections():
+            connection = instance_server.nextPendingConnection()
+            window.show_and_raise()
+            connection.disconnectFromServer()
+
+    instance_server.newConnection.connect(activate_existing_window)
     if not args.no_pet and not args.smoke_test:
         if not service.database.get_setting("pet_x", ""):
             screen = app.primaryScreen().availableGeometry()
