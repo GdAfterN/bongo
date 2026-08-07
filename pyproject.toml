@@ -18,6 +18,9 @@ dependencies = [
 [project.scripts]
 bongo = "bongo.app:main"
 
+[project.gui-scripts]
+bongo-study = "bongo.app:main"
+
 [dependency-groups]
 dev = [
   "pytest>=8.3.5",
@@ -29,6 +32,8 @@ packages = ["bongo"]
 
 [tool.setuptools.package-data]
 bongo = [
+  "assets/app-icon.ico",
+  "assets/app-icon.png",
   "assets/bongocat/*",
   "assets/bongocat/model/*",
   "assets/bongocat/model/demomodel.1024/*",

@@ -49,10 +49,13 @@ python -m pip install -e .
 python -m bongo
 ```
 
-也可以使用安装后的命令：
+安装完成后，可以直接双击项目根目录的 `Bongo Study.pyw` 启动桌面端。该入口使用 `pythonw`，不会保留 PowerShell 或命令行窗口。
+
+也可以使用安装后的命令；其中 `bongo-study` 是无控制台的 Windows GUI 入口：
 
 ```powershell
 bongo
+bongo-study
 ```
 
 常用启动参数：

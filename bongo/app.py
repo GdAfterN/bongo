@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import html
 import faulthandler
@@ -12,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -51,6 +52,9 @@ from .pet import PetSettings, PetWindow
 from .providers import available_chat_backends, chat_backend_available, available_providers
 from .service import LearningService
 from .styles import APP_STYLE
+
+
+APP_ICON_PATH = Path(__file__).parent / "assets" / "app-icon.ico"
 
 
 class WorkerSignals(QObject):
@@ -432,7 +436,9 @@ class MainWindow(QMainWindow):
     def _build_tray(self):
         self.tray = QSystemTrayIcon(self)
         self.tray.setToolTip("Bongo Study")
-        icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        icon = QIcon(str(APP_ICON_PATH))
+        if icon.isNull():
+            icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
         self.setWindowIcon(icon)
         self.tray.setIcon(icon)
         menu = QMenu()
@@ -964,9 +970,15 @@ def main(argv=None) -> int:
     if args.smoke_test:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         os.environ["BONGO_DISABLE_GLOBAL_INPUT"] = "1"
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BongoStudy.Desktop")
+        except OSError:
+            pass
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("Bongo Study")
     app.setOrganizationName("Bongo Study")
+    app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(APP_STYLE)
     service = LearningService(args.data_dir)
