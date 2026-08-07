@@ -66,8 +66,8 @@ class LearningService:
     def _provider(self):
         return build_provider(self.provider_config(), cwd=self.data_dir)
 
-    def ingest(self, path: str | Path) -> dict:
-        return KnowledgeIngestor(self.database, self._provider()).ingest(path)
+    def ingest(self, path: str | Path, knowledge_type: str = "document") -> dict:
+        return KnowledgeIngestor(self.database, self._provider()).ingest(path, knowledge_type)
 
     def start_conversation(
         self,

@@ -106,7 +106,7 @@ class MainWindow(QMainWindow):
         self.current_conversation_id: int | None = None
         self.current_source_id: int | None = None
         self.current_practice_question: dict | None = None
-        self.import_queue: deque[str] = deque()
+        self.import_queue: deque[tuple[str, str]] = deque()
         self.force_exit = False
         self.setWindowTitle("Bongo Study")
         self.setMinimumSize(980, 680)
@@ -232,31 +232,68 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 6, 0, 0)
-        bar = QHBoxLayout()
-        description = QLabel("导入 Markdown、文本或代码文件，Bongo 会立即生成练习题。")
-        description.setObjectName("muted")
-        self.import_button = QPushButton("导入知识")
-        self.import_button.clicked.connect(self.choose_knowledge_files)
-        self.delete_source_button = QPushButton("删除")
-        self.delete_source_button.setProperty("danger", True)
-        self.delete_source_button.clicked.connect(self.delete_selected_source)
-        bar.addWidget(description)
-        bar.addStretch()
-        bar.addWidget(self.delete_source_button)
-        bar.addWidget(self.import_button)
-        layout.addLayout(bar)
-        table_panel = panel()
-        table_layout = QVBoxLayout(table_panel)
-        self.source_table = QTableWidget(0, 4)
-        self.source_table.setHorizontalHeaderLabels(["文件名", "上传时间", "题目数量", "题库"])
-        self.source_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.source_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.source_table.verticalHeader().setVisible(False)
-        self.source_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in range(1, 4):
-            self.source_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        table_layout.addWidget(self.source_table)
-        layout.addWidget(table_panel, 1)
+        self.knowledge_tabs = QTabWidget()
+
+        def create_module(
+            knowledge_type: str,
+            description_text: str,
+            button_text: str,
+            headers: list[str],
+        ) -> tuple[QWidget, QTableWidget, QPushButton]:
+            module = QWidget()
+            module_layout = QVBoxLayout(module)
+            module_layout.setContentsMargins(0, 10, 0, 0)
+            bar = QHBoxLayout()
+            description = QLabel(description_text)
+            description.setObjectName("muted")
+            import_button = QPushButton(button_text)
+            import_button.clicked.connect(
+                lambda _checked=False, current=knowledge_type: self.choose_knowledge_files(current)
+            )
+            delete_button = QPushButton("删除")
+            delete_button.setProperty("danger", True)
+            bar.addWidget(description)
+            bar.addStretch()
+            bar.addWidget(delete_button)
+            bar.addWidget(import_button)
+            module_layout.addLayout(bar)
+
+            table = QTableWidget(0, len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            for column in range(1, len(headers)):
+                table.horizontalHeader().setSectionResizeMode(
+                    column,
+                    QHeaderView.ResizeMode.ResizeToContents,
+                )
+            delete_button.clicked.connect(
+                lambda _checked=False, current=table: self.delete_selected_source(current)
+            )
+            module_layout.addWidget(table, 1)
+            return module, table, import_button
+
+        document_module, self.document_source_table, self.document_import_button = create_module(
+            "document",
+            "导入文档资料，按概念、论点、步骤和因果关系生成练习题。",
+            "导入文档知识",
+            ["文件名", "上传时间", "题目数量", "题库"],
+        )
+        code_module, self.code_source_table, self.code_import_button = create_module(
+            "code",
+            "导入算法题题干、题解或代码，提取题名、题干和解题思路并生成 1 到 2 道速习题。",
+            "导入代码知识",
+            ["题名", "文件名", "上传时间", "题目数量", "题库"],
+        )
+        self.import_buttons = {
+            "document": self.document_import_button,
+            "code": self.code_import_button,
+        }
+        self.knowledge_tabs.addTab(document_module, "文档知识")
+        self.knowledge_tabs.addTab(code_module, "代码知识")
+        layout.addWidget(self.knowledge_tabs, 1)
         return page
 
     def _practice_page(self) -> QWidget:
@@ -482,26 +519,56 @@ class MainWindow(QMainWindow):
 
     def refresh_sources(self):
         sources = self.service.database.list_sources()
-        self.source_table.setRowCount(len(sources))
+        document_sources = [source for source in sources if source["knowledge_type"] == "document"]
+        code_sources = [source for source in sources if source["knowledge_type"] == "code"]
+        self._populate_source_table(self.document_source_table, document_sources, "document")
+        self._populate_source_table(self.code_source_table, code_sources, "code")
+        self._refresh_source_selectors(sources)
+
+    def _populate_source_table(
+        self,
+        table: QTableWidget,
+        sources: list[dict],
+        knowledge_type: str,
+    ) -> None:
+        table.setRowCount(len(sources))
         for row, source in enumerate(sources):
-            name = QTableWidgetItem(source["name"])
-            name.setData(Qt.ItemDataRole.UserRole, source["id"])
-            name.setToolTip(source["path"] + (f"\n{source['error']}" if source["error"] else ""))
+            primary_text = (
+                source.get("problem_title") or Path(source["name"]).stem
+                if knowledge_type == "code"
+                else source["name"]
+            )
+            primary = QTableWidgetItem(primary_text)
+            primary.setData(Qt.ItemDataRole.UserRole, source["id"])
+            primary.setToolTip(source["path"] + (f"\n{source['error']}" if source["error"] else ""))
             try:
                 uploaded = datetime.fromisoformat(source["created_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
             except (TypeError, ValueError):
                 uploaded = source["created_at"]
-            values = [name, QTableWidgetItem(uploaded), QTableWidgetItem(str(source["question_count"]))]
+            if knowledge_type == "code":
+                values = [
+                    primary,
+                    QTableWidgetItem(source["name"]),
+                    QTableWidgetItem(uploaded),
+                    QTableWidgetItem(str(source["question_count"])),
+                ]
+                bank_column = 4
+            else:
+                values = [
+                    primary,
+                    QTableWidgetItem(uploaded),
+                    QTableWidgetItem(str(source["question_count"])),
+                ]
+                bank_column = 3
             for column, value in enumerate(values):
-                self.source_table.setItem(row, column, value)
+                table.setItem(row, column, value)
             bank_button = QPushButton("查看题库")
             bank_button.setProperty("secondary", True)
             bank_button.setEnabled(source["question_count"] > 0)
             bank_button.clicked.connect(
                 lambda _checked=False, source_id=source["id"]: self.open_question_bank(source_id)
             )
-            self.source_table.setCellWidget(row, 3, bank_button)
-        self._refresh_source_selectors(sources)
+            table.setCellWidget(row, bank_column, bank_button)
 
     def _refresh_source_selectors(self, sources: list[dict]) -> None:
         chat_selected = self.current_source_id
@@ -515,8 +582,9 @@ class MainWindow(QMainWindow):
         for source in sources:
             if source["status"] != "ready":
                 continue
-            self.chat_source_combo.addItem(source["name"], source["id"])
-            self.practice_source_combo.addItem(source["name"], source["id"])
+            label = source.get("problem_title") or source["name"]
+            self.chat_source_combo.addItem(label, source["id"])
+            self.practice_source_combo.addItem(label, source["id"])
         chat_index = self.chat_source_combo.findData(chat_selected)
         self.chat_source_combo.setCurrentIndex(max(0, chat_index))
         practice_index = self.practice_source_combo.findData(practice_selected)
@@ -607,28 +675,40 @@ class MainWindow(QMainWindow):
         self.chat_status.setText(f"回答已保存 · {result['backend']}")
         self.pet.canvas.react("left")
 
-    def choose_knowledge_files(self):
+    def choose_knowledge_files(self, knowledge_type: str):
         patterns = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_EXTENSIONS))
-        files, _ = QFileDialog.getOpenFileNames(self, "向 Bongo 喂食知识", "", f"知识文件 ({patterns});;所有文件 (*)")
+        title = "导入算法题题解" if knowledge_type == "code" else "导入文档知识"
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            title,
+            "",
+            f"知识文件 ({patterns});;所有文件 (*)",
+        )
         if not files:
             return
-        self.import_queue.extend(files)
-        if self.import_button.isEnabled():
+        self.import_queue.extend((path, knowledge_type) for path in files)
+        if all(button.isEnabled() for button in self.import_buttons.values()):
             self._ingest_next()
 
     def _ingest_next(self):
         if not self.import_queue:
-            self.import_button.setEnabled(True)
-            self.import_button.setText("导入知识")
+            self.document_import_button.setEnabled(True)
+            self.document_import_button.setText("导入文档知识")
+            self.code_import_button.setEnabled(True)
+            self.code_import_button.setText("导入代码知识")
             self.refresh_sources()
             self.load_next_practice()
             return
-        path = self.import_queue.popleft()
-        self.import_button.setEnabled(False)
-        self.import_button.setText("正在喂食...")
+        path, knowledge_type = self.import_queue.popleft()
+        self.document_import_button.setText("导入文档知识")
+        self.code_import_button.setText("导入代码知识")
+        for button in self.import_buttons.values():
+            button.setEnabled(False)
+        active_button = self.import_buttons[knowledge_type]
+        active_button.setText("正在拆解题解..." if knowledge_type == "code" else "正在解析文档...")
         self.statusBar().showMessage(f"正在解析并生成题目：{Path(path).name}")
         self.pet.show_message(f"正在学习 {Path(path).name} ...", 180000)
-        worker = Worker(self.service.ingest, path)
+        worker = Worker(self.service.ingest, path, knowledge_type)
         worker.signals.result.connect(lambda result, filename=Path(path).name: self._ingest_completed(filename, result))
         worker.signals.error.connect(self._show_error)
         worker.signals.finished.connect(self._ingest_next)
@@ -636,7 +716,8 @@ class MainWindow(QMainWindow):
 
     def _ingest_completed(self, filename: str, result: dict):
         if result["created"] or result.get("reprocessed"):
-            message = f"吃完了 {filename}，我整理出了 {result['questions']} 道题。"
+            subject = f"《{result['problem_title']}》" if result.get("problem_title") else filename
+            message = f"吃完了 {subject}，我整理出了 {result['questions']} 道题。"
         else:
             message = f"{filename} 已经吃过了，知识没有重复保存。"
         self.pet.show_message(message)
@@ -644,11 +725,11 @@ class MainWindow(QMainWindow):
         self.refresh_sources()
         QTimer.singleShot(4500, self.pet.show_next_question)
 
-    def delete_selected_source(self):
-        row = self.source_table.currentRow()
+    def delete_selected_source(self, table: QTableWidget):
+        row = table.currentRow()
         if row < 0:
             return
-        item = self.source_table.item(row, 0)
+        item = table.item(row, 0)
         if QMessageBox.question(self, "删除知识", f"删除 {item.text()} 及其生成的题目？") != QMessageBox.StandardButton.Yes:
             return
         self.service.database.delete_source(int(item.data(Qt.ItemDataRole.UserRole)))

@@ -56,16 +56,27 @@ Ground explanations in the exported material. Cite the source filename and secti
             [
                 f"## {source['name']}",
                 f"- Knowledge file: `knowledge/{filename}`",
+                f"- Knowledge type: {source['knowledge_type']}",
                 f"- Imported: {source['created_at']}",
                 f"- Questions: {question_count[source['id']]}",
                 f"- Current weak questions: {wrong_count[source['id']]}",
                 "",
             ]
         )
+        algorithm_metadata = ""
+        if source["knowledge_type"] == "code":
+            algorithm_metadata = (
+                f"## Problem\n\n{source['problem_statement']}\n\n"
+                f"## Solution approach\n\n{source['solution_approach']}\n\n"
+            )
+        title = source.get("problem_title") or source["name"]
         content = (
-            f"# {source['name']}\n\n"
+            f"# {title}\n\n"
             f"- Imported: {source['created_at']}\n"
-            f"- Type: {source['kind'] or 'text'}\n\n"
+            f"- Knowledge type: {source['knowledge_type']}\n"
+            f"- File type: {source['kind'] or 'text'}\n\n"
+            f"{algorithm_metadata}"
+            f"## Original material\n\n"
             f"{source['content']}\n"
         )
         (knowledge_dir / filename).write_text(content, encoding="utf-8")

@@ -30,6 +30,17 @@ class QuestionSet(BaseModel):
     questions: list[GeneratedQuestion] = Field(min_length=1, max_length=8)
 
 
+class GeneratedAlgorithmQuestion(GeneratedQuestion):
+    explanation: str = Field(min_length=40, max_length=3000)
+
+
+class AlgorithmStudySet(BaseModel):
+    problem_title: str = Field(min_length=1, max_length=200)
+    problem_statement: str = Field(min_length=10, max_length=5000)
+    solution_approach: str = Field(min_length=20, max_length=5000)
+    questions: list[GeneratedAlgorithmQuestion] = Field(min_length=1, max_length=2)
+
+
 QUESTION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -61,6 +72,43 @@ QUESTION_SCHEMA = {
         }
     },
     "required": ["questions"],
+}
+
+
+ALGORITHM_STUDY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "problem_title": {"type": "string"},
+        "problem_statement": {"type": "string"},
+        "solution_approach": {"type": "string"},
+        "questions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "items": {"type": "string"},
+                    },
+                    "correct_index": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "explanation": {"type": "string", "minLength": 40},
+                    "evidence": {"type": "string"},
+                    "topic": {"type": "string"},
+                },
+                "required": [
+                    "question", "options", "correct_index", "explanation", "evidence", "topic"
+                ],
+            },
+        },
+    },
+    "required": ["problem_title", "problem_statement", "solution_approach", "questions"],
 }
 
 
@@ -127,6 +175,24 @@ def question_system_prompt(suffix: str) -> str:
         "题目之间应覆盖不同知识点；错误选项应当合理但能被材料排除。"
         "evidence 必须引用或紧贴原文，explanation 要说明判断依据。"
         "所有内容使用与材料一致的主要语言。"
+    )
+
+
+def algorithm_study_system_prompt() -> str:
+    return (
+        "你是严谨的算法题助学设计器。输入是一道算法题的题干、题解或实现代码，"
+        "只能依据材料整理，不得调用你记忆中的同名题目来补全材料。题名可依据文件名或类名归纳；"
+        "题干、约束和示例只能记录材料明确给出的内容，代码行为可以标注为由实现归纳。材料没有"
+        "提供的信息必须明确说明未提供，不得虚构常见题目的默认条件。先提取 problem_title、"
+        "problem_statement 和 solution_approach：题干应完整说明输入、输出、约束和示例中"
+        "能够确认的信息；解题思路应说明所选算法或数据结构、核心不变量、执行步骤、"
+        "时间与空间复杂度以及边界处理。然后生成 1 到 2 道便于快速复习的四选一题，且每题只有"
+        "一个正确答案。第 1 题必须直接检验整道题的主要实现思路，包括采用的算法或数据结构及"
+        "关键执行过程；仅当复杂度、关键边界或易错实现点值得单独复习时生成第 2 题。不要把次要"
+        "细节拆成大量题目。explanation 必须详细说明正确选项为什么成立，并逐项解释其余"
+        "选项为什么不适合当前题目；例如两数之和使用哈希表时，应说明它通过 O(1) 平均查找"
+        "补数把双重循环降为一次遍历 O(n)，代价是 O(n) 额外空间。evidence 必须紧贴题干、"
+        "题解或代码。所有内容使用与材料一致的主要语言。"
     )
 
 
@@ -199,33 +265,57 @@ class KnowledgeIngestor:
         self.database = database
         self.provider = provider
 
-    def ingest(self, path: str | Path) -> dict:
+    def ingest(self, path: str | Path, knowledge_type: str = "document") -> dict:
+        if knowledge_type not in {"document", "code"}:
+            raise ValueError("知识类型必须是 document 或 code")
         file_path = Path(path)
         content = read_knowledge_file(file_path)
-        source_id, created = self.database.add_source(file_path, content)
+        source_id, created = self.database.add_source(file_path, content, knowledge_type)
         if not created:
             existing = next(item for item in self.database.list_sources() if item["id"] == source_id)
             if existing["status"] == "ready":
-                return {"source_id": source_id, "created": False, "questions": existing["question_count"]}
+                return {
+                    "source_id": source_id,
+                    "created": False,
+                    "questions": existing["question_count"],
+                    "problem_title": existing.get("problem_title", ""),
+                }
 
         try:
             self.database.set_source_status(source_id, "processing")
             chunks = split_knowledge(content, file_path.suffix.lower())
             chunk_ids = self.database.replace_chunks(source_id, chunks)
-            questions = self._generate_questions(
-                file_path.name,
-                file_path.suffix.lower(),
-                chunks,
-                chunk_ids,
-            )
+            if knowledge_type == "code":
+                study = self._generate_algorithm_study(
+                    file_path.name,
+                    chunks,
+                    chunk_ids,
+                )
+                self.database.set_source_algorithm_metadata(
+                    source_id,
+                    study["problem_title"],
+                    study["problem_statement"],
+                    study["solution_approach"],
+                )
+                questions = study["questions"]
+            else:
+                questions = self._generate_questions(
+                    file_path.name,
+                    file_path.suffix.lower(),
+                    chunks,
+                    chunk_ids,
+                )
             question_ids = self.database.add_questions(source_id, questions)
             self.database.set_source_status(source_id, "ready")
-            return {
+            result = {
                 "source_id": source_id,
                 "created": created,
                 "reprocessed": not created,
                 "questions": len(question_ids),
             }
+            if knowledge_type == "code":
+                result["problem_title"] = study["problem_title"]
+            return result
         except Exception as exc:
             self.database.set_source_status(source_id, "failed", str(exc)[:800])
             raise
@@ -273,3 +363,47 @@ class KnowledgeIngestor:
         if not result:
             raise ProviderError("模型没有生成可用的四选一题目")
         return result
+
+    def _generate_algorithm_study(
+        self,
+        source_name: str,
+        chunks: list[dict],
+        chunk_ids: list[int],
+    ) -> dict:
+        selected = chunks[:6]
+        material = "\n\n".join(
+            f"[片段 {index + 1} | {chunk.get('heading') or '未命名'}]\n{chunk['content']}"
+            for index, chunk in enumerate(selected)
+        )
+        try:
+            raw = self.provider.complete(
+                [{
+                    "role": "user",
+                    "content": (
+                        f"题解文件：{source_name}\n"
+                        "请提取题名、题干和完整解题思路，再生成针对这道算法题的练习。\n\n"
+                        f"{material}"
+                    ),
+                }],
+                algorithm_study_system_prompt(),
+                ALGORITHM_STUDY_SCHEMA,
+            )
+            parsed = AlgorithmStudySet.model_validate(raw)
+        except (ValidationError, ProviderError, TypeError, ValueError) as exc:
+            raise ProviderError(f"算法题题解拆解失败：{exc}") from exc
+
+        questions = []
+        for position, question in enumerate(parsed.questions):
+            if len(question.options) != 4 or len(set(question.options)) != 4:
+                continue
+            value = question.model_dump()
+            value["chunk_id"] = chunk_ids[min(position, len(chunk_ids) - 1)] if chunk_ids else None
+            questions.append(value)
+        if not questions:
+            raise ProviderError("模型没有生成可用的算法四选一题")
+        return {
+            "problem_title": parsed.problem_title,
+            "problem_statement": parsed.problem_statement,
+            "solution_approach": parsed.solution_approach,
+            "questions": questions,
+        }

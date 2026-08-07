@@ -26,12 +26,13 @@ class QuestionBankDialog(QDialog):
         self.source_id = source_id
         self.questions: list[dict] = []
         source = database.get_source(source_id) or {}
-        self.setWindowTitle(f"题库 · {source.get('name', '')}")
-        self.resize(900, 620)
+        display_name = source.get("problem_title") or source.get("name", "")
+        self.setWindowTitle(f"题库 · {display_name}")
+        self.resize(960, 760 if source.get("knowledge_type") == "code" else 620)
 
         layout = QVBoxLayout(self)
         bar = QHBoxLayout()
-        bar.addWidget(QLabel(source.get("name", "题库")))
+        bar.addWidget(QLabel(display_name or "题库"))
         bar.addStretch()
         self.filter_combo = QComboBox()
         self.filter_combo.addItem("全部题目", "all")
@@ -40,6 +41,18 @@ class QuestionBankDialog(QDialog):
         self.filter_combo.currentIndexChanged.connect(self.refresh)
         bar.addWidget(self.filter_combo)
         layout.addLayout(bar)
+
+        if source.get("knowledge_type") == "code":
+            statement = html.escape(source.get("problem_statement") or "尚未提取题干").replace("\n", "<br>")
+            approach = html.escape(source.get("solution_approach") or "尚未提取解题思路").replace("\n", "<br>")
+            summary = QTextBrowser()
+            summary.setMaximumHeight(220)
+            summary.setHtml(
+                f"<h3>{html.escape(display_name)}</h3>"
+                f"<p><b>题干</b><br>{statement}</p>"
+                f"<p><b>解题思路</b><br>{approach}</p>"
+            )
+            layout.addWidget(summary)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["题目", "主题", "作答", "正确率"])
@@ -94,6 +107,6 @@ class QuestionBankDialog(QDialog):
             options.append(f"<li>{chr(65 + index)}. {html.escape(option)}{marker}</li>")
         self.detail.setHtml(
             f"<h3>{html.escape(question['prompt'])}</h3><ol>{''.join(options)}</ol>"
-            f"<p><b>解析：</b>{html.escape(question['explanation'])}</p>"
-            f"<p><b>依据：</b>{html.escape(question['evidence'])}</p>"
+            f"<p><b>解析：</b>{html.escape(question['explanation']).replace(chr(10), '<br>')}</p>"
+            f"<p><b>依据：</b>{html.escape(question['evidence']).replace(chr(10), '<br>')}</p>"
         )

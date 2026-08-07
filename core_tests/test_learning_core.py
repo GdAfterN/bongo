@@ -6,7 +6,12 @@ import pytest
 
 from bongo.database import StudyDatabase
 from bongo.exporter import export_learning_skill
-from bongo.ingestion import KnowledgeIngestor, question_system_prompt, split_knowledge
+from bongo.ingestion import (
+    KnowledgeIngestor,
+    algorithm_study_system_prompt,
+    question_system_prompt,
+    split_knowledge,
+)
 from bongo.pet import GlobalInputMonitor
 from bongo.providers import (
     ClaudeCodeProvider,
@@ -48,6 +53,42 @@ class FakeProvider(ConversationProvider):
                 ]
             }
         return "三次握手用于同步连接双方的初始状态。[来源1]"
+
+
+class FakeAlgorithmProvider(ConversationProvider):
+    def __init__(self):
+        self.system = ""
+        self.messages = []
+
+    def complete(self, messages, system, response_schema=None):
+        self.system = system
+        self.messages = messages
+        questions = []
+        topics = ["主要实现思路", "复杂度与边界"]
+        for index, topic in enumerate(topics):
+            questions.append(
+                {
+                    "question": f"两数之和专项问题 {index + 1} 应如何判断？",
+                    "options": ["使用哈希表", "始终排序", "只比较相邻元素", "忽略补数"],
+                    "correct_index": 0,
+                    "explanation": (
+                        "哈希表能够在遍历当前元素时以平均 O(1) 时间检查补数是否已经出现，"
+                        "所以整体时间复杂度是 O(n)，代价是 O(n) 额外空间。排序会改变索引且需要"
+                        " O(n log n)，只比较相邻元素和忽略补数都不能覆盖一般输入。"
+                    ),
+                    "evidence": "题解使用哈希表保存已经遍历的值及其索引。",
+                    "topic": topic,
+                }
+            )
+        return {
+            "problem_title": "两数之和",
+            "problem_statement": "给定整数数组和目标值，返回和为目标值的两个元素下标。",
+            "solution_approach": (
+                "一次遍历数组，用哈希表记录值到索引的映射。对每个元素计算补数，"
+                "若补数已存在就返回两个下标；时间 O(n)，空间 O(n)。"
+            ),
+            "questions": questions,
+        }
 
 
 def test_ingestion_can_retry_after_model_failure(tmp_path):
@@ -251,6 +292,82 @@ def test_file_types_use_specialized_question_prompts():
     assert "调用关系、数据流" in code_prompt
     assert "字段语义、取值约束" in data_prompt
     assert len({document_prompt, code_prompt, data_prompt}) == 3
+
+
+def test_algorithm_knowledge_records_problem_and_generates_detailed_questions(tmp_path):
+    solution = tmp_path / "two-sum.md"
+    solution.write_text(
+        """# 两数之和
+
+给定整数数组 nums 和目标值 target，返回两个和为 target 的元素下标。
+
+## 题解
+
+遍历 nums。对当前值 x 计算补数 target - x，先检查补数是否已经在哈希表中；
+如果存在就返回补数的索引和当前索引，否则把 x 和当前索引加入哈希表。
+这样只需一次遍历，时间复杂度 O(n)，空间复杂度 O(n)。
+""",
+        encoding="utf-8",
+    )
+    database = StudyDatabase(tmp_path / "study.db")
+    provider = FakeAlgorithmProvider()
+    try:
+        result = KnowledgeIngestor(database, provider).ingest(solution, "code")
+        source = database.get_source(result["source_id"])
+        questions = database.list_questions(result["source_id"])
+
+        assert result["questions"] == 2
+        assert source["knowledge_type"] == "code"
+        assert source["problem_title"] == "两数之和"
+        assert "返回和为目标值" in source["problem_statement"]
+        assert "时间 O(n)" in source["solution_approach"]
+        assert len(questions) == 2
+        assert all(len(question["explanation"]) >= 40 for question in questions)
+        assert "主要实现思路" in provider.system
+        assert "1 到 2 道" in provider.system
+        assert "哈希表" in provider.system
+        assert "题解文件：two-sum.md" in provider.messages[0]["content"]
+    finally:
+        database.close()
+
+
+def test_same_material_can_be_imported_into_both_knowledge_modules(tmp_path):
+    database = StudyDatabase(tmp_path / "study.db")
+    material = "同一份材料可以按文档知识或算法题解使用，去重范围必须包含知识类型。"
+    try:
+        document_id, document_created = database.add_source(
+            tmp_path / "shared.md",
+            material,
+            "document",
+        )
+        code_id, code_created = database.add_source(
+            tmp_path / "shared.md",
+            material,
+            "code",
+        )
+        duplicate_id, duplicate_created = database.add_source(
+            tmp_path / "shared-copy.md",
+            material,
+            "code",
+        )
+
+        assert document_created is True
+        assert code_created is True
+        assert document_id != code_id
+        assert duplicate_created is False
+        assert duplicate_id == code_id
+    finally:
+        database.close()
+
+
+def test_algorithm_prompt_requires_rationale_and_alternative_analysis():
+    prompt = algorithm_study_system_prompt()
+    assert "为什么不适合" in prompt
+    assert "时间与空间复杂度" in prompt
+    assert "两数之和" in prompt
+    assert "第 1 题必须直接检验整道题的主要实现思路" in prompt
+    assert "不得调用你记忆中的同名题目" in prompt
+    assert "材料没有提供的信息必须明确说明未提供" in prompt
 
 
 def test_openai_provider_retries_one_empty_structured_response():

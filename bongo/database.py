@@ -46,6 +46,10 @@ class StudyDatabase:
                     kind TEXT NOT NULL,
                     content TEXT NOT NULL,
                     content_hash TEXT NOT NULL UNIQUE,
+                    knowledge_type TEXT NOT NULL DEFAULT 'document',
+                    problem_title TEXT NOT NULL DEFAULT '',
+                    problem_statement TEXT NOT NULL DEFAULT '',
+                    solution_approach TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'processing',
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
@@ -128,6 +132,40 @@ class StudyDatabase:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source_id, updated_at)"
             )
+            source_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(sources)").fetchall()
+            }
+            added_knowledge_type = "knowledge_type" not in source_columns
+            if added_knowledge_type:
+                self.conn.execute(
+                    "ALTER TABLE sources ADD COLUMN knowledge_type TEXT NOT NULL DEFAULT 'document'"
+                )
+            for column in ("problem_title", "problem_statement", "solution_approach"):
+                if column not in source_columns:
+                    self.conn.execute(
+                        f"ALTER TABLE sources ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+            if added_knowledge_type:
+                code_kinds = (
+                    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
+                    ".rs", ".c", ".h", ".cpp", ".hpp", ".cs", ".swift",
+                )
+                placeholders = ",".join("?" for _ in code_kinds)
+                self.conn.execute(
+                    f"UPDATE sources SET knowledge_type = 'code' WHERE kind IN ({placeholders})",
+                    code_kinds,
+                )
+                rows = self.conn.execute(
+                    "SELECT id, knowledge_type, content FROM sources"
+                ).fetchall()
+                for row in rows:
+                    digest = hashlib.sha256(
+                        f"{row['knowledge_type']}\0{row['content']}".encode("utf-8")
+                    ).hexdigest()
+                    self.conn.execute(
+                        "UPDATE sources SET content_hash = ? WHERE id = ?",
+                        (digest, row["id"]),
+                    )
             try:
                 self.conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
@@ -149,9 +187,16 @@ class StudyDatabase:
                 (key, str(value)),
             )
 
-    def add_source(self, path: str | Path, content: str) -> tuple[int, bool]:
+    def add_source(
+        self,
+        path: str | Path,
+        content: str,
+        knowledge_type: str = "document",
+    ) -> tuple[int, bool]:
+        if knowledge_type not in {"document", "code"}:
+            raise ValueError("知识类型必须是 document 或 code")
         source_path = Path(path).resolve()
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{knowledge_type}\0{content}".encode("utf-8")).hexdigest()
         with self._lock, self.conn:
             row = self.conn.execute(
                 "SELECT id FROM sources WHERE content_hash = ?", (digest,)
@@ -159,11 +204,28 @@ class StudyDatabase:
             if row:
                 return int(row["id"]), False
             cursor = self.conn.execute(
-                "INSERT INTO sources(path, name, kind, content, content_hash, created_at) "
-                "VALUES(?, ?, ?, ?, ?, ?)",
-                (str(source_path), source_path.name, source_path.suffix.lower(), content, digest, utc_now()),
+                "INSERT INTO sources(path, name, kind, content, content_hash, knowledge_type, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(source_path), source_path.name, source_path.suffix.lower(), content,
+                    digest, knowledge_type, utc_now(),
+                ),
             )
             return int(cursor.lastrowid), True
+
+    def set_source_algorithm_metadata(
+        self,
+        source_id: int,
+        problem_title: str,
+        problem_statement: str,
+        solution_approach: str,
+    ) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE sources SET problem_title = ?, problem_statement = ?, "
+                "solution_approach = ? WHERE id = ?",
+                (problem_title, problem_statement, solution_approach, source_id),
+            )
 
     def set_source_status(self, source_id: int, status: str, error: str = "") -> None:
         with self._lock, self.conn:
