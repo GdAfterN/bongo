@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from .database import StudyDatabase
-from .exporter import export_learning_skill
+from .exporter import export_saved_learning_skill, learning_skill_preview
 from .ingestion import KnowledgeIngestor
 from .memory import ConversationContext
 from .providers import (
@@ -67,7 +67,15 @@ class LearningService:
         return build_provider(self.provider_config(), cwd=self.data_dir)
 
     def ingest(self, path: str | Path, knowledge_type: str = "document") -> dict:
-        return KnowledgeIngestor(self.database, self._provider()).ingest(path, knowledge_type)
+        result = KnowledgeIngestor(self.database, self._provider()).ingest(path, knowledge_type)
+        self.database.record_learning_event(
+            "knowledge_imported",
+            f"source:{result['source_id']}:imported",
+            source_id=int(result["source_id"]),
+            value=1,
+            metadata={"knowledge_type": knowledge_type},
+        )
+        return result
 
     def start_conversation(
         self,
@@ -106,7 +114,13 @@ class LearningService:
         if source_id is None:
             raise ValueError("旧对话未绑定知识文档，请新建文档对话")
         messages, citations, system = self.context.build(conversation_id, message)
-        self.database.add_message(conversation_id, "user", message)
+        user_message_id = self.database.add_message(conversation_id, "user", message)
+        self.database.add_conversation_insight(
+            conversation_id,
+            int(source_id),
+            user_message_id,
+            message,
+        )
         configured_backend = self.chat_backend()
         resolved_backend = resolve_chat_backend(configured_backend)
         if resolved_backend == "cc":
@@ -118,7 +132,20 @@ class LearningService:
         answer = str(provider.complete(messages, system)).strip()
         if not answer:
             raise RuntimeError("模型返回了空回答")
-        self.database.add_message(conversation_id, "assistant", answer, citations)
+        assistant_message_id = self.database.add_message(conversation_id, "assistant", answer, citations)
+        self.database.resolve_conversation_insight(
+            user_message_id,
+            assistant_message_id,
+            answer,
+            citations,
+        )
+        self.database.record_learning_event(
+            "conversation_conclusion",
+            f"assistant-message:{assistant_message_id}",
+            source_id=int(source_id),
+            conversation_id=conversation_id,
+            metadata={"citation_count": len(citations)},
+        )
         self._compact_if_needed(conversation_id)
         return {
             "conversation_id": conversation_id,
@@ -143,8 +170,17 @@ class LearningService:
             return
         self.database.set_conversation_summary(conversation_id, str(summary).strip()[:2000])
 
-    def export_skill(self, target: str | Path) -> Path:
-        return export_learning_skill(self.database, target)
+    def create_skill(self, **values) -> int:
+        return self.database.create_learning_skill(**values)
+
+    def update_skill(self, skill_id: int, **values) -> None:
+        self.database.update_learning_skill(skill_id, **values)
+
+    def preview_skill(self, skill_id: int) -> dict:
+        return learning_skill_preview(self.database, skill_id)
+
+    def export_skill(self, skill_id: int, target: str | Path) -> Path:
+        return export_saved_learning_skill(self.database, skill_id, target)
 
     def close(self) -> None:
         self.database.close()

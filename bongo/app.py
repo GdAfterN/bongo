@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ingestion import SUPPORTED_EXTENSIONS
-from .dialogs import QuestionBankDialog
+from .dialogs import QuestionBankDialog, SkillEditorDialog
 from .pet import PetSettings, PetWindow
 from .providers import available_chat_backends, chat_backend_available, available_providers
 from .service import LearningService
@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self.current_conversation_id: int | None = None
         self.current_source_id: int | None = None
         self.current_practice_question: dict | None = None
+        self.current_skill_id: int | None = None
         self.import_queue: deque[tuple[str, str]] = deque()
         self.force_exit = False
         self.setWindowTitle("Bongo Study")
@@ -145,7 +146,7 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(sub)
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
-        nav_items = [("对话", 0), ("知识库", 1), ("练习", 2), ("设置", 3)]
+        nav_items = [("对话", 0), ("知识库", 1), ("练习", 2), ("Skill", 3), ("设置", 4)]
         for label, index in nav_items:
             button = QPushButton(label)
             button.setObjectName("navButton")
@@ -172,6 +173,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._chat_page())
         self.pages.addWidget(self._knowledge_page())
         self.pages.addWidget(self._practice_page())
+        self.pages.addWidget(self._skill_page())
         self.pages.addWidget(self._settings_page())
         content_layout.addWidget(self.pages, 1)
         outer.addWidget(content, 1)
@@ -363,6 +365,58 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    def _skill_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+
+        toolbar = QHBoxLayout()
+        intro = QLabel("把选定知识、题库、错题、对话洞察和学习成长编译为可复用的 Learning Skill。")
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        toolbar.addWidget(intro, 1)
+        create_button = QPushButton("创建 Skill")
+        create_button.clicked.connect(self.create_skill)
+        toolbar.addWidget(create_button)
+        layout.addLayout(toolbar)
+
+        body = QHBoxLayout()
+        self.skill_table = QTableWidget(0, 5)
+        self.skill_table.setHorizontalHeaderLabels(["名称", "知识", "题目", "版本", "状态"])
+        self.skill_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.skill_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.skill_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.skill_table.verticalHeader().setVisible(False)
+        self.skill_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 5):
+            self.skill_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.skill_table.itemSelectionChanged.connect(self.show_selected_skill)
+        body.addWidget(self.skill_table, 5)
+
+        detail_layout = QVBoxLayout()
+        self.skill_preview = QTextBrowser()
+        self.skill_preview.setHtml("<p style='color:#687078'>创建或选择一个 Skill 查看沉淀内容。</p>")
+        detail_layout.addWidget(self.skill_preview, 1)
+        actions = QHBoxLayout()
+        self.edit_skill_button = QPushButton("编辑")
+        self.edit_skill_button.setProperty("secondary", True)
+        self.edit_skill_button.clicked.connect(self.edit_selected_skill)
+        self.delete_skill_button = QPushButton("删除")
+        self.delete_skill_button.setProperty("danger", True)
+        self.delete_skill_button.clicked.connect(self.delete_selected_skill)
+        self.export_skill_button = QPushButton("导出")
+        self.export_skill_button.clicked.connect(self.export_selected_skill)
+        actions.addWidget(self.edit_skill_button)
+        actions.addWidget(self.delete_skill_button)
+        actions.addStretch()
+        actions.addWidget(self.export_skill_button)
+        detail_layout.addLayout(actions)
+        body.addLayout(detail_layout, 6)
+        layout.addLayout(body, 1)
+        for button in (self.edit_skill_button, self.delete_skill_button, self.export_skill_button):
+            button.setEnabled(False)
+        return page
+
     def _settings_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -458,19 +512,6 @@ class MainWindow(QMainWindow):
         pet_form.addStretch()
         tabs.addTab(pet_tab, "桌宠")
 
-        export_tab = QWidget()
-        export_form = QVBoxLayout(export_tab)
-        export_form.addWidget(QLabel("学习 Skill"))
-        export_help = QLabel("将知识来源、练习题和会话索引导出为可复用的本地 skill。")
-        export_help.setObjectName("muted")
-        export_help.setWordWrap(True)
-        export_form.addWidget(export_help)
-        export_button = QPushButton("导出学习 Skill")
-        export_button.setProperty("secondary", True)
-        export_button.clicked.connect(self.export_skill)
-        export_form.addWidget(export_button, 0, Qt.AlignmentFlag.AlignLeft)
-        export_form.addStretch()
-        tabs.addTab(export_tab, "导出")
         layout.addWidget(settings, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch()
         return page
@@ -510,6 +551,8 @@ class MainWindow(QMainWindow):
             self.refresh_sources()
         elif index == 2:
             self.load_next_practice()
+        elif index == 3:
+            self.refresh_skills()
 
     def _start_worker(self, worker: Worker) -> None:
         self.active_workers.add(worker)
@@ -519,6 +562,7 @@ class MainWindow(QMainWindow):
     def refresh_all(self):
         self.refresh_sources()
         self.refresh_conversations()
+        self.refresh_skills()
         self.load_settings()
         self.load_next_practice()
 
@@ -617,6 +661,175 @@ class MainWindow(QMainWindow):
 
     def open_question_bank(self, source_id: int) -> None:
         QuestionBankDialog(self.service.database, source_id, self).exec()
+
+    def refresh_skills(self) -> None:
+        skills = self.service.database.list_learning_skills()
+        selected_id = self.current_skill_id
+        self.skill_table.blockSignals(True)
+        self.skill_table.setRowCount(len(skills))
+        selected_row = -1
+        for row, skill in enumerate(skills):
+            if not skill.get("last_exported_at"):
+                status = "未导出"
+            elif bool(skill.get("dirty")):
+                status = "待更新"
+            else:
+                status = "最新"
+            values = [
+                skill["title"],
+                str(skill["source_count"]),
+                str(skill["question_count"]),
+                str(skill["version"] or "-") if skill["version"] else "-",
+                status,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(skill["id"]))
+                    item.setToolTip(f"{skill['name']}\n{skill['description']}")
+                self.skill_table.setItem(row, column, item)
+            if int(skill["id"]) == selected_id:
+                selected_row = row
+        self.skill_table.blockSignals(False)
+        if skills:
+            self.skill_table.selectRow(selected_row if selected_row >= 0 else 0)
+        else:
+            self.current_skill_id = None
+            self.skill_preview.setHtml(
+                "<h3>还没有 Learning Skill</h3>"
+                "<p style='color:#687078'>创建 Skill 后，可以在这里查看、编辑、删除和导出。</p>"
+            )
+            for button in (self.edit_skill_button, self.delete_skill_button, self.export_skill_button):
+                button.setEnabled(False)
+
+    def show_selected_skill(self) -> None:
+        row = self.skill_table.currentRow()
+        item = self.skill_table.item(row, 0) if row >= 0 else None
+        if item is None:
+            return
+        self.current_skill_id = int(item.data(Qt.ItemDataRole.UserRole))
+        for button in (self.edit_skill_button, self.delete_skill_button, self.export_skill_button):
+            button.setEnabled(True)
+        try:
+            preview = self.service.preview_skill(self.current_skill_id)
+        except Exception as exc:
+            self.skill_preview.setHtml(f"<p style='color:#b94a48'>{html.escape(str(exc))}</p>")
+            return
+        skill = preview["skill"]
+        source_items = "".join(
+            f"<li>{html.escape(source.get('problem_title') or source['name'])}</li>"
+            for source in preview["sources"]
+        ) or "<li>没有有效知识来源</li>"
+        included = ["原始知识"]
+        if skill["include_questions"]:
+            included.append("完整题库")
+        if skill["include_mistakes"]:
+            included.append("错题纠正")
+        if skill["include_conversations"]:
+            included.append("对话洞察")
+        if skill["include_growth"]:
+            included.append("学习与成长画像")
+        growth = preview["growth"]
+        unresolved = sum(not bool(item["resolved"]) for item in preview["insights"])
+        last_export = skill.get("last_exported_at") or "尚未导出"
+        weak_items = [
+            f"<li>{html.escape(question['prompt'])}</li>"
+            for question in preview["questions"]
+            if preview["states"][int(question["id"])]["state"] == "薄弱"
+        ][:6]
+        insight_items = [
+            f"<li>{html.escape(item['question'])}：{html.escape(item['conclusion'] or '尚未形成结论')}</li>"
+            for item in preview["insights"]
+        ][:6]
+        weak_html = "".join(weak_items) or "<li>当前没有需要优先纠正的题目</li>"
+        insight_html = "".join(insight_items) or "<li>当前没有对话洞察</li>"
+        growth_text = (
+            f"<p>成长值 {growth['growth_score']} · 已纠正错题 {growth['recovered_mistakes']} 道 · "
+            f"对话结论 {growth['conversation_conclusions']} 个</p>"
+            if skill["include_growth"]
+            else "<p style='color:#687078'>成长画像未包含在此 Skill 中。</p>"
+        )
+        self.skill_preview.setHtml(
+            f"<h2>{html.escape(skill['title'])}</h2>"
+            f"<p><code>{html.escape(skill['name'])}</code></p>"
+            f"<p>{html.escape(skill['description'])}</p>"
+            f"<p><b>沉淀范围：</b>{'、'.join(included)}</p>"
+            f"<h3>知识来源</h3><ul>{source_items}</ul>"
+            "<h3>学习状态</h3>"
+            f"<p>题目 {len(preview['questions'])} 道 · 历史错题 {preview['historical_mistakes']} 道 · "
+            f"当前薄弱 {preview['weak_questions']} 道 · 未解决对话 {unresolved} 个</p>"
+            f"<h3>优先复习</h3><ul>{weak_html}</ul>"
+            f"<h3>对话洞察</h3><ul>{insight_html}</ul>"
+            f"{growth_text}"
+            f"<p style='color:#687078'>当前版本：{skill['version'] or '未导出'} · 最近导出：{html.escape(str(last_export))}</p>"
+        )
+
+    def create_skill(self) -> None:
+        if not any(source["status"] == "ready" for source in self.service.database.list_sources()):
+            QMessageBox.information(self, "创建 Skill", "请先导入至少一份可用知识。")
+            return
+        dialog = SkillEditorDialog(self.service.database, parent=self)
+        if not dialog.exec():
+            return
+        try:
+            self.current_skill_id = self.service.create_skill(**dialog.values())
+            self.refresh_skills()
+            self.statusBar().showMessage("Learning Skill 已创建", 5000)
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def edit_selected_skill(self) -> None:
+        if self.current_skill_id is None:
+            return
+        skill = self.service.database.get_learning_skill(self.current_skill_id)
+        if not skill:
+            self.refresh_skills()
+            return
+        dialog = SkillEditorDialog(self.service.database, skill, self)
+        if not dialog.exec():
+            return
+        try:
+            self.service.update_skill(self.current_skill_id, **dialog.values())
+            self.refresh_skills()
+            self.statusBar().showMessage("Learning Skill 已更新", 5000)
+        except Exception as exc:
+            self._show_error(str(exc))
+
+    def delete_selected_skill(self) -> None:
+        if self.current_skill_id is None:
+            return
+        skill = self.service.database.get_learning_skill(self.current_skill_id)
+        if not skill:
+            self.refresh_skills()
+            return
+        if QMessageBox.question(
+            self,
+            "删除 Skill",
+            f"删除 {skill['title']} 的 Skill 定义？已经导出到磁盘的目录不会被删除。",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.service.database.delete_learning_skill(self.current_skill_id)
+        self.current_skill_id = None
+        self.refresh_skills()
+        self.statusBar().showMessage("Learning Skill 已删除", 5000)
+
+    def export_selected_skill(self) -> None:
+        if self.current_skill_id is None:
+            return
+        skill = self.service.database.get_learning_skill(self.current_skill_id)
+        if not skill:
+            self.refresh_skills()
+            return
+        directory = QFileDialog.getExistingDirectory(self, "选择 Skill 导出位置")
+        if not directory:
+            return
+        target = Path(directory) / skill["name"]
+        try:
+            result = self.service.export_skill(self.current_skill_id, target)
+            self.refresh_skills()
+            QMessageBox.information(self, "导出完成", f"Skill 已通过结构校验并导出到：\n{result}")
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def refresh_conversations(self):
         selected = self.current_conversation_id
@@ -977,17 +1190,6 @@ class MainWindow(QMainWindow):
     def _save_pet_position(self, x: int, y: int) -> None:
         self.service.database.set_setting("pet_x", str(x))
         self.service.database.set_setting("pet_y", str(y))
-
-    def export_skill(self):
-        directory = QFileDialog.getExistingDirectory(self, "选择 Skill 导出目录")
-        if not directory:
-            return
-        target = Path(directory) / "bongo-learning-profile"
-        try:
-            result = self.service.export_skill(target)
-            QMessageBox.information(self, "导出完成", f"Skill 已导出到：\n{result}")
-        except Exception as exc:
-            self._show_error(str(exc))
 
     def show_and_raise(self):
         self.show()

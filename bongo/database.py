@@ -114,11 +114,62 @@ class StudyDatabase:
                     resolved_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS learning_skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    include_questions INTEGER NOT NULL DEFAULT 1,
+                    include_mistakes INTEGER NOT NULL DEFAULT 1,
+                    include_conversations INTEGER NOT NULL DEFAULT 1,
+                    include_growth INTEGER NOT NULL DEFAULT 1,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    dirty INTEGER NOT NULL DEFAULT 1,
+                    last_exported_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS learning_skill_sources (
+                    skill_id INTEGER NOT NULL REFERENCES learning_skills(id) ON DELETE CASCADE,
+                    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    PRIMARY KEY(skill_id, source_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_insights (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE,
+                    user_message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+                    assistant_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                    question TEXT NOT NULL,
+                    conclusion TEXT NOT NULL DEFAULT '',
+                    citations_json TEXT NOT NULL DEFAULT '[]',
+                    resolved INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS learning_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    event_key TEXT NOT NULL UNIQUE,
+                    source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+                    question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+                    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+                    value INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id, position);
                 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(source_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_attempts_question ON question_attempts(question_id, id);
                 CREATE INDEX IF NOT EXISTS idx_unanswered_question ON unanswered_questions(question_id, id);
+                CREATE INDEX IF NOT EXISTS idx_skill_sources_source ON learning_skill_sources(source_id, skill_id);
+                CREATE INDEX IF NOT EXISTS idx_insights_source ON conversation_insights(source_id, id);
+                CREATE INDEX IF NOT EXISTS idx_learning_events_source ON learning_events(source_id, id);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_unanswered_open
                     ON unanswered_questions(question_id) WHERE resolved_at IS NULL;
                 """
@@ -149,6 +200,13 @@ class StudyDatabase:
             if "bubble_enabled" not in source_columns:
                 self.conn.execute(
                     "ALTER TABLE sources ADD COLUMN bubble_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+            skill_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(learning_skills)").fetchall()
+            }
+            if "dirty" not in skill_columns:
+                self.conn.execute(
+                    "ALTER TABLE learning_skills ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1"
                 )
             if added_knowledge_type:
                 code_kinds = (
@@ -274,6 +332,12 @@ class StudyDatabase:
 
     def delete_source(self, source_id: int) -> None:
         with self._lock, self.conn:
+            skill_ids = [
+                int(row["skill_id"])
+                for row in self.conn.execute(
+                    "SELECT skill_id FROM learning_skill_sources WHERE source_id = ?", (source_id,)
+                )
+            ]
             chunk_ids = [
                 str(row["id"])
                 for row in self.conn.execute("SELECT id FROM chunks WHERE source_id = ?", (source_id,))
@@ -287,6 +351,12 @@ class StudyDatabase:
                 except sqlite3.OperationalError:
                     pass
             self.conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+            if skill_ids:
+                placeholders = ",".join("?" for _ in skill_ids)
+                self.conn.execute(
+                    f"UPDATE learning_skills SET updated_at = ?, dirty = 1 WHERE id IN ({placeholders})",
+                    (utc_now(), *skill_ids),
+                )
 
     def replace_chunks(self, source_id: int, chunks: list[dict]) -> list[int]:
         ids: list[int] = []
@@ -346,6 +416,7 @@ class StudyDatabase:
                     ),
                 )
                 ids.append(int(cursor.lastrowid))
+            self._touch_skills_for_source_locked(source_id)
         return ids
 
     @staticmethod
@@ -447,12 +518,20 @@ class StudyDatabase:
         correct = int(selected_index) == int(question["correct_index"])
         now = utc_now()
         with self._lock, self.conn:
+            previous = self.conn.execute(
+                "SELECT is_correct FROM question_attempts WHERE question_id = ? ORDER BY id DESC LIMIT 1",
+                (question_id,),
+            ).fetchone()
+            had_wrong = self.conn.execute(
+                "SELECT 1 FROM question_attempts WHERE question_id = ? AND is_correct = 0 LIMIT 1",
+                (question_id,),
+            ).fetchone() is not None
             self.conn.execute(
                 "UPDATE questions SET ask_count = ask_count + 1, "
                 "correct_count = correct_count + ?, last_asked_at = ? WHERE id = ?",
                 (1 if correct else 0, now, question_id),
             )
-            self.conn.execute(
+            attempt = self.conn.execute(
                 "INSERT INTO question_attempts(question_id, selected_index, is_correct, created_at) "
                 "VALUES(?, ?, ?, ?)",
                 (question_id, int(selected_index), 1 if correct else 0, now),
@@ -462,6 +541,29 @@ class StudyDatabase:
                 "WHERE question_id = ? AND resolved_at IS NULL",
                 (now, question_id),
             )
+            event_type = "question_correct" if correct else "question_wrong"
+            self.conn.execute(
+                "INSERT OR IGNORE INTO learning_events("
+                "event_type, event_key, source_id, question_id, value, metadata_json, created_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_type,
+                    f"attempt:{attempt.lastrowid}",
+                    question["source_id"],
+                    question_id,
+                    1,
+                    json.dumps({"selected_index": int(selected_index)}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            if correct and had_wrong and previous is not None and not bool(previous["is_correct"]):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO learning_events("
+                    "event_type, event_key, source_id, question_id, value, metadata_json, created_at"
+                    ") VALUES('mistake_recovered', ?, ?, ?, 1, '{}', ?)",
+                    (f"recovery:{question_id}:{attempt.lastrowid}", question["source_id"], question_id, now),
+                )
+            self._touch_skills_for_source_locked(int(question["source_id"]), now)
         return {"correct": correct, "question": question}
 
     def list_wrong_questions(self, source_id: int | None = None) -> list[dict]:
@@ -572,6 +674,11 @@ class StudyDatabase:
             self.conn.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?", (utc_now(), conversation_id)
             )
+            source = self.conn.execute(
+                "SELECT source_id FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+            if source and source["source_id"] is not None:
+                self._touch_skills_for_source_locked(int(source["source_id"]))
             return int(cursor.lastrowid)
 
     def get_messages(self, conversation_id: int, limit: int = 40) -> list[dict]:
@@ -606,3 +713,264 @@ class StudyDatabase:
         with self._lock:
             row = self.conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         return dict(row) if row else None
+
+    def _touch_skills_for_source_locked(self, source_id: int, timestamp: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE learning_skills SET updated_at = ?, dirty = 1 WHERE id IN ("
+            "SELECT skill_id FROM learning_skill_sources WHERE source_id = ?)",
+            (timestamp or utc_now(), source_id),
+        )
+
+    @staticmethod
+    def _validate_skill_name(name: str) -> str:
+        normalized = name.strip().lower()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", normalized) or len(normalized) > 64:
+            raise ValueError("Skill 标识只能包含小写字母、数字和连字符，且不能超过 64 个字符")
+        return normalized
+
+    def create_learning_skill(
+        self,
+        name: str,
+        title: str,
+        description: str,
+        source_ids: list[int],
+        *,
+        include_questions: bool = True,
+        include_mistakes: bool = True,
+        include_conversations: bool = True,
+        include_growth: bool = True,
+    ) -> int:
+        normalized = self._validate_skill_name(name)
+        selected = sorted(set(int(value) for value in source_ids))
+        if not selected:
+            raise ValueError("至少选择一个知识来源")
+        if not title.strip() or not description.strip():
+            raise ValueError("请填写 Skill 名称和用途描述")
+        now = utc_now()
+        with self._lock, self.conn:
+            existing = {
+                int(row["id"])
+                for row in self.conn.execute(
+                    f"SELECT id FROM sources WHERE id IN ({','.join('?' for _ in selected)})",
+                    selected,
+                )
+            }
+            if existing != set(selected):
+                raise ValueError("所选知识来源不存在")
+            try:
+                cursor = self.conn.execute(
+                    "INSERT INTO learning_skills("
+                    "name, title, description, include_questions, include_mistakes, "
+                    "include_conversations, include_growth, created_at, updated_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        normalized, title.strip()[:100], description.strip()[:1000],
+                        int(include_questions), int(include_mistakes),
+                        int(include_conversations), int(include_growth), now, now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Skill 标识 {normalized} 已存在") from exc
+            skill_id = int(cursor.lastrowid)
+            self.conn.executemany(
+                "INSERT INTO learning_skill_sources(skill_id, source_id) VALUES(?, ?)",
+                [(skill_id, source_id) for source_id in selected],
+            )
+        return skill_id
+
+    def update_learning_skill(
+        self,
+        skill_id: int,
+        name: str,
+        title: str,
+        description: str,
+        source_ids: list[int],
+        *,
+        include_questions: bool = True,
+        include_mistakes: bool = True,
+        include_conversations: bool = True,
+        include_growth: bool = True,
+    ) -> None:
+        normalized = self._validate_skill_name(name)
+        selected = sorted(set(int(value) for value in source_ids))
+        if not selected:
+            raise ValueError("至少选择一个知识来源")
+        if not title.strip() or not description.strip():
+            raise ValueError("请填写 Skill 名称和用途描述")
+        with self._lock, self.conn:
+            if not self.conn.execute("SELECT 1 FROM learning_skills WHERE id = ?", (skill_id,)).fetchone():
+                raise ValueError("Skill 不存在")
+            existing = {
+                int(row["id"])
+                for row in self.conn.execute(
+                    f"SELECT id FROM sources WHERE id IN ({','.join('?' for _ in selected)})",
+                    selected,
+                )
+            }
+            if existing != set(selected):
+                raise ValueError("所选知识来源不存在")
+            try:
+                self.conn.execute(
+                "UPDATE learning_skills SET name = ?, title = ?, description = ?, "
+                    "include_questions = ?, include_mistakes = ?, include_conversations = ?, "
+                    "include_growth = ?, updated_at = ?, dirty = 1 WHERE id = ?",
+                    (
+                        normalized, title.strip()[:100], description.strip()[:1000],
+                        int(include_questions), int(include_mistakes),
+                        int(include_conversations), int(include_growth), utc_now(), skill_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Skill 标识 {normalized} 已存在") from exc
+            self.conn.execute("DELETE FROM learning_skill_sources WHERE skill_id = ?", (skill_id,))
+            self.conn.executemany(
+                "INSERT INTO learning_skill_sources(skill_id, source_id) VALUES(?, ?)",
+                [(skill_id, source_id) for source_id in selected],
+            )
+
+    def list_learning_skills(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT sk.*, COUNT(DISTINCT ss.source_id) AS source_count, "
+                "COUNT(DISTINCT q.id) AS question_count "
+                "FROM learning_skills sk "
+                "LEFT JOIN learning_skill_sources ss ON ss.skill_id = sk.id "
+                "LEFT JOIN questions q ON q.source_id = ss.source_id "
+                "GROUP BY sk.id ORDER BY sk.updated_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_learning_skill(self, skill_id: int) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM learning_skills WHERE id = ?", (skill_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["source_ids"] = [
+                int(item["source_id"])
+                for item in self.conn.execute(
+                    "SELECT source_id FROM learning_skill_sources WHERE skill_id = ? ORDER BY source_id",
+                    (skill_id,),
+                )
+            ]
+        return result
+
+    def delete_learning_skill(self, skill_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM learning_skills WHERE id = ?", (skill_id,))
+
+    def mark_learning_skill_exported(self, skill_id: int, version: int) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE learning_skills SET version = ?, last_exported_at = ?, updated_at = ?, dirty = 0 WHERE id = ?",
+                (version, now, now, skill_id),
+            )
+
+    def add_conversation_insight(
+        self,
+        conversation_id: int,
+        source_id: int,
+        user_message_id: int,
+        question: str,
+    ) -> int:
+        now = utc_now()
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO conversation_insights("
+                "conversation_id, source_id, user_message_id, question, created_at, updated_at"
+                ") VALUES(?, ?, ?, ?, ?, ?)",
+                (conversation_id, source_id, user_message_id, question.strip(), now, now),
+            )
+            self._touch_skills_for_source_locked(source_id, now)
+        return int(cursor.lastrowid)
+
+    def resolve_conversation_insight(
+        self,
+        user_message_id: int,
+        assistant_message_id: int,
+        conclusion: str,
+        citations: list[dict],
+    ) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT source_id FROM conversation_insights WHERE user_message_id = ?",
+                (user_message_id,),
+            ).fetchone()
+            self.conn.execute(
+                "UPDATE conversation_insights SET assistant_message_id = ?, conclusion = ?, "
+                "citations_json = ?, resolved = 1, updated_at = ? WHERE user_message_id = ?",
+                (
+                    assistant_message_id, conclusion.strip(),
+                    json.dumps(citations or [], ensure_ascii=False), now, user_message_id,
+                ),
+            )
+            if row and row["source_id"] is not None:
+                self._touch_skills_for_source_locked(int(row["source_id"]), now)
+
+    def list_conversation_insights(self, source_ids: list[int]) -> list[dict]:
+        selected = sorted(set(int(value) for value in source_ids))
+        if not selected:
+            return []
+        placeholders = ",".join("?" for _ in selected)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT i.*, c.title AS conversation_title, c.summary AS conversation_summary, "
+                "s.name AS source_name "
+                "FROM conversation_insights i "
+                "JOIN conversations c ON c.id = i.conversation_id "
+                "LEFT JOIN sources s ON s.id = i.source_id "
+                f"WHERE i.source_id IN ({placeholders}) ORDER BY i.id",
+                selected,
+            ).fetchall()
+        result = []
+        for row in rows:
+            value = dict(row)
+            value["citations"] = json.loads(value.pop("citations_json"))
+            result.append(value)
+        return result
+
+    def record_learning_event(
+        self,
+        event_type: str,
+        event_key: str,
+        *,
+        source_id: int | None = None,
+        question_id: int | None = None,
+        conversation_id: int | None = None,
+        value: int = 1,
+        metadata: dict | None = None,
+    ) -> bool:
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "INSERT OR IGNORE INTO learning_events("
+                "event_type, event_key, source_id, question_id, conversation_id, value, metadata_json, created_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_type, event_key, source_id, question_id, conversation_id, int(value),
+                    json.dumps(metadata or {}, ensure_ascii=False), utc_now(),
+                ),
+            )
+            if cursor.rowcount and source_id is not None:
+                self._touch_skills_for_source_locked(source_id)
+        return cursor.rowcount > 0
+
+    def list_learning_events(self, source_ids: list[int]) -> list[dict]:
+        selected = sorted(set(int(value) for value in source_ids))
+        if not selected:
+            return []
+        placeholders = ",".join("?" for _ in selected)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM learning_events WHERE source_id IN ({placeholders}) ORDER BY id",
+                selected,
+            ).fetchall()
+        result = []
+        for row in rows:
+            value = dict(row)
+            value["metadata"] = json.loads(value.pop("metadata_json"))
+            result.append(value)
+        return result

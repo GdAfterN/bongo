@@ -4,11 +4,17 @@ import html
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -17,6 +23,110 @@ from PySide6.QtWidgets import (
 )
 
 from .database import StudyDatabase
+
+
+class SkillEditorDialog(QDialog):
+    def __init__(self, database: StudyDatabase, skill: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.database = database
+        self.skill = skill or {}
+        self.setWindowTitle("编辑 Learning Skill" if skill else "创建 Learning Skill")
+        self.resize(620, 620)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "选择要沉淀的知识来源。原始知识始终包含，题库、错题、对话洞察和成长画像可以独立控制。"
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("muted")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.title_input = QLineEdit(str(self.skill.get("title", "")))
+        self.title_input.setPlaceholderText("例如：Hot 100 算法复习")
+        self.name_input = QLineEdit(str(self.skill.get("name", "")))
+        self.name_input.setPlaceholderText("例如：review-hot100")
+        self.description_input = QLineEdit(str(self.skill.get("description", "")))
+        self.description_input.setPlaceholderText("说明这个 Skill 能做什么，以及何时使用")
+        form.addRow("显示名称", self.title_input)
+        form.addRow("Skill 标识", self.name_input)
+        form.addRow("用途描述", self.description_input)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("知识来源"))
+        self.source_list = QListWidget()
+        selected = {int(value) for value in self.skill.get("source_ids", [])}
+        for source in database.list_sources():
+            if source["status"] != "ready":
+                continue
+            label = source.get("problem_title") or source["name"]
+            item = QListWidgetItem(f"{label}  ·  {source['knowledge_type']}")
+            item.setData(Qt.ItemDataRole.UserRole, int(source["id"]))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if int(source["id"]) in selected else Qt.CheckState.Unchecked
+            )
+            self.source_list.addItem(item)
+        layout.addWidget(self.source_list, 1)
+
+        self.include_questions = QCheckBox("包含完整题库与解析")
+        self.include_mistakes = QCheckBox("包含历史错题与纠正状态")
+        self.include_conversations = QCheckBox("包含对话结论与未解决问题")
+        self.include_growth = QCheckBox("包含学习画像、复习计划与成长成果")
+        options = (
+            (self.include_questions, "include_questions"),
+            (self.include_mistakes, "include_mistakes"),
+            (self.include_conversations, "include_conversations"),
+            (self.include_growth, "include_growth"),
+        )
+        for checkbox, key in options:
+            checkbox.setChecked(bool(self.skill.get(key, 1)))
+            layout.addWidget(checkbox)
+
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet("color:#b94a48;")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validate_and_accept(self) -> None:
+        if not self.title_input.text().strip():
+            self.error_label.setText("请填写显示名称。")
+            return
+        if not self.name_input.text().strip():
+            self.error_label.setText("请填写由小写字母、数字和连字符组成的 Skill 标识。")
+            return
+        if not self.description_input.text().strip():
+            self.error_label.setText("请填写 Skill 的用途描述。")
+            return
+        if not self.selected_source_ids():
+            self.error_label.setText("至少选择一个知识来源。")
+            return
+        self.accept()
+
+    def selected_source_ids(self) -> list[int]:
+        return [
+            int(item.data(Qt.ItemDataRole.UserRole))
+            for row in range(self.source_list.count())
+            if (item := self.source_list.item(row)).checkState() == Qt.CheckState.Checked
+        ]
+
+    def values(self) -> dict:
+        return {
+            "name": self.name_input.text().strip(),
+            "title": self.title_input.text().strip(),
+            "description": self.description_input.text().strip(),
+            "source_ids": self.selected_source_ids(),
+            "include_questions": self.include_questions.isChecked(),
+            "include_mistakes": self.include_mistakes.isChecked(),
+            "include_conversations": self.include_conversations.isChecked(),
+            "include_growth": self.include_growth.isChecked(),
+        }
 
 
 class QuestionBankDialog(QDialog):

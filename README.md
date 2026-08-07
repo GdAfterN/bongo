@@ -6,7 +6,8 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 
 ```text
 导入本地资料 -> 切分并保存 -> 模型生成选择题 -> 桌面气泡复习
-                         \-> 检索资料 -> 知识对话 -> 保存会话
+                         \-> 检索资料 -> 来源对话 -> 错题与洞察沉淀
+                                         \-> Learning Skill 编译 -> 定向复习
 ```
 
 ## 已实现功能
@@ -29,7 +30,11 @@ Bongo Study 是一个 Windows 优先、本地数据优先的桌面智能助学 A
 - 对话上下文、长期摘要、历史会话保存与恢复
 - OpenAI、Anthropic 官方 Python SDK
 - 对话后端可选默认、CC 或 Codex；CLI 仅在实际可执行时可选
-- 将逐文档知识、题库、错题、学习画像和会话导出为本地 skill
+- 独立的 Learning Skill 管理页：可按来源创建、查看、编辑、删除和导出 Skill
+- Skill 沉淀融合原始知识、完整题库、错题纠正状态、来源限定对话洞察、学习画像、复习计划和桌宠学习成果
+- Skill 使用 `SKILL.md`、`manifest.json` 和 `references/` 渐进式披露结构，记录来源哈希、版本和待更新状态
+- 导出前校验 frontmatter、JSON、来源隔离和模型密钥；默认不导出完整原始聊天和键鼠日志
+- 基于学习事件账本聚合知识导入、答题、错题纠正和对话结论，桌宠成长只反映真实学习行为
 
 当前版本不包含工具调用、Shell/文件编辑 Agent、ReAct、MCP、评测系统、视频生成，也暂不实现宠物升级、亲密度和装备系统。
 
@@ -117,7 +122,8 @@ Codex 使用非交互 `exec` 模式并启用 `read-only` 沙箱；文档片段�
 4. 在知识库点击“查看题库”，检查该文档生成的题目与作答情况。
 5. 在“对话”中先选择一份资料，再针对该文档提问并查看来源。
 6. 在“练习”页按文档练习，或切换到“错题复习”“未回答”；桌宠气泡也可直接答题。
-7. 在“设置”页调整 BongoCat，或导出包含学习画像和错题复盘流程的 skill。
+7. 打开“Skill”页，选择知识来源和需要沉淀的题库、错题、对话及成长内容，然后查看、编辑或导出 Skill。
+8. 在“设置”页调整 BongoCat 和模型配置。
 
 支持的主要格式包括 `.md`、`.txt`、`.rst`、`.py`、`.js`、`.ts`、`.java`、`.go`、`.rs`、`.c`、`.cpp`、`.cs`、`.html`、`.css`、`.sql`、`.yaml` 和 `.json`。
 
@@ -147,7 +153,7 @@ bongo/
 ├── providers.py    # OpenAI、Anthropic、Claude Code、Codex 后端
 ├── memory.py       # 对话上下文、知识检索和来源
 ├── service.py      # 导入、对话、摘要与恢复流程
-├── exporter.py     # 学习 skill 导出
+├── exporter.py     # Learning Skill 编译、校验与导出
 └── styles.py       # 桌面 UI 样式
 ```
 

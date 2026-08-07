@@ -5,7 +5,7 @@ import json
 import pytest
 
 from bongo.database import StudyDatabase
-from bongo.exporter import export_learning_skill
+from bongo.exporter import export_learning_skill, export_saved_learning_skill
 from bongo.ingestion import (
     KnowledgeIngestor,
     algorithm_study_system_prompt,
@@ -221,14 +221,14 @@ def test_service_chat_resume_and_skill_export(tmp_path):
         source_index = (target / "references" / "source-index.md").read_text(encoding="utf-8")
         knowledge_file = next((target / "references" / "knowledge").glob("*.md"))
         knowledge = knowledge_file.read_text(encoding="utf-8")
-        conversations = json.loads(
-            (target / "references" / "conversations.json").read_text(encoding="utf-8")
-        )
         assert "network.md" in source_index
         assert "TCP 使用三次握手" in knowledge
-        assert conversations[0]["messages"][0]["content"] == "请解释三次握手"
+        insights = (target / "references" / "conversation-insights.md").read_text(encoding="utf-8")
+        assert "请解释三次握手" in insights
+        assert "用于同步连接双方" in insights
         assert (target / "references" / "mistakes.md").exists()
         assert (target / "references" / "learning-profile.md").exists()
+        assert (target / "references" / "growth-profile.md").exists()
     finally:
         service.close()
 
@@ -325,6 +325,51 @@ def test_conversation_retrieval_is_scoped_to_selected_document(tmp_path):
         assert "第二份资料" not in request
     finally:
         service.close()
+
+
+def test_learning_skill_selects_sources_and_tracks_dirty_state(tmp_path):
+    database = StudyDatabase(tmp_path / "study.db")
+    try:
+        first_id, _ = database.add_source(tmp_path / "first.md", "第一份知识。")
+        second_id, _ = database.add_source(tmp_path / "second.md", "第二份知识。")
+        question_id = database.add_questions(
+            first_id,
+            [{
+                "question": "第一份知识的题目？",
+                "options": ["正确", "错误", "未知", "无关"],
+                "correct_index": 0,
+                "explanation": "第一份知识明确说明了正确结论。",
+                "evidence": "第一份知识。",
+                "topic": "第一主题",
+            }],
+        )[0]
+        skill_id = database.create_learning_skill(
+            "review-first",
+            "第一份复习",
+            "复习第一份知识并纠正错题。",
+            [first_id],
+        )
+        skill = database.get_learning_skill(skill_id)
+        assert skill["source_ids"] == [first_id]
+        assert skill["dirty"] == 1
+
+        database.answer_question(question_id, 1)
+        assert database.get_learning_skill(skill_id)["dirty"] == 1
+        target = export_saved_learning_skill(database, skill_id, tmp_path / "review-first")
+        manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["version"] == 1
+        assert manifest["sources"][0]["id"] == first_id
+        questions = json.loads((target / "references" / "questions.json").read_text(encoding="utf-8"))
+        assert {item["source_id"] for item in questions} == {first_id}
+        assert database.get_learning_skill(skill_id)["dirty"] == 0
+
+        database.answer_question(question_id, 0)
+        assert database.get_learning_skill(skill_id)["dirty"] == 1
+        export_saved_learning_skill(database, skill_id, target)
+        assert database.get_learning_skill(skill_id)["version"] == 2
+        assert database.list_learning_events([first_id])
+    finally:
+        database.close()
 
 
 def test_file_types_use_specialized_question_prompts():
