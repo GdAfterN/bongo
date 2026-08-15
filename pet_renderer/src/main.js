@@ -9,6 +9,10 @@ const canvas = document.querySelector("#live2d");
 const keyOverlay = document.querySelector("#key-overlay");
 const errorBox = document.querySelector("#error");
 let model = null;
+let pixiApp = null;
+let resizeModel = () => {};
+let modelWidth = 0;
+let modelHeight = 0;
 let currentKey = "";
 let pulseTimer = 0;
 
@@ -32,6 +36,22 @@ function rangeValue(id, ratio, invert = false) {
 }
 
 window.bongoPet = {
+  syncViewport(requestedResolution) {
+    if (!pixiApp) return false;
+    const resolution = Math.max(
+      1,
+      Number(requestedResolution) || Number(window.devicePixelRatio) || 1,
+    );
+    if (Math.abs(pixiApp.renderer.resolution - resolution) > 0.001) {
+      pixiApp.renderer.resolution = resolution;
+    }
+    pixiApp.renderer.resize(
+      Math.max(1, stage.clientWidth),
+      Math.max(1, stage.clientHeight),
+    );
+    resizeModel();
+    return true;
+  },
   setMirror(mirrored) {
     stage.style.transform = mirrored ? "scaleX(-1)" : "none";
   },
@@ -80,6 +100,7 @@ async function start() {
     autoDensity: true,
     resolution: window.devicePixelRatio,
   });
+  pixiApp = app;
 
   const modelJSON = await fetch(modelUrl("cat.model3.json")).then((response) => response.json());
   const setting = new CubismSetting({ modelJSON });
@@ -87,16 +108,19 @@ async function start() {
   model = new Live2DSprite({ modelSetting: setting, ticker: Ticker.shared });
   app.stage.addChild(model);
   await model.ready;
+  modelWidth = model.width;
+  modelHeight = model.height;
 
-  const resize = () => {
-    const scale = Math.min(stage.clientWidth / model.width, stage.clientHeight / model.height);
+  resizeModel = () => {
+    if (modelWidth <= 0 || modelHeight <= 0) return;
+    const scale = Math.min(stage.clientWidth / modelWidth, stage.clientHeight / modelHeight);
     model.scale.set(scale);
     model.anchor.set(0.5);
     model.x = stage.clientWidth / 2;
     model.y = stage.clientHeight / 2;
   };
-  window.addEventListener("resize", resize);
-  resize();
+  window.addEventListener("resize", () => window.bongoPet.syncViewport());
+  window.bongoPet.syncViewport();
   document.body.dataset.ready = "true";
 }
 

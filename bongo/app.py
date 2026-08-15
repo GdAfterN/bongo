@@ -12,9 +12,10 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -47,19 +49,48 @@ from PySide6.QtWidgets import (
 
 from .ingestion import SUPPORTED_EXTENSIONS
 from .dialogs import QuestionBankDialog, SkillEditorDialog
+from .activity import ActivityRecorder
+from .application_names import display_application_name
 from .pet import PetSettings, PetWindow
 from .providers import available_chat_backends, chat_backend_available, available_providers
 from .service import LearningService
 from .styles import APP_STYLE
-from .widgets import WrappedRadioButton
+from .widgets import ActivityTimelineWidget, WrappedRadioButton
+from .qml_bridge import BongoBridge
 
 
 APP_ICON_PATH = Path(__file__).parent / "assets" / "app-icon.ico"
+WINDOW_BACKGROUND_COLOR = 0x00E5EDF1  # COLORREF for #f1ede5 (BGR byte order)
+WINDOW_TEXT_COLOR = 0x001F2220  # COLORREF for #20221f (BGR byte order)
+
+
+def _apply_windows_title_bar_theme(window) -> None:
+    if os.name != "nt":
+        return
+    try:
+        hwnd = ctypes.c_void_p(int(window.winId()))
+        dwm = ctypes.windll.dwmapi
+        for attribute, color in (
+            (34, WINDOW_BACKGROUND_COLOR),  # DWMWA_BORDER_COLOR
+            (35, WINDOW_BACKGROUND_COLOR),  # DWMWA_CAPTION_COLOR
+            (36, WINDOW_TEXT_COLOR),  # DWMWA_TEXT_COLOR
+        ):
+            value = ctypes.c_uint(color)
+            dwm.DwmSetWindowAttribute(
+                hwnd,
+                ctypes.c_uint(attribute),
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+            )
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
 
 
 class WorkerSignals(QObject):
     result = Signal(object)
     error = Signal(str)
+    progress = Signal(object)
+    item_completed = Signal(object)
     finished = Signal()
 
 
@@ -94,21 +125,30 @@ class MainWindow(QMainWindow):
         self,
         service: LearningService,
         pet: PetWindow,
+        activity_recorder: ActivityRecorder,
         start_hidden: bool = False,
         pet_enabled: bool = True,
     ):
         super().__init__()
         self.service = service
         self.pet = pet
+        self.activity_recorder = activity_recorder
         self.pet_enabled = pet_enabled
         self.thread_pool = QThreadPool.globalInstance()
         self.active_workers: set[Worker] = set()
         self.current_conversation_id: int | None = None
         self.current_source_id: int | None = None
         self.current_practice_question: dict | None = None
+        self.recent_practice_question_ids: deque[int] = deque(maxlen=12)
+        self.recent_practice_source_ids: deque[int] = deque(maxlen=2)
         self.current_skill_id: int | None = None
         self.import_queue: deque[tuple[str, str]] = deque()
         self.force_exit = False
+        self.work_break_worker_active = False
+        self.ai_news_worker_active = False
+        self.ai_news_show_after_refresh = False
+        self.ai_news_cursor = 0
+        self.work_break_session_started_at: str | None = None
         self.setWindowTitle("Bongo Study")
         self.setMinimumSize(980, 680)
         self.resize(1180, 760)
@@ -118,12 +158,24 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.pet.position_changed.connect(self._save_pet_position)
 
-        self.bubble_timer = QTimer(self)
-        self.bubble_timer.timeout.connect(self.pet.show_next_question)
-        interval = int(self.service.database.get_setting("bubble_interval", "180"))
-        self.bubble_timer.start(max(30, interval) * 1000)
+        self.home_refresh_timer = QTimer(self)
+        self.home_refresh_timer.setInterval(30_000)
+        self.home_refresh_timer.timeout.connect(self.refresh_home)
+        self.home_refresh_timer.start()
+
+        self.work_session_timer = QTimer(self)
+        self.work_session_timer.setInterval(5_000)
+        self.work_session_timer.timeout.connect(self.check_work_session)
+        self.work_session_timer.start()
+
+        self.ai_news_timer = QTimer(self)
+        self.ai_news_timer.setInterval(5 * 60 * 1000)
+        self.ai_news_timer.timeout.connect(self.refresh_ai_news_if_due)
+        self.ai_news_timer.start()
+
         if not start_hidden:
             self.show()
+            QTimer.singleShot(0, self.refresh_ai_news_if_due)
 
     def _build_ui(self):
         root = QWidget()
@@ -146,7 +198,15 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(sub)
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
-        nav_items = [("对话", 0), ("知识库", 1), ("练习", 2), ("Skill", 3), ("设置", 4)]
+        nav_items = [
+            ("首页", 0),
+            ("对话", 1),
+            ("知识库", 2),
+            ("练习", 3),
+            ("Skill", 4),
+            ("AI 简讯", 5),
+            ("设置", 6),
+        ]
         for label, index in nav_items:
             button = QPushButton(label)
             button.setObjectName("navButton")
@@ -166,18 +226,89 @@ class MainWindow(QMainWindow):
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(24, 18, 24, 20)
-        self.page_title = QLabel("对话")
+        self.page_title = QLabel("首页")
         self.page_title.setObjectName("pageTitle")
         content_layout.addWidget(self.page_title)
         self.pages = QStackedWidget()
+        self.pages.addWidget(self._home_page())
         self.pages.addWidget(self._chat_page())
         self.pages.addWidget(self._knowledge_page())
         self.pages.addWidget(self._practice_page())
         self.pages.addWidget(self._skill_page())
+        self.pages.addWidget(self._news_page())
         self.pages.addWidget(self._settings_page())
         content_layout.addWidget(self.pages, 1)
         outer.addWidget(content, 1)
         self.statusBar().showMessage("就绪")
+
+    def _home_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(12)
+
+        summary = QHBoxLayout()
+        summary.setSpacing(12)
+
+        def metric(label: str) -> tuple[QFrame, QLabel]:
+            frame = panel()
+            frame.setMinimumHeight(76)
+            metric_layout = QVBoxLayout(frame)
+            title = QLabel(label)
+            title.setObjectName("muted")
+            value = QLabel("-")
+            value.setWordWrap(True)
+            value.setStyleSheet("font-size:19px;font-weight:700;color:#203d34;")
+            metric_layout.addWidget(title)
+            metric_layout.addWidget(value)
+            summary.addWidget(frame, 1)
+            return frame, value
+
+        _, self.home_key_total = metric("今日键盘敲击")
+        _, self.home_top_application = metric("最活跃应用")
+        _, self.home_activity_range = metric("今日记录时段")
+        _, self.home_work_session = metric("当前连续工作")
+        layout.addLayout(summary)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        ranking_panel = panel()
+        ranking_layout = QVBoxLayout(ranking_panel)
+        ranking_title = QLabel("应用敲击排行")
+        ranking_title.setStyleSheet("font-size:15px;font-weight:600;")
+        ranking_layout.addWidget(ranking_title)
+        self.home_activity_table = QTableWidget(0, 3)
+        self.home_activity_table.setHorizontalHeaderLabels(["应用", "敲击", "活动时段"])
+        self.home_activity_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.home_activity_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.home_activity_table.verticalHeader().setVisible(False)
+        self.home_activity_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.home_activity_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.home_activity_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        ranking_layout.addWidget(self.home_activity_table, 1)
+        ranking_panel.setMinimumWidth(330)
+        body.addWidget(ranking_panel, 4)
+
+        timeline_panel = panel()
+        timeline_layout = QVBoxLayout(timeline_panel)
+        timeline_header = QHBoxLayout()
+        timeline_title = QLabel("键盘时间分布")
+        timeline_title.setStyleSheet("font-size:15px;font-weight:600;")
+        self.home_activity_status = QLabel()
+        self.home_activity_status.setObjectName("muted")
+        timeline_header.addWidget(timeline_title)
+        timeline_header.addStretch()
+        timeline_header.addWidget(self.home_activity_status)
+        timeline_layout.addLayout(timeline_header)
+        self.home_timeline = ActivityTimelineWidget()
+        timeline_layout.addWidget(self.home_timeline, 1)
+        self.home_timeline_legend = QLabel()
+        self.home_timeline_legend.setObjectName("muted")
+        self.home_timeline_legend.setWordWrap(True)
+        timeline_layout.addWidget(self.home_timeline_legend)
+        body.addWidget(timeline_panel, 7)
+        layout.addLayout(body, 1)
+        return page
 
     def _chat_page(self) -> QWidget:
         page = QWidget()
@@ -228,6 +359,59 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.send_button)
         chat_layout.addLayout(actions)
         layout.addWidget(chat_panel, 1)
+        return page
+
+    def _news_page(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(14)
+
+        list_panel = panel()
+        list_layout = QVBoxLayout(list_panel)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("最新 AI 简讯"))
+        self.news_refresh_button = QPushButton("主动抓取")
+        self.news_refresh_button.setProperty("secondary", True)
+        self.news_refresh_button.clicked.connect(
+            lambda _checked=False: self.start_ai_news_refresh(force=True)
+        )
+        header.addStretch()
+        header.addWidget(self.news_refresh_button)
+        list_layout.addLayout(header)
+        self.news_status = QLabel("启动后每 8 小时自动更新")
+        self.news_status.setObjectName("muted")
+        list_layout.addWidget(self.news_status)
+        self.news_progress = QProgressBar()
+        self.news_progress.setRange(0, 100)
+        self.news_progress.setValue(0)
+        self.news_progress.hide()
+        list_layout.addWidget(self.news_progress)
+        self.news_progress_detail = QLabel()
+        self.news_progress_detail.setObjectName("muted")
+        self.news_progress_detail.setWordWrap(True)
+        self.news_progress_detail.hide()
+        list_layout.addWidget(self.news_progress_detail)
+        self.news_list = QListWidget()
+        self.news_list.setMinimumWidth(360)
+        self.news_list.itemClicked.connect(self.render_news_item)
+        list_layout.addWidget(self.news_list, 1)
+        layout.addWidget(list_panel, 4)
+
+        detail_panel = panel()
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.addWidget(QLabel("简讯详情"))
+        self.news_detail = QTextBrowser()
+        self.news_detail.setOpenExternalLinks(False)
+        self.news_detail.setHtml(
+            "<div style='color:#77817e;'>选择一条简讯查看标题、摘要、发布时间和作者。</div>"
+        )
+        detail_layout.addWidget(self.news_detail, 1)
+        self.news_open_button = QPushButton("打开原文")
+        self.news_open_button.setEnabled(False)
+        self.news_open_button.clicked.connect(self.open_selected_news_url)
+        detail_layout.addWidget(self.news_open_button)
+        layout.addWidget(detail_panel, 6)
         return page
 
     def _knowledge_page(self) -> QWidget:
@@ -501,6 +685,23 @@ class MainWindow(QMainWindow):
         self.pet_scale_spin.setRange(50, 200)
         self.pet_scale_spin.setSuffix("%")
         pet_form.addWidget(self.pet_scale_spin)
+        pet_form.addWidget(QLabel("显示器适配预设"))
+        self.pet_display_profile_combo = QComboBox()
+        self.pet_display_profile_combo.addItem(
+            "笔记本 2880×1800（200% 缩放）",
+            "laptop_2880_200",
+        )
+        self.pet_display_profile_combo.addItem(
+            "2K 27 寸显示器（100% 缩放）",
+            "desktop_2k_100",
+        )
+        pet_form.addWidget(self.pet_display_profile_combo)
+        profile_hint = QLabel(
+            "预设用于校准点击穿透状态下的右键命中区域，不改变上方桌宠尺寸。"
+        )
+        profile_hint.setObjectName("muted")
+        profile_hint.setWordWrap(True)
+        pet_form.addWidget(profile_hint)
         pet_form.addWidget(QLabel("题目气泡等待时间"))
         self.pet_question_timeout_spin = QSpinBox()
         self.pet_question_timeout_spin.setRange(10, 300)
@@ -511,6 +712,32 @@ class MainWindow(QMainWindow):
         pet_form.addWidget(pet_save, 0, Qt.AlignmentFlag.AlignRight)
         pet_form.addStretch()
         tabs.addTab(pet_tab, "桌宠")
+
+        activity_tab = QWidget()
+        activity_form = QVBoxLayout(activity_tab)
+        self.activity_tracking_check = QCheckBox("记录匿名键鼠活动")
+        activity_form.addWidget(self.activity_tracking_check)
+        activity_note = QLabel(
+            "仅按 5 分钟时间段保存前台应用进程名、键盘次数、鼠标活跃秒数和点击次数。"
+            "不保存具体按键、输入内容、窗口标题、鼠标坐标或完整程序路径。"
+            "连续工作 40 分钟后，会将本次会话的进程名和聚合计数发送给当前配置的模型，"
+            "用于生成休息提醒。"
+        )
+        activity_note.setObjectName("muted")
+        activity_note.setWordWrap(True)
+        activity_form.addWidget(activity_note)
+        activity_actions = QHBoxLayout()
+        clear_activity = QPushButton("清空活动历史")
+        clear_activity.setProperty("danger", True)
+        clear_activity.clicked.connect(self.clear_activity_history)
+        save_activity = QPushButton("应用活动记录设置")
+        save_activity.clicked.connect(self.save_activity_settings)
+        activity_actions.addWidget(clear_activity)
+        activity_actions.addStretch()
+        activity_actions.addWidget(save_activity)
+        activity_form.addLayout(activity_actions)
+        activity_form.addStretch()
+        tabs.addTab(activity_tab, "活动记录")
 
         layout.addWidget(settings, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch()
@@ -524,35 +751,250 @@ class MainWindow(QMainWindow):
             icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
         self.setWindowIcon(icon)
         self.tray.setIcon(icon)
-        menu = QMenu()
-        show_action = QAction("打开学习面板", self)
-        show_action.triggered.connect(self.show_and_raise)
-        pet_action = QAction("显示桌宠", self)
-        pet_action.triggered.connect(self.pet.show)
-        quit_action = QAction("退出", self)
-        quit_action.triggered.connect(self.exit_application)
-        menu.addAction(show_action)
-        menu.addAction(pet_action)
-        menu.addSeparator()
-        menu.addAction(quit_action)
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(lambda reason: self.show_and_raise() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray_menu = QMenu(self)
+        self.tray_show_action = QAction("打开学习面板", self)
+        self.tray_show_action.triggered.connect(
+            lambda _checked=False: self.show_and_raise()
+        )
+        self.tray_pet_action = QAction("显示桌宠", self)
+        self.tray_pet_action.triggered.connect(lambda _checked=False: self.pet.show())
+        self.tray_quit_action = QAction("退出", self)
+        self.tray_quit_action.triggered.connect(
+            lambda _checked=False: self.exit_application()
+        )
+        self.tray_menu.addAction(self.tray_show_action)
+        self.tray_menu.addAction(self.tray_pet_action)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.tray_quit_action)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self._tray_activated)
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.show_and_raise()
 
     def _connect_pet(self):
         self.pet.answer_selected.connect(self.answer_from_pet)
         self.pet.question_unanswered.connect(self.question_unanswered_from_pet)
+        self.pet.open_panel_requested.connect(self.show_and_raise)
+        self.pet.open_dashboard_requested.connect(self.show_and_raise)
+        self.pet.show_statistics_requested.connect(self.show_statistics_page)
+        self.pet.show_ai_news_requested.connect(self.show_ai_news)
+        self.pet.news_detail_requested.connect(self.show_news_detail)
+        self.pet.news_read_requested.connect(self.mark_ai_news_read)
+
+    def show_ai_news(self) -> None:
+        cached = self.service.cached_ai_news()
+        if cached and cached.get("items"):
+            read_ids = self.service.read_ai_news_ids(cached)
+            items = [item for item in cached["items"] if int(item["id"]) not in read_ids]
+            if not items:
+                self.pet.show_message("本轮 AI 简讯已经全部阅完，可在学习面板中随时查看。", 8000)
+                return
+            item = dict(items[self.ai_news_cursor % len(items)])
+            self.ai_news_cursor = (self.ai_news_cursor + 1) % len(items)
+            item["published_at_display"] = self._news_time(item["published_at"])
+            self.pet.show_ai_news(item)
+            return
+        self.ai_news_show_after_refresh = True
+        self.pet.show_message("正在生成最新 AI 简讯，请稍候……", 60_000)
+        self.start_ai_news_refresh()
+
+    def mark_ai_news_read(self, news_id: int) -> None:
+        self.service.mark_ai_news_read(news_id)
+        self.ai_news_cursor = 0
+
+    def refresh_ai_news_if_due(self) -> None:
+        if self.service.ai_news_due():
+            self.start_ai_news_refresh()
+
+    def start_ai_news_refresh(self, force: bool = False) -> None:
+        if self.ai_news_worker_active:
+            return
+        self.ai_news_worker_active = True
+        self.news_refresh_button.setEnabled(False)
+        self.news_refresh_button.setText("抓取中…")
+        self.news_progress.setValue(0)
+        self.news_progress.setFormat("0% · 准备抓取")
+        self.news_progress.show()
+        self.news_progress_detail.setText("正在启动抓取任务")
+        self.news_progress_detail.show()
+        self.news_status.setText("正在获取来源并生成 20 条中文简讯……")
+        worker = Worker(self.service.fetch_ai_news, force)
+        worker.kwargs["progress"] = worker.signals.progress.emit
+        worker.kwargs["item_completed"] = worker.signals.item_completed.emit
+        worker.signals.progress.connect(self._ai_news_progress)
+        worker.signals.item_completed.connect(self._ai_news_item_completed)
+        worker.signals.result.connect(self._ai_news_completed)
+        worker.signals.error.connect(self._ai_news_failed)
+        worker.signals.finished.connect(self._finish_ai_news_worker)
+        self._start_worker(worker)
+
+    def _ai_news_progress(self, update: dict) -> None:
+        percent = max(0, min(100, int(update.get("percent", 0))))
+        stage = str(update.get("stage") or "正在抓取")
+        detail = str(update.get("detail") or "")
+        self.news_progress.setValue(percent)
+        self.news_progress.setFormat(f"{percent}% · {stage}")
+        self.news_progress_detail.setText(detail or stage)
+        self.news_status.setText(stage)
+
+    def _ai_news_completed(self, digest: dict) -> None:
+        self.refresh_news(digest)
+        if self.ai_news_show_after_refresh:
+            self.ai_news_show_after_refresh = False
+            self.show_ai_news()
+
+    def _ai_news_item_completed(self, digest: dict) -> None:
+        self.refresh_news(digest)
+
+    def _ai_news_failed(self, error: str) -> None:
+        self.news_status.setText(f"更新失败：{error}")
+        self.news_progress.setFormat("抓取失败")
+        self.news_progress_detail.setText(error)
+        if self.ai_news_show_after_refresh:
+            self.ai_news_show_after_refresh = False
+            self.pet.show_message(f"AI 简讯更新失败：{error}", 8000)
+
+    def _finish_ai_news_worker(self) -> None:
+        self.ai_news_worker_active = False
+        self.news_refresh_button.setEnabled(True)
+        self.news_refresh_button.setText("主动抓取")
+
+    def refresh_news(self, digest: dict | None = None) -> None:
+        digest = digest or self.service.cached_ai_news()
+        self.news_list.clear()
+        if not digest:
+            self.news_status.setText("暂无简讯，等待首次更新")
+            return
+        for brief in digest["items"]:
+            item = QListWidgetItem(
+                f"{brief['title']}\n{self._news_time(brief['published_at'])} · {brief['author']}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, brief)
+            self.news_list.addItem(item)
+        updated = datetime.fromtimestamp(int(digest["fetched_at"])).astimezone()
+        completed = len(digest["items"])
+        failures = len(digest.get("failures") or [])
+        if digest.get("complete") is False:
+            processed = int(digest.get("processed") or completed + failures)
+            status = f"已完成 {completed} 条 · 正在处理 {processed}/20"
+        elif failures:
+            status = f"已完成 {completed} 条 · 失败 {failures} 条"
+        else:
+            status = f"共 {completed} 条"
+        self.news_status.setText(
+            f"{status} · 更新于 {updated.strftime('%m-%d %H:%M')} · 每 8 小时刷新"
+        )
+
+    def render_news_item(self, item: QListWidgetItem) -> None:
+        brief = item.data(Qt.ItemDataRole.UserRole) or {}
+        title = html.escape(str(brief.get("title") or ""))
+        summary = html.escape(str(brief.get("summary") or ""))
+        author = html.escape(str(brief.get("author") or "未知作者"))
+        original_title = html.escape(str(brief.get("original_title") or ""))
+        self.news_detail.setHtml(
+            f"<h2 style='color:#203d34;'>{title}</h2>"
+            f"<p style='color:#77817e;'>{self._news_time(brief.get('published_at'))} · 作者：{author}</p>"
+            f"<p style='font-size:15px;line-height:1.65;color:#303735;'>{summary}</p>"
+            f"<hr><p style='color:#77817e;font-size:12px;'>原始标题：{original_title}</p>"
+        )
+        self.news_open_button.setProperty("url", str(brief.get("original_url") or ""))
+        self.news_open_button.setEnabled(bool(brief.get("original_url")))
+
+    def show_news_detail(self, news_id: int) -> None:
+        self.show_page(5, "AI 简讯")
+        self.show_and_raise()
+        for row in range(self.news_list.count()):
+            item = self.news_list.item(row)
+            brief = item.data(Qt.ItemDataRole.UserRole) or {}
+            if int(brief.get("id") or -1) == int(news_id):
+                self.news_list.setCurrentItem(item)
+                self.render_news_item(item)
+                break
+
+    def open_selected_news_url(self) -> None:
+        url = str(self.news_open_button.property("url") or "").strip()
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    @staticmethod
+    def _news_time(value: object) -> str:
+        try:
+            return datetime.fromisoformat(str(value)).astimezone().strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return "时间未知"
+
+    def show_statistics_page(self) -> None:
+        try:
+            self.activity_recorder.flush()
+            activity_date = datetime.now().astimezone().date().isoformat()
+            rows = self.service.database.list_activity_buckets(activity_date)
+            summary = self.service.database.get_daily_activity_summary(activity_date)
+        except Exception as exc:
+            self.pet.show_message(f"今日统计读取失败：{exc}", 6000)
+            return
+
+        if not self.activity_recorder.enabled:
+            self.pet.show_message(
+                "匿名活动记录尚未开启。\n请在学习面板的设置 → 活动记录中开启。",
+                7000,
+            )
+            return
+        total_keys = sum(int(item["key_press_count"]) for item in summary)
+        work_seconds = self._daily_work_seconds(rows)
+        top_application = display_application_name(summary[0]["application"]) if summary else "暂无"
+        self.pet.show_statistics(
+            self._format_work_duration(work_seconds),
+            total_keys,
+            top_application,
+        )
+
+    @staticmethod
+    def _daily_work_seconds(rows: list[dict]) -> int:
+        intervals = []
+        for row in rows:
+            try:
+                started_at = datetime.fromisoformat(str(row["first_activity_at"]))
+                ended_at = datetime.fromisoformat(str(row["last_activity_at"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ended_at < started_at:
+                continue
+            intervals.append((started_at, ended_at))
+        if not intervals:
+            return 0
+
+        intervals.sort(key=lambda item: item[0])
+        session_start, session_end = intervals[0]
+        total_seconds = 0.0
+        for started_at, ended_at in intervals[1:]:
+            if (started_at - session_end).total_seconds() < 10 * 60:
+                session_end = max(session_end, ended_at)
+            else:
+                total_seconds += max(0.0, (session_end - session_start).total_seconds())
+                session_start, session_end = started_at, ended_at
+        total_seconds += max(0.0, (session_end - session_start).total_seconds())
+        return int(total_seconds)
 
     def show_page(self, index: int, title: str):
         self.pages.setCurrentIndex(index)
         self.page_title.setText(title)
-        if index == 1:
-            self.refresh_sources()
+        if index == 0:
+            self.refresh_home()
         elif index == 2:
-            self.load_next_practice()
+            self.refresh_sources()
         elif index == 3:
+            self.load_next_practice()
+        elif index == 4:
             self.refresh_skills()
+        elif index == 5:
+            self.refresh_news()
 
     def _start_worker(self, worker: Worker) -> None:
         self.active_workers.add(worker)
@@ -560,11 +1002,175 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def refresh_all(self):
+        self.refresh_home()
         self.refresh_sources()
         self.refresh_conversations()
         self.refresh_skills()
         self.load_settings()
         self.load_next_practice()
+
+    @staticmethod
+    def _activity_clock(value: str) -> str:
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime("%H:%M")
+        except (TypeError, ValueError):
+            return "-"
+
+    def refresh_home(self):
+        try:
+            self.activity_recorder.flush()
+            activity_date = datetime.now().astimezone().date().isoformat()
+            rows = self.service.database.list_activity_buckets(activity_date)
+            summary = self.service.database.get_daily_activity_summary(activity_date)
+        except Exception as exc:
+            self.home_activity_status.setText("统计读取失败")
+            self.statusBar().showMessage(f"活动统计读取失败：{exc}", 5000)
+            return
+
+        total_keys = sum(int(item["key_press_count"]) for item in summary)
+        self.home_key_total.setText(f"{total_keys:,} 次")
+        if summary:
+            top = summary[0]
+            top_name = display_application_name(top["application"])
+            self.home_top_application.setText(top_name)
+            self.home_top_application.setToolTip(top_name)
+            first = min(str(item["first_activity_at"]) for item in summary)
+            last = max(str(item["last_activity_at"]) for item in summary)
+            self.home_activity_range.setText(
+                f"{self._activity_clock(first)} - {self._activity_clock(last)}"
+            )
+        else:
+            self.home_top_application.setText("暂无")
+            self.home_top_application.setToolTip("")
+            self.home_activity_range.setText("暂无")
+
+        self.home_activity_table.setRowCount(len(summary))
+        for row_index, item in enumerate(summary):
+            values = (
+                display_application_name(item["application"]),
+                f"{int(item['key_press_count']):,}",
+                f"{self._activity_clock(item['first_activity_at'])} - "
+                f"{self._activity_clock(item['last_activity_at'])}",
+            )
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                if column == 1:
+                    table_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.home_activity_table.setItem(row_index, column, table_item)
+
+        self.home_timeline.set_activity(rows)
+        top_applications = summary[:8]
+        legend = []
+        for index, item in enumerate(top_applications):
+            color = ActivityTimelineWidget.COLORS[index % len(ActivityTimelineWidget.COLORS)]
+            legend.append(
+                f"<span style='color:{color};font-size:16px;'>■</span> "
+                f"{html.escape(display_application_name(item['application']))} {int(item['key_press_count']):,}"
+            )
+        self.home_timeline_legend.setText("　".join(legend))
+        enabled = self.service.database.get_setting("activity_tracking_enabled", "0") == "1"
+        if not enabled:
+            self.home_activity_status.setText("记录未开启")
+        elif not rows:
+            self.home_activity_status.setText("等待活动数据")
+        else:
+            self.home_activity_status.setText("每 30 秒更新")
+        self._update_home_work_session(
+            self.activity_recorder.get_current_work_session()
+        )
+
+    def check_work_session(self) -> None:
+        session = self.activity_recorder.get_current_work_session()
+        self.pet.set_work_session_tooltip(session)
+        self._update_home_work_session(session)
+        if (
+            session is None
+            or session["duration_seconds"] < 40 * 60
+            or session.get("reminder_sent")
+            or self.work_break_worker_active
+            or not self.pet.can_show_break_reminder()
+        ):
+            return
+        claimed = self.activity_recorder.claim_break_reminder(40)
+        if claimed is None:
+            return
+        self.work_break_worker_active = True
+        session_started_at = str(claimed["started_at"])
+        self.work_break_session_started_at = session_started_at
+        worker = Worker(
+            self.service.analyze_work_session,
+            self.activity_recorder,
+            claimed,
+        )
+        worker.signals.result.connect(
+            lambda result, started_at=session_started_at: self._work_break_completed(
+                result, started_at
+            )
+        )
+        worker.signals.error.connect(
+            lambda _message, current=claimed, started_at=session_started_at: (
+                self._work_break_fallback(current, started_at)
+            )
+        )
+        worker.signals.finished.connect(self._work_break_finished)
+        self._start_worker(worker)
+
+    @staticmethod
+    def _format_work_duration(seconds: int) -> str:
+        minutes = max(0, int(seconds)) // 60
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}小时{minutes}分钟" if hours else f"{minutes}分钟"
+
+    def _update_home_work_session(self, session: dict | None) -> None:
+        if not self.activity_recorder.enabled:
+            self.home_work_session.setText("记录未开启")
+            self.home_work_session.setToolTip("请在设置 → 活动记录中开启匿名键鼠活动")
+            return
+        if not session:
+            self.home_work_session.setText("等待活动")
+            self.home_work_session.setToolTip("键盘或鼠标活动后开始计时")
+            return
+        duration = self._format_work_duration(int(session.get("duration_seconds", 0)))
+        key_count = int(session.get("key_press_count", 0))
+        self.home_work_session.setText(duration)
+        self.home_work_session.setToolTip(
+            f"本次键盘敲击 {key_count:,} 次；连续 10 分钟无操作后结束计时"
+        )
+
+    def _is_current_work_session(self, started_at: str) -> bool:
+        session = self.activity_recorder.get_current_work_session()
+        return bool(session and session.get("started_at") == started_at)
+
+    def _work_break_completed(self, result: dict, started_at: str) -> None:
+        if not self._is_current_work_session(started_at):
+            return
+        report = result["report"]
+        message = (
+            f"{report['summary']}\n\n"
+            f"{report['activity']}\n\n"
+            f"{report['suggestion']}"
+        )
+        self.pet.show_message(message, 20_000)
+
+    def _work_break_fallback(self, session: dict, started_at: str) -> None:
+        if not self._is_current_work_session(started_at):
+            return
+        applications = session.get("applications", [])[:3]
+        app_text = "、".join(
+            f"{display_application_name(item['application'])}（{int(item['key_press_count']):,}次）"
+            for item in applications
+        ) or "未识别应用"
+        message = (
+            f"你已经连续工作 {self._format_work_duration(session['duration_seconds'])}，"
+            f"键盘敲击 {int(session['key_press_count']):,} 次。\n\n"
+            f"主要活动应用：{app_text}。\n\n"
+            "起来走动一下，让眼睛和手腕休息几分钟吧。"
+        )
+        self.pet.show_message(message, 20_000)
+
+    def _work_break_finished(self) -> None:
+        self.work_break_worker_active = False
+        self.work_break_session_started_at = None
 
     def refresh_sources(self):
         sources = self.service.database.list_sources()
@@ -959,7 +1565,6 @@ class MainWindow(QMainWindow):
         self.pet.show_message(message)
         self.statusBar().showMessage(message, 8000)
         self.refresh_sources()
-        QTimer.singleShot(4500, self.pet.show_next_question)
 
     def delete_selected_source(self, table: QTableWidget):
         row = table.currentRow()
@@ -973,7 +1578,10 @@ class MainWindow(QMainWindow):
         self.load_next_practice()
 
     def _practice_filter_changed(self, *_args) -> None:
-        self.load_next_practice(advance=True)
+        self.recent_practice_question_ids.clear()
+        self.recent_practice_source_ids.clear()
+        self.current_practice_question = None
+        self.load_next_practice()
 
     def _practice_mode(self) -> str:
         for mode, button in self.practice_mode_buttons.items():
@@ -992,11 +1600,11 @@ class MainWindow(QMainWindow):
             button.setText(f"{labels[mode]} ({counts[mode]})")
 
     def load_next_practice(self, advance: bool = False):
-        previous_id = (
-            int(self.current_practice_question["id"])
-            if advance and self.current_practice_question
-            else None
-        )
+        previous = self.current_practice_question if advance else None
+        previous_id = int(previous["id"]) if previous else None
+        if previous is not None:
+            self.recent_practice_question_ids.append(previous_id)
+            self.recent_practice_source_ids.append(int(previous["source_id"]))
         source_id = self.practice_source_combo.currentData()
         mode = self._practice_mode()
         wrong_only = mode == "wrong"
@@ -1004,10 +1612,36 @@ class MainWindow(QMainWindow):
         self._refresh_practice_mode_labels(source_id)
         question = self.service.database.next_question(
             exclude_id=previous_id,
+            exclude_ids=tuple(self.recent_practice_question_ids),
+            exclude_source_ids=(
+                tuple(self.recent_practice_source_ids)
+                if source_id is None and advance
+                else None
+            ),
             source_id=source_id,
             wrong_only=wrong_only,
             unanswered_only=unanswered_only,
+            randomize=True,
         )
+        if question is None and source_id is None and advance:
+            question = self.service.database.next_question(
+                exclude_id=previous_id,
+                exclude_ids=tuple(self.recent_practice_question_ids),
+                source_id=source_id,
+                wrong_only=wrong_only,
+                unanswered_only=unanswered_only,
+                randomize=True,
+            )
+        if question is None and previous_id is not None:
+            self.recent_practice_question_ids.clear()
+            self.recent_practice_source_ids.clear()
+            question = self.service.database.next_question(
+                exclude_id=previous_id,
+                source_id=source_id,
+                wrong_only=wrong_only,
+                unanswered_only=unanswered_only,
+                randomize=True,
+            )
         no_alternative = False
         if question is None and previous_id is not None:
             previous = self.service.database.get_question(previous_id)
@@ -1127,8 +1761,17 @@ class MainWindow(QMainWindow):
         }
         for control, (key, default) in checks.items():
             control.setChecked(database.get_setting(key, default) == "1")
+        self.activity_tracking_check.setChecked(
+            database.get_setting("activity_tracking_enabled", "0") == "1"
+        )
         self.pet_opacity_slider.setValue(int(database.get_setting("pet_opacity", "100")))
         self.pet_scale_spin.setValue(int(database.get_setting("pet_scale", "100")))
+        display_profile = database.get_setting(
+            "pet_display_profile",
+            "laptop_2880_200",
+        )
+        profile_index = self.pet_display_profile_combo.findData(display_profile)
+        self.pet_display_profile_combo.setCurrentIndex(max(0, profile_index))
         self.pet_question_timeout_spin.setValue(
             int(database.get_setting("pet_question_timeout", "45"))
         )
@@ -1165,6 +1808,7 @@ class MainWindow(QMainWindow):
             keyboard_enabled=self.pet_keyboard_check.isChecked(),
             mouse_enabled=self.pet_mouse_check.isChecked(),
             question_timeout=self.pet_question_timeout_spin.value(),
+            display_profile=str(self.pet_display_profile_combo.currentData()),
         )
 
     def save_pet_settings(self):
@@ -1181,20 +1825,75 @@ class MainWindow(QMainWindow):
             "pet_keyboard_enabled": settings.keyboard_enabled,
             "pet_mouse_enabled": settings.mouse_enabled,
             "pet_question_timeout": settings.question_timeout,
+            "pet_display_profile": settings.display_profile,
         }
         for key, value in values.items():
             self.service.database.set_setting(key, str(int(value)) if isinstance(value, bool) else str(value))
         self.pet.apply_settings(settings)
         self.statusBar().showMessage("桌宠设置已应用", 5000)
 
+    def save_activity_settings(self):
+        enabled = self.activity_tracking_check.isChecked()
+        self.service.database.set_setting("activity_tracking_enabled", str(int(enabled)))
+        self.activity_recorder.set_enabled(enabled)
+        state = "已开始记录匿名活动" if enabled else "活动记录已暂停"
+        self.statusBar().showMessage(state, 5000)
+        self.refresh_home()
+
+    def clear_activity_history(self):
+        confirmed = QMessageBox.question(
+            self,
+            "清空活动历史",
+            "确定删除本机保存的全部键鼠活动统计吗？此操作不可撤销。",
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        was_enabled = self.activity_recorder.enabled
+        self.activity_recorder.set_enabled(False)
+        self.activity_recorder.flush()
+        deleted = self.service.database.clear_activity_history()
+        self.activity_recorder.set_enabled(was_enabled)
+        self.statusBar().showMessage(f"已清空 {deleted} 条活动统计", 5000)
+        self.refresh_home()
+
     def _save_pet_position(self, x: int, y: int) -> None:
         self.service.database.set_setting("pet_x", str(x))
         self.service.database.set_setting("pet_y", str(y))
 
     def show_and_raise(self):
+        state = self.windowState()
+        if state & Qt.WindowState.WindowMinimized:
+            self.setWindowState(
+                (state & ~Qt.WindowState.WindowMinimized)
+                | Qt.WindowState.WindowActive
+            )
         self.show()
+        self._ensure_window_on_screen()
+        QTimer.singleShot(0, self._activate_visible_window)
+
+    def _ensure_window_on_screen(self) -> None:
+        frame = self.frameGeometry()
+        if any(screen.availableGeometry().intersects(frame) for screen in QApplication.screens()):
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        bounds = screen.availableGeometry()
+        self.move(
+            bounds.center().x() - self.width() // 2,
+            bounds.center().y() - self.height() // 2,
+        )
+
+    def _activate_visible_window(self) -> None:
         self.raise_()
         self.activateWindow()
+        if os.name == "nt":
+            handle = int(self.winId())
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(handle, 9)
+            user32.BringWindowToTop(handle)
+            user32.SetForegroundWindow(handle)
+        QApplication.alert(self, 0)
 
     def exit_application(self):
         if self.active_workers:
@@ -1212,7 +1911,6 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
             self.hide()
-            self.tray.showMessage("Bongo Study", "学习伙伴仍在桌面上运行。", QSystemTrayIcon.MessageIcon.Information, 2500)
 
     def _show_error(self, message: str):
         self.statusBar().showMessage("操作失败", 8000)
@@ -1251,6 +1949,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", default=None, help="Override local application data directory")
     parser.add_argument("--no-pet", action="store_true", help="Start without showing the desktop pet")
     parser.add_argument("--smoke-test", action="store_true", help="Start offscreen and exit automatically")
+    parser.add_argument("--legacy-ui", action="store_true", help="Use the legacy QWidget management panel")
     return parser
 
 
@@ -1275,8 +1974,17 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.smoke_test:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
         os.environ["BONGO_DISABLE_GLOBAL_INPUT"] = "1"
+    else:
+        os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
     if os.name == "nt":
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(-4)
+            )
+        except (AttributeError, OSError):
+            pass
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BongoStudy.Desktop")
         except OSError:
@@ -1303,18 +2011,83 @@ def main(argv=None) -> int:
             raise RuntimeError(f"无法创建单实例服务：{instance_server.errorString()}")
     crash_log = (service.data_dir / "crash.log").open("a", encoding="utf-8")
     faulthandler.enable(crash_log)
-    pet = PetWindow(lambda: service.database.next_question(bubble_only=True))
-    window = MainWindow(
-        service,
-        pet,
-        start_hidden=args.smoke_test,
-        pet_enabled=not args.no_pet and not args.smoke_test,
+    recent_pet_source_ids: deque[int] = deque(maxlen=2)
+
+    def next_pet_question():
+        question = service.database.next_question(
+            bubble_only=True,
+            exclude_source_ids=tuple(recent_pet_source_ids),
+        )
+        if question is None and recent_pet_source_ids:
+            # A small selected scope may contain only one or two sources. In that
+            # case keep producing questions instead of enforcing source diversity.
+            question = service.database.next_question(bubble_only=True)
+        if question:
+            # Persist recency when the question is selected for an actual bubble.
+            # This keeps repeated timer ticks from favoring one early-imported item.
+            service.database.mark_question_bubbled(int(question["id"]))
+            recent_pet_source_ids.append(int(question["source_id"]))
+        return question
+
+    activity_recorder = ActivityRecorder(
+        service.database,
+        enabled=service.database.get_setting("activity_tracking_enabled", "0") == "1",
     )
+    activity_sample_timer = QTimer(app)
+    activity_sample_timer.setInterval(1_000)
+    activity_sample_timer.timeout.connect(activity_recorder.sample_foreground)
+    if not args.smoke_test:
+        activity_sample_timer.start()
+    pet = PetWindow(next_pet_question, activity_recorder.record)
+    bridge = None
+    engine = None
+    if args.legacy_ui:
+        window = MainWindow(
+            service,
+            pet,
+            activity_recorder,
+            start_hidden=args.smoke_test,
+            pet_enabled=not args.no_pet and not args.smoke_test,
+        )
+        activity_flush_timer = QTimer(app)
+        activity_flush_timer.setInterval(30_000)
+        activity_flush_timer.timeout.connect(activity_recorder.flush)
+        activity_flush_timer.start()
+    else:
+        bridge = BongoBridge(
+            service,
+            pet,
+            activity_recorder,
+            APP_ICON_PATH,
+            pet_enabled=not args.no_pet and not args.smoke_test,
+            start_background_tasks=not args.smoke_test,
+        )
+        engine = QQmlApplicationEngine()
+        engine.warnings.connect(
+            lambda warnings: [print(error.toString(), file=sys.stderr) for error in warnings]
+        )
+        engine.rootContext().setContextProperty("bridge", bridge)
+        qml_path = Path(__file__).parent / "qml" / "Main.qml"
+        engine.load(QUrl.fromLocalFile(str(qml_path)))
+        if not engine.rootObjects():
+            bridge.shutdown()
+            service.close()
+            crash_log.close()
+            raise RuntimeError(f"无法加载 QML 界面：{qml_path}")
+        window = engine.rootObjects()[0]
+        window.setIcon(QIcon(str(APP_ICON_PATH)))
+        bridge.attachWindow(window)
+        _apply_windows_title_bar_theme(window)
+        if args.smoke_test:
+            window.hide()
 
     def activate_existing_window() -> None:
         while instance_server.hasPendingConnections():
             connection = instance_server.nextPendingConnection()
-            window.show_and_raise()
+            if bridge is not None:
+                bridge.show_window()
+            else:
+                window.show_and_raise()
             connection.disconnectFromServer()
 
     instance_server.newConnection.connect(activate_existing_window)
@@ -1325,11 +2098,20 @@ def main(argv=None) -> int:
         pet.setVisible(pet.pet_settings.visible)
         pet.start_input_monitor()
     if args.smoke_test:
-        QTimer.singleShot(800, app.quit)
+        if bridge is not None:
+            for index in range(7):
+                QTimer.singleShot(120 + index * 120, lambda page=index: window.setProperty("currentPage", page))
+            QTimer.singleShot(1100, app.quit)
+        else:
+            QTimer.singleShot(800, app.quit)
     try:
         return app.exec()
     finally:
-        pet.stop_input_monitor()
+        if bridge is not None:
+            bridge.shutdown()
+        else:
+            pet.stop_input_monitor()
+            activity_recorder.flush()
         service.close()
         crash_log.close()
 

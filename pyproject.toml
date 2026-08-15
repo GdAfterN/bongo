@@ -34,9 +34,14 @@ packages = ["bongo"]
 bongo = [
   "assets/app-icon.ico",
   "assets/app-icon.png",
+  "assets/icons/*.svg",
   "assets/bongocat/*",
   "assets/bongocat/model/*",
   "assets/bongocat/model/demomodel.1024/*",
   "assets/bongocat/model/resources/*",
   "assets/bongocat/model/resources/left-keys/*",
+  "qml/*.qml",
+  "qml/components/*.qml",
+  "qml/components/qmldir",
+  "qml/pages/*.qml",
 ]

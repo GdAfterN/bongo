@@ -177,7 +177,7 @@ class AnthropicProvider(ConversationProvider):
 
 
 class ClaudeCodeProvider(ConversationProvider):
-    """Tool-free Claude Code adapter. Application history remains the source of truth."""
+    """Claude Code adapter using the selected workspace as its working directory."""
 
     def __init__(self, config: ProviderConfig, cwd: str | Path | None = None):
         executable = shutil.which("claude")
@@ -196,11 +196,8 @@ class ClaudeCodeProvider(ConversationProvider):
         command = [
             self.executable,
             "--print",
-            "--safe-mode",
-            "--disable-slash-commands",
-            "--no-session-persistence",
-            "--tools",
-            "",
+            "--permission-mode",
+            "acceptEdits",
             "--system-prompt",
             system,
         ]
@@ -246,15 +243,16 @@ class ClaudeCodeProvider(ConversationProvider):
 
 
 class CodexCliProvider(ConversationProvider):
-    """Read-only Codex CLI adapter. Application history remains the source of truth."""
+    """Codex CLI adapter using workspace-write inside the selected directory."""
 
-    def __init__(self, config: ProviderConfig, cwd: str | Path | None = None):
+    def __init__(self, config: ProviderConfig, cwd: str | Path | None = None, writable: bool = False):
         executable = shutil.which("codex")
         if not executable:
             raise ProviderError("Codex CLI was not found in PATH")
         self.executable = executable
         self.model = config.model
         self.cwd = Path(cwd or Path.home()).resolve()
+        self.writable = writable
 
     def complete(self, messages, system, response_schema=None):
         transcript = []
@@ -271,7 +269,7 @@ class CodexCliProvider(ConversationProvider):
             self.executable,
             "exec",
             "--sandbox",
-            "read-only",
+            "workspace-write" if self.writable else "read-only",
             "--skip-git-repo-check",
             "--color",
             "never",

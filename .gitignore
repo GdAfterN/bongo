@@ -38,6 +38,11 @@ tmp/
 .bongo/
 .bongo-local/
 .bongo-smoke/
+.bongo-*
+.test-tmp-*
+.codex-smoke-*
+.codex_test_tmp_*
+_codex_*
 artifacts/
 readme_intro_locked/
 tests/results/

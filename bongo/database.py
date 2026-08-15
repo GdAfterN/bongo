@@ -77,6 +77,8 @@ class StudyDatabase:
                     ask_count INTEGER NOT NULL DEFAULT 0,
                     correct_count INTEGER NOT NULL DEFAULT 0,
                     last_asked_at TEXT,
+                    last_bubble_at TEXT,
+                    bubble_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -162,6 +164,69 @@ class StudyDatabase:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS activity_buckets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    activity_date TEXT NOT NULL,
+                    bucket_start TEXT NOT NULL,
+                    application TEXT NOT NULL,
+                    key_press_count INTEGER NOT NULL DEFAULT 0,
+                    mouse_active_seconds INTEGER NOT NULL DEFAULT 0,
+                    foreground_seconds INTEGER NOT NULL DEFAULT 0,
+                    mouse_click_count INTEGER NOT NULL DEFAULT 0,
+                    first_activity_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    UNIQUE(activity_date, bucket_start, application)
+                );
+
+                CREATE TABLE IF NOT EXISTS rag_connections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL DEFAULT '',
+                    knowledge_id TEXT NOT NULL DEFAULT '',
+                    upload_path TEXT NOT NULL DEFAULT '/documents',
+                    retrieval_path TEXT NOT NULL DEFAULT '/retrieval',
+                    delete_path TEXT NOT NULL DEFAULT '/documents/{document_id}',
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS rag_documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    connection_id INTEGER NOT NULL REFERENCES rag_connections(id) ON DELETE RESTRICT,
+                    local_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    remote_document_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'uploading',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    synced_at TEXT,
+                    UNIQUE(connection_id, content_hash)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    backend TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_steps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+                    step_type TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    input_json TEXT NOT NULL DEFAULT '{}',
+                    output_text TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_id, position);
                 CREATE INDEX IF NOT EXISTS idx_questions_source ON questions(source_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
@@ -170,6 +235,12 @@ class StudyDatabase:
                 CREATE INDEX IF NOT EXISTS idx_skill_sources_source ON learning_skill_sources(source_id, skill_id);
                 CREATE INDEX IF NOT EXISTS idx_insights_source ON conversation_insights(source_id, id);
                 CREATE INDEX IF NOT EXISTS idx_learning_events_source ON learning_events(source_id, id);
+                CREATE INDEX IF NOT EXISTS idx_activity_buckets_date
+                    ON activity_buckets(activity_date, bucket_start);
+                CREATE INDEX IF NOT EXISTS idx_rag_documents_connection
+                    ON rag_documents(connection_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation
+                    ON agent_runs(conversation_id, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_unanswered_open
                     ON unanswered_questions(question_id) WHERE resolved_at IS NULL;
                 """
@@ -181,9 +252,26 @@ class StudyDatabase:
                 self.conn.execute(
                     "ALTER TABLE conversations ADD COLUMN source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL"
                 )
+            conversation_additions = {
+                "mode": "TEXT NOT NULL DEFAULT 'legacy'",
+                "rag_connection_id": "INTEGER REFERENCES rag_connections(id) ON DELETE SET NULL",
+                "work_dir": "TEXT NOT NULL DEFAULT ''",
+                "memory_json": "TEXT NOT NULL DEFAULT '{}'",
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+            }
+            for column, definition in conversation_additions.items():
+                if column not in conversation_columns:
+                    self.conn.execute(f"ALTER TABLE conversations ADD COLUMN {column} {definition}")
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source_id, updated_at)"
             )
+            activity_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(activity_buckets)").fetchall()
+            }
+            if "foreground_seconds" not in activity_columns:
+                self.conn.execute(
+                    "ALTER TABLE activity_buckets ADD COLUMN foreground_seconds INTEGER NOT NULL DEFAULT 0"
+                )
             source_columns = {
                 row["name"] for row in self.conn.execute("PRAGMA table_info(sources)").fetchall()
             }
@@ -207,6 +295,15 @@ class StudyDatabase:
             if "dirty" not in skill_columns:
                 self.conn.execute(
                     "ALTER TABLE learning_skills ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1"
+                )
+            question_columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(questions)").fetchall()
+            }
+            if "last_bubble_at" not in question_columns:
+                self.conn.execute("ALTER TABLE questions ADD COLUMN last_bubble_at TEXT")
+            if "bubble_count" not in question_columns:
+                self.conn.execute(
+                    "ALTER TABLE questions ADD COLUMN bubble_count INTEGER NOT NULL DEFAULT 0"
                 )
             if added_knowledge_type:
                 code_kinds = (
@@ -254,7 +351,7 @@ class StudyDatabase:
         self,
         path: str | Path,
         content: str,
-        knowledge_type: str = "document",
+        knowledge_type: str = "code",
     ) -> tuple[int, bool]:
         if knowledge_type not in {"document", "code"}:
             raise ValueError("知识类型必须是 document 或 code")
@@ -317,6 +414,9 @@ class StudyDatabase:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_code_sources(self) -> list[dict]:
+        return [item for item in self.list_sources() if item.get("knowledge_type") == "code"]
 
     def get_source(self, source_id: int) -> dict | None:
         with self._lock:
@@ -437,7 +537,7 @@ class StudyDatabase:
     def get_question(self, question_id: int) -> dict | None:
         with self._lock:
             row = self.conn.execute(
-                "SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q "
+                "SELECT q.*, s.name AS source_name, s.problem_title, s.problem_statement, s.knowledge_type FROM questions q "
                 "JOIN sources s ON s.id = q.source_id WHERE q.id = ?",
                 (question_id,),
             ).fetchone()
@@ -449,7 +549,7 @@ class StudyDatabase:
         wrong_only: bool = False,
         unanswered_only: bool = False,
     ) -> list[dict]:
-        conditions = []
+        conditions = ["s.knowledge_type = 'code'"]
         parameters: list[object] = []
         if source_id is not None:
             conditions.append("q.source_id = ?")
@@ -464,7 +564,7 @@ class StudyDatabase:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
             rows = self.conn.execute(
-                "SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q "
+                "SELECT q.*, s.name AS source_name, s.problem_title, s.problem_statement, s.knowledge_type FROM questions q "
                 f"JOIN sources s ON s.id = q.source_id {where} ORDER BY q.id",
                 parameters,
             ).fetchall()
@@ -473,16 +573,29 @@ class StudyDatabase:
     def next_question(
         self,
         exclude_id: int | None = None,
+        exclude_ids: list[int] | tuple[int, ...] | None = None,
+        exclude_source_ids: list[int] | tuple[int, ...] | None = None,
         source_id: int | None = None,
         wrong_only: bool = False,
         unanswered_only: bool = False,
         bubble_only: bool = False,
+        randomize: bool = False,
     ) -> dict | None:
-        conditions = []
+        conditions = ["s.knowledge_type = 'code'"]
         parameters: list[object] = []
         if exclude_id is not None:
             conditions.append("q.id != ?")
             parameters.append(exclude_id)
+        if exclude_ids:
+            recent_question_ids = [int(item) for item in exclude_ids]
+            placeholders = ",".join("?" for _ in recent_question_ids)
+            conditions.append(f"q.id NOT IN ({placeholders})")
+            parameters.extend(recent_question_ids)
+        if exclude_source_ids:
+            recent_source_ids = [int(item) for item in exclude_source_ids]
+            placeholders = ",".join("?" for _ in recent_source_ids)
+            conditions.append(f"q.source_id NOT IN ({placeholders})")
+            parameters.extend(recent_source_ids)
         if source_id is not None:
             conditions.append("q.source_id = ?")
             parameters.append(source_id)
@@ -497,19 +610,89 @@ class StudyDatabase:
             )
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._lock:
-            row = self.conn.execute(
-                f"""
-                SELECT q.*, s.name AS source_name, s.problem_title, s.knowledge_type FROM questions q
-                JOIN sources s ON s.id = q.source_id
-                {where}
-                ORDER BY CASE WHEN q.last_asked_at IS NULL THEN 0 ELSE 1 END,
-                         (q.correct_count * 1.0 / MAX(q.ask_count, 1)) ASC,
-                          COALESCE(q.last_asked_at, q.created_at) ASC
-                LIMIT 1
-                """,
-                parameters,
-            ).fetchone()
+            if bubble_only:
+                # Bubble review is driven by learning difficulty and recency, rather
+                # than source/question insertion order. A short cooldown prevents a
+                # single question from immediately reappearing; the fallback keeps
+                # small knowledge bases usable when every question is cooling down.
+                bubble_where = f"{where} AND (q.last_bubble_at IS NULL OR q.last_bubble_at <= datetime('now', '-600 seconds'))"
+                bubble_sql = f"""
+                    SELECT q.*, s.name AS source_name, s.problem_title, s.problem_statement, s.knowledge_type,
+                           COALESCE((SELECT SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END)
+                                     FROM question_attempts a WHERE a.question_id = q.id), 0) AS wrong_count,
+                           COALESCE((SELECT SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END)
+                                     FROM question_attempts a WHERE a.question_id = q.id), 0) AS answered_correct_count,
+                           (SELECT a.is_correct FROM question_attempts a
+                            WHERE a.question_id = q.id ORDER BY a.id DESC LIMIT 1) AS last_attempt_correct,
+                           CASE WHEN EXISTS (SELECT 1 FROM unanswered_questions u
+                                             WHERE u.question_id = q.id AND u.resolved_at IS NULL)
+                                THEN 1 ELSE 0 END AS has_unanswered
+                    FROM questions q JOIN sources s ON s.id = q.source_id
+                    {bubble_where}
+                    ORDER BY
+                        CASE
+                            WHEN has_unanswered = 1 THEN 0
+                            WHEN wrong_count > 0 AND answered_correct_count = 0 THEN 1
+                            WHEN last_attempt_correct = 0 THEN 2
+                            WHEN q.last_bubble_at IS NULL THEN 3
+                            ELSE 4
+                        END,
+                        wrong_count DESC,
+                        CASE WHEN q.last_bubble_at IS NULL THEN 0 ELSE 1 END,
+                        COALESCE(q.last_bubble_at, '1970-01-01T00:00:00+00:00') ASC,
+                        RANDOM()
+                    LIMIT 1
+                """
+                row = self.conn.execute(bubble_sql, parameters).fetchone()
+                if row is None:
+                    row = self.conn.execute(
+                        f"""
+                        SELECT q.*, s.name AS source_name, s.problem_title, s.problem_statement, s.knowledge_type,
+                               COALESCE((SELECT SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END)
+                                         FROM question_attempts a WHERE a.question_id = q.id), 0) AS wrong_count,
+                               COALESCE((SELECT SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END)
+                                         FROM question_attempts a WHERE a.question_id = q.id), 0) AS answered_correct_count,
+                               (SELECT a.is_correct FROM question_attempts a WHERE a.question_id = q.id
+                                ORDER BY a.id DESC LIMIT 1) AS last_attempt_correct,
+                               CASE WHEN EXISTS (SELECT 1 FROM unanswered_questions u
+                                                 WHERE u.question_id = q.id AND u.resolved_at IS NULL)
+                                    THEN 1 ELSE 0 END AS has_unanswered
+                        FROM questions q JOIN sources s ON s.id = q.source_id
+                        {where}
+                        ORDER BY CASE WHEN has_unanswered = 1 THEN 0
+                                      WHEN wrong_count > 0 AND answered_correct_count = 0 THEN 1
+                                      WHEN last_attempt_correct = 0 THEN 2
+                                      WHEN q.last_bubble_at IS NULL THEN 3 ELSE 4 END,
+                                 wrong_count DESC,
+                                 COALESCE(q.last_bubble_at, '1970-01-01T00:00:00+00:00') ASC,
+                                 RANDOM()
+                        LIMIT 1
+                        """,
+                        parameters,
+                    ).fetchone()
+            else:
+                final_order = "RANDOM()" if randomize else "COALESCE(q.last_asked_at, q.created_at) ASC"
+                row = self.conn.execute(
+                    f"""
+                    SELECT q.*, s.name AS source_name, s.problem_title, s.problem_statement, s.knowledge_type FROM questions q
+                    JOIN sources s ON s.id = q.source_id
+                    {where}
+                    ORDER BY CASE WHEN q.last_asked_at IS NULL THEN 0 ELSE 1 END,
+                             (q.correct_count * 1.0 / MAX(q.ask_count, 1)) ASC,
+                              {final_order}
+                    LIMIT 1
+                    """,
+                    parameters,
+                ).fetchone()
         return self._question(row)
+
+    def mark_question_bubbled(self, question_id: int) -> None:
+        """Record that a question was actually selected for desktop display."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE questions SET last_bubble_at = ?, bubble_count = bubble_count + 1 WHERE id = ?",
+                (utc_now(), question_id),
+            )
 
     def answer_question(self, question_id: int, selected_index: int) -> dict:
         question = self.get_question(question_id)
@@ -645,24 +828,154 @@ class StudyDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def create_conversation(self, title: str, provider: str, source_id: int | None = None) -> int:
+    def create_conversation(
+        self,
+        title: str,
+        provider: str,
+        source_id: int | None = None,
+        *,
+        mode: str = "chat",
+        rag_connection_id: int | None = None,
+        work_dir: str = "",
+    ) -> int:
         now = utc_now()
         with self._lock, self.conn:
             cursor = self.conn.execute(
-                "INSERT INTO conversations(title, provider, source_id, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (title[:80] or "新对话", provider, source_id, now, now),
+                "INSERT INTO conversations(title, provider, source_id, mode, rag_connection_id, work_dir, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (title[:80] or "新会话", provider, source_id, mode, rag_connection_id, work_dir, now, now),
             )
             return int(cursor.lastrowid)
 
     def list_conversations(self, limit: int = 50) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT c.*, s.name AS source_name FROM conversations c "
+                "SELECT c.*, s.name AS source_name, r.name AS rag_connection_name FROM conversations c "
                 "LEFT JOIN sources s ON s.id = c.source_id "
+                "LEFT JOIN rag_connections r ON r.id = c.rag_connection_id "
                 "ORDER BY c.updated_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_rag_connection(
+        self,
+        name: str,
+        base_url: str,
+        api_key: str = "",
+        knowledge_id: str = "",
+        upload_path: str = "/documents",
+        retrieval_path: str = "/retrieval",
+        delete_path: str = "/documents/{document_id}",
+        connection_id: int | None = None,
+    ) -> int:
+        now = utc_now()
+        with self._lock, self.conn:
+            if connection_id:
+                self.conn.execute(
+                    "UPDATE rag_connections SET name=?, base_url=?, api_key=?, knowledge_id=?, "
+                    "upload_path=?, retrieval_path=?, delete_path=?, updated_at=? WHERE id=?",
+                    (name, base_url.rstrip('/'), api_key, knowledge_id, upload_path, retrieval_path,
+                     delete_path, now, connection_id),
+                )
+                return int(connection_id)
+            cursor = self.conn.execute(
+                "INSERT INTO rag_connections(name,base_url,api_key,knowledge_id,upload_path,retrieval_path,delete_path,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (name, base_url.rstrip('/'), api_key, knowledge_id, upload_path, retrieval_path,
+                 delete_path, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def list_rag_connections(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT *, (SELECT COUNT(*) FROM rag_documents d WHERE d.connection_id=r.id) AS document_count "
+                "FROM rag_connections r ORDER BY active DESC, updated_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_rag_connection(self, connection_id: int | None = None) -> dict | None:
+        with self._lock:
+            if connection_id is None:
+                row = self.conn.execute(
+                    "SELECT * FROM rag_connections WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = self.conn.execute("SELECT * FROM rag_connections WHERE id=?", (connection_id,)).fetchone()
+        return dict(row) if row else None
+
+    def activate_rag_connection(self, connection_id: int) -> None:
+        with self._lock, self.conn:
+            if not self.conn.execute("SELECT 1 FROM rag_connections WHERE id=?", (connection_id,)).fetchone():
+                raise KeyError("RAG 连接不存在")
+            self.conn.execute("UPDATE rag_connections SET active=0")
+            self.conn.execute("UPDATE rag_connections SET active=1, updated_at=? WHERE id=?", (utc_now(), connection_id))
+
+    def delete_rag_connection(self, connection_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM rag_connections WHERE id=?", (connection_id,))
+
+    def add_rag_document(self, connection_id: int, path: str | Path, content_hash: str) -> tuple[int, bool]:
+        resolved = Path(path).resolve()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT id FROM rag_documents WHERE connection_id=? AND content_hash=?",
+                (connection_id, content_hash),
+            ).fetchone()
+            if row:
+                return int(row["id"]), False
+            cursor = self.conn.execute(
+                "INSERT INTO rag_documents(connection_id,local_path,name,content_hash,created_at) VALUES(?,?,?,?,?)",
+                (connection_id, str(resolved), resolved.name, content_hash, utc_now()),
+            )
+            return int(cursor.lastrowid), True
+
+    def set_rag_document_status(self, document_id: int, status: str, remote_id: str = "", error: str = "") -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE rag_documents SET status=?, remote_document_id=?, error=?, synced_at=? WHERE id=?",
+                (status, remote_id, error, utc_now() if status == "ready" else None, document_id),
+            )
+
+    def get_rag_document(self, document_id: int) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM rag_documents WHERE id=?", (document_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_rag_documents(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT d.*, r.name AS connection_name FROM rag_documents d "
+                "JOIN rag_connections r ON r.id=d.connection_id ORDER BY d.created_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_rag_document(self, document_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM rag_documents WHERE id=?", (document_id,))
+
+    def create_agent_run(self, conversation_id: int, backend: str) -> int:
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO agent_runs(conversation_id,backend,created_at) VALUES(?,?,?)",
+                (conversation_id, backend, utc_now()),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_agent_run(self, run_id: int, status: str = "completed", error: str = "") -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE agent_runs SET status=?, error=?, finished_at=? WHERE id=?",
+                (status, error, utc_now(), run_id),
+            )
+
+    def add_agent_step(self, run_id: int, step_type: str, name: str, input_value: dict, output: str, status: str = "completed") -> int:
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO agent_steps(run_id,step_type,name,input_json,output_text,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                (run_id, step_type, name, json.dumps(input_value, ensure_ascii=False), output, status, utc_now()),
+            )
+            return int(cursor.lastrowid)
 
     def add_message(self, conversation_id: int, role: str, content: str, citations=None) -> int:
         with self._lock, self.conn:
@@ -974,3 +1287,69 @@ class StudyDatabase:
             value["metadata"] = json.loads(value.pop("metadata_json"))
             result.append(value)
         return result
+
+    def add_activity_buckets(self, rows: list[dict]) -> None:
+        """Merge anonymous counters; raw keys, titles, text and coordinates are absent."""
+        if not rows:
+            return
+        values = [
+            (
+                row["activity_date"],
+                row["bucket_start"],
+                row["application"],
+                int(row.get("key_press_count", 0)),
+                int(row.get("mouse_active_seconds", 0)),
+                int(row.get("foreground_seconds", 0)),
+                int(row.get("mouse_click_count", 0)),
+                row["first_activity_at"],
+                row["last_activity_at"],
+            )
+            for row in rows
+        ]
+        with self._lock, self.conn:
+            self.conn.executemany(
+                "INSERT INTO activity_buckets("
+                "activity_date, bucket_start, application, key_press_count, "
+                "mouse_active_seconds, foreground_seconds, mouse_click_count, first_activity_at, last_activity_at"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(activity_date, bucket_start, application) DO UPDATE SET "
+                "key_press_count = key_press_count + excluded.key_press_count, "
+                "mouse_active_seconds = mouse_active_seconds + excluded.mouse_active_seconds, "
+                "foreground_seconds = foreground_seconds + excluded.foreground_seconds, "
+                "mouse_click_count = mouse_click_count + excluded.mouse_click_count, "
+                "first_activity_at = MIN(first_activity_at, excluded.first_activity_at), "
+                "last_activity_at = MAX(last_activity_at, excluded.last_activity_at)",
+                values,
+            )
+
+    def list_activity_buckets(self, activity_date: str) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT activity_date, bucket_start, application, key_press_count, "
+                "mouse_active_seconds, foreground_seconds, mouse_click_count, first_activity_at, last_activity_at "
+                "FROM activity_buckets WHERE activity_date = ? "
+                "ORDER BY bucket_start, application",
+                (activity_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_daily_activity_summary(self, activity_date: str) -> list[dict]:
+        """Structured application totals for the future reporting tool layer."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT application, SUM(key_press_count) AS key_press_count, "
+                "SUM(mouse_active_seconds) AS mouse_active_seconds, "
+                "SUM(foreground_seconds) AS foreground_seconds, "
+                "SUM(mouse_click_count) AS mouse_click_count, "
+                "MIN(first_activity_at) AS first_activity_at, "
+                "MAX(last_activity_at) AS last_activity_at "
+                "FROM activity_buckets WHERE activity_date = ? GROUP BY application "
+                "ORDER BY key_press_count DESC, mouse_active_seconds DESC, application",
+                (activity_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_activity_history(self) -> int:
+        with self._lock, self.conn:
+            cursor = self.conn.execute("DELETE FROM activity_buckets")
+        return cursor.rowcount
