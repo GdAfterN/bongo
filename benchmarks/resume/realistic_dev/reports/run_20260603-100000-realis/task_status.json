@@ -1,0 +1,28 @@
+{
+  "run_id": "run_20260603-100000-realis",
+  "task_id": "20260603-100000-realis",
+  "user_request": "帮我看看这段代码",
+  "status": "running",
+  "current_action": "executing",
+  "tool_steps": 10,
+  "attempts": 10,
+  "last_tool": "write_file",
+  "tools_called": [
+    "read_file",
+    "search",
+    "patch_file",
+    "run_shell",
+    "write_file",
+    "read_file",
+    "search",
+    "patch_file",
+    "run_shell",
+    "write_file"
+  ],
+  "stop_reason": "",
+  "final_answer": "",
+  "checkpoint_snapshot": {},
+  "interrupted_at_step": 10,
+  "last_tool_result": "",
+  "checkpoint_created_at": ""
+}

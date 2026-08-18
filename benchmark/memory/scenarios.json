@@ -1,0 +1,191 @@
+{
+  "description": "Memory 模块测试场景：12 组 20 轮对话，覆盖重复读、摘要失效、理解偏移等问题。",
+  "rounds_per_scenario": 20,
+  "scenarios": [
+    {
+      "name": "single_file_reread",
+      "description": "单文件反复读：同一文件读 20 次，测试重复读检测",
+      "task_summary": "查看 main.py",
+      "recent_files": ["src/main.py"],
+      "file_summaries": {"src/main.py": {"summary": "入口文件", "freshness": "abc"}},
+      "history_pattern": [
+        {"role": "user", "content": "看看 main.py"},
+        {"role": "tool_call", "name": "read_file", "path": "src/main.py", "result": "def main(): pass"}
+      ],
+      "repeat": 20
+    },
+    {
+      "name": "rotate_files",
+      "description": "多文件轮换读：5 个文件轮换读取，测试 recent_files 上限",
+      "task_summary": "轮换读取文件",
+      "recent_files": ["src/f0.py", "src/f1.py", "src/f2.py", "src/f3.py", "src/f4.py",
+                        "src/f5.py", "src/f6.py", "src/f7.py", "src/f8.py", "src/f9.py"],
+      "file_summaries": {
+        "src/f0.py": {"summary": "文件 0", "freshness": "h0"},
+        "src/f1.py": {"summary": "文件 1", "freshness": "h1"},
+        "src/f2.py": {"summary": "文件 2", "freshness": "h2"},
+        "src/f3.py": {"summary": "文件 3", "freshness": "h3"},
+        "src/f4.py": {"summary": "文件 4", "freshness": "h4"}
+      },
+      "history_pattern": [
+        {"role": "user", "content_template": "读取文件 {i}"},
+        {"role": "tool_call", "name": "read_file", "path_template": "src/f{i}.py", "result_template": "内容 {i}"}
+      ],
+      "repeat": 10
+    },
+    {
+      "name": "stale_summary",
+      "description": "文件摘要过期：读取后文件内容变化，摘要 freshness 不匹配",
+      "task_summary": "修改 main.py",
+      "recent_files": ["src/main.py"],
+      "file_summaries": {"src/main.py": {"summary": "旧内容摘要", "freshness": "stale_hash"}},
+      "history_pattern": [
+        {"role": "user", "content": "修改 main.py"},
+        {"role": "tool_call", "name": "patch_file", "path": "src/main.py", "result": "patched"}
+      ],
+      "repeat": 1
+    },
+    {
+      "name": "growing_files",
+      "description": "渐进增加文件：每轮新读一个文件，测试文件列表截断",
+      "task_summary": "逐步读取新文件",
+      "recent_files_template": ["src/new_{i}.py"],
+      "file_summaries": {},
+      "history_pattern": [
+        {"role": "user", "content_template": "读文件 {i}"},
+        {"role": "tool_call", "name": "read_file", "path_template": "src/new_{i}.py", "result_template": "内容 {i}"}
+      ],
+      "repeat": 20
+    },
+    {
+      "name": "no_summary",
+      "description": "无摘要文件：recent_files 中的文件没有对应的 file_summary",
+      "task_summary": "读取文件",
+      "recent_files": ["src/a.py", "src/b.py", "src/c.py"],
+      "file_summaries": {},
+      "history_pattern": [
+        {"role": "user", "content": "读取 a.py"},
+        {"role": "tool_call", "name": "read_file", "path": "src/a.py", "result": "内容"}
+      ],
+      "repeat": 1
+    },
+    {
+      "name": "changing_task",
+      "description": "任务摘要变化：模拟任务目标不断变化",
+      "task_summary": "最终任务: 部署上线",
+      "recent_files": ["deploy.sh"],
+      "file_summaries": {},
+      "history_pattern": [
+        {"role": "user", "content_template": "新任务 {i}"},
+        {"role": "tool_call", "name": "bash", "path_template": "echo {i}", "result_template": "{i}"}
+      ],
+      "repeat": 20
+    },
+    {
+      "name": "many_notes",
+      "description": "大量笔记：session 中有 20 条笔记，测试召回",
+      "task_summary": "查看笔记",
+      "recent_files": ["notes.md"],
+      "file_summaries": {},
+      "notes": [
+        {"text": "笔记 0: 学习 Python 基础", "tags": ["python", "basics"]},
+        {"text": "笔记 1: 了解列表推导式", "tags": ["python", "list"]},
+        {"text": "笔记 2: 装饰器入门", "tags": ["python", "decorator"]},
+        {"text": "笔记 3: 上下文管理器", "tags": ["python", "context"]},
+        {"text": "笔记 4: 异步编程", "tags": ["python", "async"]},
+        {"text": "笔记 5: 类型注解", "tags": ["python", "typing"]},
+        {"text": "笔记 6: 单元测试", "tags": ["python", "testing"]},
+        {"text": "笔记 7: 虚拟环境", "tags": ["python", "venv"]},
+        {"text": "笔记 8: 包管理", "tags": ["python", "pip"]},
+        {"text": "笔记 9: 代码规范", "tags": ["python", "style"]},
+        {"text": "笔记 10: Git 基础", "tags": ["git", "basics"]},
+        {"text": "笔记 11: 分支策略", "tags": ["git", "branch"]},
+        {"text": "笔记 12: 合并冲突", "tags": ["git", "merge"]},
+        {"text": "笔记 13: rebase 技巧", "tags": ["git", "rebase"]},
+        {"text": "笔记 14: Docker 入门", "tags": ["docker", "basics"]},
+        {"text": "笔记 15: Dockerfile 编写", "tags": ["docker", "dockerfile"]},
+        {"text": "笔记 16: CI/CD 流程", "tags": ["cicd", "pipeline"]},
+        {"text": "笔记 17: GitHub Actions", "tags": ["cicd", "github"]},
+        {"text": "笔记 18: 部署策略", "tags": ["deploy", "strategy"]},
+        {"text": "笔记 19: 监控告警", "tags": ["monitoring", "alert"]}
+      ],
+      "history_pattern": [
+        {"role": "user", "content": "看看笔记"},
+        {"role": "tool_call", "name": "read_file", "path": "notes.md", "result": "笔记内容"}
+      ],
+      "repeat": 1
+    },
+    {
+      "name": "empty_memory",
+      "description": "空 memory：无任务、无文件、无摘要",
+      "task_summary": "",
+      "recent_files": [],
+      "file_summaries": {},
+      "history_pattern": [],
+      "repeat": 0
+    },
+    {
+      "name": "deleted_files",
+      "description": "文件被删除：recent_files 引用的文件已不存在",
+      "task_summary": "清理临时文件",
+      "recent_files": ["tmp.py", "src/main.py"],
+      "file_summaries": {"tmp.py": {"summary": "临时文件", "freshness": "xxx"}},
+      "history_pattern": [
+        {"role": "user", "content": "删除 tmp.py"},
+        {"role": "tool_call", "name": "bash", "path": "rm tmp.py", "result": "deleted"}
+      ],
+      "repeat": 1
+    },
+    {
+      "name": "long_summary",
+      "description": "超长摘要：单个文件摘要超过 300 字符",
+      "task_summary": "分析大文件",
+      "recent_files": ["huge.py"],
+      "file_summaries": {"huge.py": {"summary": "这是一个非常长的摘要。" * 50, "freshness": "abc"}},
+      "history_pattern": [
+        {"role": "user", "content": "分析大文件"},
+        {"role": "tool_call", "name": "read_file", "path": "huge.py", "result": "x" * 5000}
+      ],
+      "repeat": 1
+    },
+    {
+      "name": "mixed_read_write",
+      "description": "混合读写：交替读取和写入文件，测试记忆更新",
+      "task_summary": "混合读写操作",
+      "recent_files": ["src/mixed_0.py", "src/mixed_1.py", "src/mixed_2.py", "src/mixed_3.py", "src/mixed_4.py"],
+      "file_summaries": {
+        "src/mixed_0.py": {"summary": "文件 0", "freshness": "h0"},
+        "src/mixed_1.py": {"summary": "文件 1", "freshness": "h1"},
+        "src/mixed_2.py": {"summary": "文件 2", "freshness": "h2"},
+        "src/mixed_3.py": {"summary": "文件 3", "freshness": "h3"},
+        "src/mixed_4.py": {"summary": "文件 4", "freshness": "h4"}
+      },
+      "history_pattern": [
+        {"role": "user", "content_template": "第 {i} 轮操作"},
+        {"role": "tool_call", "name_cycle": ["read_file", "patch_file"], "path_template": "src/mixed_{i%5}.py", "result_template": "结果 {i}"}
+      ],
+      "repeat": 20
+    },
+    {
+      "name": "realistic_dev",
+      "description": "真实编码场景：bug 定位 → 修复 → 测试 → 提交",
+      "task_summary": "修复登录 bug",
+      "recent_files": ["src/auth.py", "tests/test_auth.py"],
+      "file_summaries": {
+        "src/auth.py": {"summary": "登录逻辑，已修复 return None 问题", "freshness": "fixed"},
+        "tests/test_auth.py": {"summary": "登录测试用例", "freshness": "abc"}
+      },
+      "history_pattern": [
+        {"role": "user", "content": "看看这个 bug"},
+        {"role": "tool_call", "name": "read_file", "path": "src/auth.py", "result": "def login():\n    return None"},
+        {"role": "user", "content": "修复它"},
+        {"role": "tool_call", "name": "patch_file", "path": "src/auth.py", "result": "patched"},
+        {"role": "user", "content": "跑测试"},
+        {"role": "tool_call", "name": "bash", "path": "pytest", "result": "2 passed"},
+        {"role": "user", "content": "提交"},
+        {"role": "tool_call", "name": "bash", "path": "git commit", "result": "committed"}
+      ],
+      "repeat": 5
+    }
+  ]
+}

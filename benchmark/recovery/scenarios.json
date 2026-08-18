@@ -1,0 +1,121 @@
+{
+  "description": "中断恢复模块测试场景：覆盖恢复成功率、工具重复调用、最长记忆轮次三个核心指标。",
+  "scenarios": [
+    {
+      "name": "basic_recovery",
+      "description": "基本恢复：中断后 from_session 检测到 _recovery_context",
+      "tool_chain": [
+        {"tool": "read_file", "args": {"path": "README.md"}, "result": "# test"},
+        {"tool": "patch_file", "args": {"path": "README.md"}, "result": "patched"}
+      ],
+      "user_request": "test task",
+      "expected_recovery": true
+    },
+    {
+      "name": "long_chain_recovery",
+      "description": "长工具链恢复：10 个工具调用中断后成功恢复",
+      "tool_chain_count": 10,
+      "user_request": "long task",
+      "expected_recovery": true,
+      "expected_tool_steps": 10
+    },
+    {
+      "name": "different_request_recovery",
+      "description": "不同请求恢复：新请求与中断请求不同，仍能恢复",
+      "tool_chain": [
+        {"tool": "read_file", "args": {"path": "README.md"}, "result": "# test"}
+      ],
+      "user_request": "original task",
+      "new_request": "new task",
+      "expected_recovery": true,
+      "expected_original_request_preserved": true
+    },
+    {
+      "name": "completed_no_recovery",
+      "description": "已完成任务：active_run_id 对应的 task 已完成，不触发恢复",
+      "task_status": "success",
+      "expected_recovery": false
+    },
+    {
+      "name": "no_active_run_no_recovery",
+      "description": "无 active_run_id：不触发恢复",
+      "active_run_id": "",
+      "expected_recovery": false
+    },
+    {
+      "name": "no_duplicates_after_recovery",
+      "description": "恢复后 history 中工具调用不重复",
+      "tool_chain": [
+        {"tool": "read_file", "args": {"path": "README.md"}, "result": "# test"},
+        {"tool": "patch_file", "args": {"path": "README.md"}, "result": "patched"},
+        {"tool": "read_file", "args": {"path": "src/main.py"}, "result": "def main(): pass"}
+      ],
+      "expected_tool_call_count": 3
+    },
+    {
+      "name": "trace_matches_history",
+      "description": "trace 中记录的工具调用与 history 一致，无多余记录",
+      "tool_chain": [
+        {"tool": "read_file", "args": {"path": "a.py"}, "result": "content a"},
+        {"tool": "read_file", "args": {"path": "b.py"}, "result": "content b"},
+        {"tool": "search", "args": {"pattern": "test"}, "result": "found"}
+      ],
+      "expected_trace_count": 3,
+      "expected_trace_tools": ["read_file", "read_file", "search"]
+    },
+    {
+      "name": "recovery_context_tools",
+      "description": "_recovery_context 中的 tools_called 与实际执行一致",
+      "tool_chain": [
+        {"tool": "list_files", "args": {"path": "."}, "result": "README.md\nsrc/"},
+        {"tool": "read_file", "args": {"path": "README.md"}, "result": "# test"},
+        {"tool": "patch_file", "args": {"path": "README.md"}, "result": "patched"},
+        {"tool": "run_shell", "args": {"command": "pytest"}, "result": "2 passed"}
+      ],
+      "expected_tools_called": ["list_files", "read_file", "patch_file", "run_shell"]
+    },
+    {
+      "name": "memory_at_6_rounds",
+      "description": "6 轮对话后 memory 仍完整保留",
+      "rounds": 6,
+      "expected_task_in_memory": true,
+      "expected_min_memory_chars": 100
+    },
+    {
+      "name": "memory_at_12_rounds",
+      "description": "12 轮对话后 memory 保留关键信息，最早文件被截断",
+      "rounds": 12,
+      "expected_task_in_memory": true,
+      "expected_recent_file": "f11.py",
+      "expected_truncated_file": "f0.py"
+    },
+    {
+      "name": "memory_at_24_rounds",
+      "description": "24 轮对话后 memory 仍保留任务摘要",
+      "rounds": 24,
+      "expected_task_in_memory": true,
+      "expected_recent_file": "f23.py",
+      "expected_max_recent_files": 8
+    },
+    {
+      "name": "memory_at_36_rounds",
+      "description": "36 轮（压缩阈值）后 memory 仍有效",
+      "rounds": 36,
+      "expected_task_in_memory": true
+    },
+    {
+      "name": "memory_after_compact",
+      "description": "压缩后 memory 仍保留任务摘要和最近文件",
+      "rounds": 40,
+      "expected_task_in_memory": true,
+      "expected_history_shortened": true
+    },
+    {
+      "name": "trace_preserves_all_rounds",
+      "description": "trace 文件保留全部轮次的工具记录，不受压缩影响",
+      "trace_count": 30,
+      "expected_first_target": "f0.py",
+      "expected_last_target": "f29.py"
+    }
+  ]
+}

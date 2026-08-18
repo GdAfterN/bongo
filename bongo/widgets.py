@@ -70,10 +70,16 @@ class _WrappedTextControl:
 
     def _sync_wrapped_height(self) -> None:
         target = self.heightForWidth(max(80, self.width()))
-        if self.minimumHeight() == target and self.maximumHeight() == target:
-            return
-        self.setFixedHeight(target)
-        self.updateGeometry()
+        if self.minimumHeight() != target or self.maximumHeight() != target:
+            self.setFixedHeight(target)
+            self.updateGeometry()
+
+        # A resize can settle before the child layout receives the new height.
+        # Reactivate it even when the outer control is already at its target.
+        inner_layout = self.layout()
+        if inner_layout is not None:
+            inner_layout.invalidate()
+            inner_layout.activate()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

@@ -4,8 +4,10 @@ import QtQuick.Layouts
 
 Item {
     id: root
+    objectName: "applicationKeystrokeChart"
     property var points: []
     property real loadProgress: 0
+    property int hoveredIndex: -1
     property var accents: ["#c9653d", "#d5784d", "#df8b61", "#e69c77", "#edad8d", "#efbda3"]
 
     function maximum() {
@@ -20,7 +22,10 @@ Item {
         loadAnimation.restart()
     }
 
-    onPointsChanged: playLoadAnimation()
+    onPointsChanged: {
+        hoveredIndex = -1
+        playLoadAnimation()
+    }
 
     NumberAnimation {
         id: loadAnimation
@@ -42,23 +47,42 @@ Item {
 
         delegate: Rectangle {
             id: row
+            objectName: "keystrokeRow" + index
             required property var modelData
             required property int index
             width: ranking.width - 10
             height: 40
             radius: 10
-            color: hover.hovered ? "#58ffffff" : "transparent"
-            scale: hover.hovered ? 1.006 : 1
+            color: isHovered ? "#70fff1e5" : "transparent"
+            border.width: 1
+            border.color: isHovered ? "#78df7845" : "transparent"
+            scale: isHovered ? 1.008 : 1
             transformOrigin: Item.Center
+            z: isHovered ? 1 : 0
             property color accent: root.accents[index % root.accents.length]
             property real progress: root.barProgress(index)
+            property bool isHovered: root.hoveredIndex === index
             Behavior on color { ColorAnimation { duration: 160 } }
+            Behavior on border.color { ColorAnimation { duration: 160 } }
             Behavior on scale { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.leftMargin: 2
+                anchors.verticalCenter: parent.verticalCenter
+                width: 3
+                height: row.isHovered ? 22 : 8
+                radius: 2
+                color: row.accent
+                opacity: row.isHovered ? 1 : 0
+                Behavior on height { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                Behavior on opacity { NumberAnimation { duration: 140 } }
+            }
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 5
-                anchors.rightMargin: 5
+                anchors.leftMargin: 8
+                anchors.rightMargin: 7
                 spacing: 7
 
                 Rectangle {
@@ -73,15 +97,15 @@ Item {
                     Layout.preferredWidth: 90
                     text: modelData.label
                     elide: Text.ElideRight
-                    color: hover.hovered ? Theme.text : Theme.textMuted
+                    color: row.isHovered ? Theme.text : Theme.textMuted
                     font.pixelSize: 11
-                    font.weight: hover.hovered ? Font.DemiBold : Font.Normal
+                    font.weight: row.isHovered ? Font.DemiBold : Font.Normal
                     Behavior on color { ColorAnimation { duration: 150 } }
                 }
                 Rectangle {
                     id: track
                     Layout.fillWidth: true
-                    height: hover.hovered ? 22 : 18
+                    height: row.isHovered ? 22 : 18
                     radius: 9
                     color: Theme.track
                     clip: true
@@ -99,21 +123,36 @@ Item {
                         }
                     }
                 }
-                Text {
-                    Layout.preferredWidth: 50
-                    horizontalAlignment: Text.AlignRight
-                    text: modelData.valueLabel
-                    color: row.accent
-                    font.pixelSize: 11
-                    font.weight: Font.Bold
+                Rectangle {
+                    Layout.preferredWidth: 70
+                    height: 28
+                    radius: 14
+                    color: row.isHovered ? "#eafffaf5" : "transparent"
+                    border.width: 1
+                    border.color: row.isHovered ? Qt.rgba(row.accent.r, row.accent.g, row.accent.b, 0.48) : "transparent"
                     opacity: row.progress
+                    Behavior on color { ColorAnimation { duration: 160 } }
+                    Behavior on border.color { ColorAnimation { duration: 160 } }
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: modelData.valueLabel + (row.isHovered ? " 次" : "")
+                        color: row.accent
+                        font.pixelSize: 11
+                        font.weight: Font.Bold
+                    }
                 }
             }
 
-            HoverHandler { id: hover }
-            ToolTip.visible: hover.hovered
-            ToolTip.delay: 120
-            ToolTip.text: modelData.label + "\n键盘敲击 " + modelData.valueLabel + " 次"
+            HoverHandler {
+                id: hover
+                onHoveredChanged: {
+                    if (hovered)
+                        root.hoveredIndex = row.index
+                    else if (root.hoveredIndex === row.index)
+                        root.hoveredIndex = -1
+                }
+            }
         }
 
         Text {

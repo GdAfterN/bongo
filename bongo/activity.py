@@ -120,7 +120,7 @@ class ActivityRecorder:
         self._session_applications: dict[str, dict[str, int]] = defaultdict(
             self._empty_session_application
         )
-        self._session_reminder_sent = False
+        self._session_reminder_count = 0
         if self.enabled:
             self._restore_session_state()
 
@@ -148,7 +148,7 @@ class ActivityRecorder:
         self._session_started_at = None
         self._session_last_activity_at = None
         self._session_applications = defaultdict(self._empty_session_application)
-        self._session_reminder_sent = False
+        self._session_reminder_count = 0
 
     def _session_state_locked(self) -> dict | None:
         if (
@@ -164,7 +164,8 @@ class ActivityRecorder:
                 application: dict(counts)
                 for application, counts in self._session_applications.items()
             },
-            "reminder_sent": self._session_reminder_sent,
+            "reminder_count": self._session_reminder_count,
+            "reminder_sent": self._session_reminder_count > 0,
         }
 
     def _save_session_state(self) -> None:
@@ -207,11 +208,21 @@ class ActivityRecorder:
                         raise ValueError("invalid saved activity count")
                     counts[field] = value
 
+            reminder_count = state.get("reminder_count")
+            if reminder_count is None:
+                reminder_count = 1 if state.get("reminder_sent", False) else 0
+            if (
+                isinstance(reminder_count, bool)
+                or not isinstance(reminder_count, int)
+                or reminder_count < 0
+            ):
+                raise ValueError("invalid saved reminder count")
+
             with self._lock:
                 self._session_started_at = started_at
                 self._session_last_activity_at = last_activity_at
                 self._session_applications = applications
-                self._session_reminder_sent = bool(state.get("reminder_sent", False))
+                self._session_reminder_count = reminder_count
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             self.database.set_setting(self.SESSION_STATE_SETTING, "")
 
@@ -400,7 +411,8 @@ class ActivityRecorder:
                     "foreground_seconds": total_foreground_seconds,
                     "mouse_click_count": total_clicks,
                     "applications": applications,
-                    "reminder_sent": self._session_reminder_sent,
+                    "reminder_count": self._session_reminder_count,
+                    "reminder_sent": self._session_reminder_count > 0,
                 }
         if expired:
             self._save_session_state()
@@ -408,19 +420,26 @@ class ActivityRecorder:
 
     def claim_break_reminder(self, minimum_minutes: int = 40) -> dict | None:
         session = self.get_current_work_session()
-        if session is None or session["duration_seconds"] < max(1, minimum_minutes) * 60:
+        interval_seconds = max(1, minimum_minutes) * 60
+        if (
+            session is None
+            or session["duration_seconds"] < interval_seconds
+            or session["reminder_sent"]
+        ):
             return None
         with self._lock:
             if (
-                self._session_reminder_sent
+                self._session_reminder_count > 0
                 or self._session_started_at is None
                 or self._session_started_at.isoformat(timespec="seconds")
                 != session["started_at"]
             ):
                 return None
-            self._session_reminder_sent = True
+            self._session_reminder_count = 1
         self._save_session_state()
+        session["reminder_count"] = 1
         session["reminder_sent"] = True
+        session["reminder_number"] = 1
         return session
 
 

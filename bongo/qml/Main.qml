@@ -20,6 +20,12 @@ ApplicationWindow {
     property bool allowClose: false
     property int pendingNewsId: 0
 
+    onCurrentPageChanged: {
+        if (currentPage === 0) {
+            Qt.callLater(function() { dashboardPage.reload() })
+        }
+    }
+
     Component.onCompleted: bridge.attachWindow(window)
     onClosing: function(close) {
         if (!allowClose) {
@@ -31,12 +37,15 @@ ApplicationWindow {
     Connections {
         target: bridge
         function onShowWindowRequested() {
-            window.visibility = Window.Windowed
             window.visible = true
-            window.raise()
-            window.requestActivate()
         }
-        function onNavigateRequested(newsId) { window.pendingNewsId = newsId; newsPage.selectNewsById(newsId); window.currentPage = 5; window.show(); window.raise(); window.requestActivate() }
+        function onNavigateRequested(page, itemId) {
+            if (page === 5 && itemId > 0) {
+                window.pendingNewsId = itemId
+                newsPage.selectNewsById(itemId)
+            }
+            window.currentPage = page
+        }
         function onStatusChanged(title, detail) { window.toastTitle = title; window.toastDetail = detail; toast.open() }
     }
 

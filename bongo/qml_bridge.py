@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import re
 import traceback
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QIcon, QWindow
+from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon, QWindow
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QSystemTrayIcon
 
 from .activity import ActivityRecorder
@@ -18,6 +20,13 @@ from .ingestion import SUPPORTED_EXTENSIONS
 from .pet import PetSettings, PetWindow
 from .providers import available_chat_backends, available_providers, chat_backend_available
 from .service import LearningService
+
+
+_NEWS_TOPIC_STOP_WORDS = {
+    "a", "ai", "an", "and", "are", "as", "at", "be", "by", "for",
+    "from", "how", "in", "is", "it", "its", "new", "of", "on", "or",
+    "that", "the", "their", "them", "this", "to", "using", "will", "with",
+}
 
 
 class TaskSignals(QObject):
@@ -61,8 +70,12 @@ class BongoBridge(QObject):
     busyChanged = Signal(str, bool)
     newsProgressChanged = Signal(int, str, str)
     showWindowRequested = Signal()
-    navigateRequested = Signal(int)
+    navigateRequested = Signal(int, int)
     chatCompleted = Signal()
+    chatStarted = Signal(str, int)
+    chatDelta = Signal(str, str)
+    chatFailed = Signal(str, str)
+    chatStreamCompleted = Signal(str, int)
 
     def __init__(
         self,
@@ -88,11 +101,13 @@ class BongoBridge(QObject):
         self._current_source_id: int | None = None
         self._recent_question_ids: deque[int] = deque(maxlen=12)
         self._recent_source_ids: deque[int] = deque(maxlen=2)
-        self._news_cursor = 0
+        self._last_pet_news_id: int | None = None
         self._news_refresh_active = False
         self._import_queue: deque[tuple[str, str]] = deque()
         self._work_break_active = False
         self._work_break_started_at: str | None = None
+        self._pending_chat_deltas: dict[str, str] = {}
+        self._scheduled_chat_delta_flushes: set[str] = set()
         self._build_tray(app_icon)
         self._connect_pet()
         self._load_pet_settings()
@@ -112,7 +127,7 @@ class BongoBridge(QObject):
         menu.addSeparator()
         exit_action = menu.addAction("退出")
         open_action.triggered.connect(self.show_window)
-        show_pet_action.triggered.connect(self.pet.show)
+        show_pet_action.triggered.connect(self.showPet)
         exit_action.triggered.connect(self.quit_application)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
@@ -129,8 +144,8 @@ class BongoBridge(QObject):
         self.pet.position_changed.connect(self._save_pet_position)
 
     def _open_dashboard(self) -> None:
+        self.navigateRequested.emit(0, 0)
         self.show_window()
-        self.navigateRequested.emit(0)
 
     def _start_timers(self, start_background_tasks: bool) -> None:
         self.activity_flush_timer = QTimer(self)
@@ -158,9 +173,48 @@ class BongoBridge(QObject):
         self.window = window if isinstance(window, QWindow) else None
 
     @staticmethod
-    def _activate_window(window: QWindow) -> None:
-        window.setVisibility(QWindow.Visibility.Windowed)
+    def _ensure_window_on_screen(window: QWindow) -> None:
+        screens = QGuiApplication.screens()
+        if not screens:
+            return
+        frame = window.frameGeometry()
+        if any(screen.availableGeometry().intersects(frame) for screen in screens):
+            return
+        screen = window.screen()
+        if screen not in screens:
+            screen = QGuiApplication.primaryScreen() or screens[0]
+        bounds = screen.availableGeometry()
+        width = min(max(1, window.width()), bounds.width())
+        height = min(max(1, window.height()), bounds.height())
+        window.setPosition(
+            bounds.x() + (bounds.width() - width) // 2,
+            bounds.y() + (bounds.height() - height) // 2,
+        )
+
+    @staticmethod
+    def _restore_native_window(window: QWindow) -> None:
+        if os.name != "nt":
+            return
+        try:
+            handle = int(window.winId())
+            if not handle:
+                return
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(handle)
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return
+
+    @classmethod
+    def _activate_window(cls, window: QWindow) -> None:
+        states = window.windowStates()
+        if states & Qt.WindowState.WindowMinimized:
+            window.setWindowStates(states & ~Qt.WindowState.WindowMinimized)
         window.setVisible(True)
+        cls._restore_native_window(window)
+        cls._ensure_window_on_screen(window)
         window.raise_()
         window.requestActivate()
 
@@ -616,21 +670,70 @@ class BongoBridge(QObject):
             for item in self.service.database.get_messages(conversation_id, 200)
         ]
 
-    @Slot(int, int, str)
-    def sendChat(self, source_id: int, conversation_id: int, message: str) -> None:
+    def _queue_chat_stream_event(self, event: dict) -> None:
+        request_id = str(event.get("request_id") or "")
+        if not request_id:
+            return
+        event_type = event.get("type")
+        if event_type == "started":
+            conversation_id = int(event["conversation_id"])
+            self._current_conversation_id = conversation_id
+            self._current_source_id = 0
+            self.conversationsChanged.emit()
+            self.chatStarted.emit(request_id, conversation_id)
+            return
+        if event_type != "delta":
+            return
+        delta = str(event.get("delta") or "")
+        if not delta:
+            return
+        self._pending_chat_deltas[request_id] = self._pending_chat_deltas.get(request_id, "") + delta
+        if request_id in self._scheduled_chat_delta_flushes:
+            return
+        self._scheduled_chat_delta_flushes.add(request_id)
+        QTimer.singleShot(36, lambda current=request_id: self._flush_chat_delta(current))
+
+    def _flush_chat_delta(self, request_id: str) -> None:
+        self._scheduled_chat_delta_flushes.discard(request_id)
+        delta = self._pending_chat_deltas.pop(request_id, "")
+        if delta:
+            self.chatDelta.emit(request_id, delta)
+
+    def _chat_failed(self, request_id: str, title: str, error: str) -> None:
+        self._flush_chat_delta(request_id)
+        self.chatFailed.emit(request_id, error)
+        self.statusChanged.emit(title, error)
+
+    @Slot(str, int, int, str)
+    def sendChat(self, request_id: str, source_id: int, conversation_id: int, message: str) -> None:
+        request_id = request_id.strip()
+        if not request_id:
+            return
         if not message.strip():
             self.statusChanged.emit("无法发送", "请输入问题")
+            self.chatFailed.emit(request_id, "请输入问题")
             return
         self._current_conversation_id = conversation_id if conversation_id > 0 else None
+        selected_conversation_id = self._current_conversation_id
         self.busyChanged.emit("chat", True)
-        task = BackgroundTask(
-            self.service.chat,
-            self._current_conversation_id,
-            message.strip(),
-        )
+
+        def run_chat() -> dict:
+            return self.service.chat(
+                selected_conversation_id,
+                message.strip(),
+                on_started=lambda current_id: task.signals.progress.emit(
+                    {"type": "started", "request_id": request_id, "conversation_id": current_id}
+                ),
+                on_delta=lambda delta: task.signals.progress.emit(
+                    {"type": "delta", "request_id": request_id, "delta": delta}
+                ),
+            )
+
+        task = BackgroundTask(run_chat)
         task.task_type = "chat"
-        task.signals.result.connect(self._chat_completed)
-        task.signals.error.connect(lambda error: self.statusChanged.emit("对话失败", error))
+        task.signals.progress.connect(self._queue_chat_stream_event)
+        task.signals.result.connect(lambda result: self._chat_completed(request_id, result))
+        task.signals.error.connect(lambda error: self._chat_failed(request_id, "对话失败", error))
         task.signals.finished.connect(lambda: self.busyChanged.emit("chat", False))
         self._start_task(task)
 
@@ -638,27 +741,48 @@ class BongoBridge(QObject):
     def chooseWorkDirectory(self) -> str:
         return QFileDialog.getExistingDirectory(None, "选择 Work 工作目录") or ""
 
-    @Slot(int, str, str, str)
-    def sendWork(self, conversation_id: int, work_dir: str, backend: str, message: str) -> None:
+    @Slot(str, int, str, str, str)
+    def sendWork(self, request_id: str, conversation_id: int, work_dir: str, backend: str, message: str) -> None:
+        request_id = request_id.strip()
+        if not request_id:
+            return
         if not message.strip():
             self.statusChanged.emit("无法发送", "请输入工作任务")
+            self.chatFailed.emit(request_id, "请输入工作任务")
             return
         self._current_conversation_id = conversation_id if conversation_id > 0 else None
+        selected_conversation_id = self._current_conversation_id
         self.busyChanged.emit("chat", True)
-        task = BackgroundTask(self.service.work, self._current_conversation_id, message.strip(), work_dir, backend)
+
+        def run_work() -> dict:
+            return self.service.work(
+                selected_conversation_id,
+                message.strip(),
+                work_dir,
+                backend,
+                on_started=lambda current_id: task.signals.progress.emit(
+                    {"type": "started", "request_id": request_id, "conversation_id": current_id}
+                ),
+                on_delta=lambda delta: task.signals.progress.emit(
+                    {"type": "delta", "request_id": request_id, "delta": delta}
+                ),
+            )
+
+        task = BackgroundTask(run_work)
         task.task_type = "chat"
-        task.signals.result.connect(self._chat_completed)
-        task.signals.error.connect(lambda error: self.statusChanged.emit("Work 执行失败", error))
+        task.signals.progress.connect(self._queue_chat_stream_event)
+        task.signals.result.connect(lambda result: self._chat_completed(request_id, result))
+        task.signals.error.connect(lambda error: self._chat_failed(request_id, "Work 执行失败", error))
         task.signals.finished.connect(lambda: self.busyChanged.emit("chat", False))
         self._start_task(task)
 
-    def _chat_completed(self, result: dict) -> None:
+    def _chat_completed(self, request_id: str, result: dict) -> None:
+        self._flush_chat_delta(request_id)
         self._current_conversation_id = int(result["conversation_id"])
         self._current_source_id = int(result["source_id"])
         self.conversationsChanged.emit()
-        self.messagesChanged.emit()
+        self.chatStreamCompleted.emit(request_id, self._current_conversation_id)
         self.chatCompleted.emit()
-        self.statusChanged.emit("回答已保存", result["backend"])
         self.pet.canvas.react("left")
 
     @Slot(int)
@@ -868,7 +992,6 @@ class BongoBridge(QObject):
 
     def _mark_news_read(self, news_id: int) -> None:
         self.service.mark_ai_news_read(news_id)
-        self._news_cursor = 0
         self.newsChanged.emit()
 
     @Slot(str)
@@ -980,8 +1103,7 @@ class BongoBridge(QObject):
 
     @Slot()
     def showPet(self) -> None:
-        self.pet.show()
-        self.pet.raise_()
+        self.pet.show_on_active_screen()
 
     def _load_pet_settings(self) -> None:
         database = self.service.database
@@ -1038,14 +1160,79 @@ class BongoBridge(QObject):
         if not items:
             self.pet.show_message("本轮 AI 简讯已经全部阅完，可在学习面板中随时查看。", 8000)
             return
-        item = dict(items[self._news_cursor % len(items)])
-        self._news_cursor = (self._news_cursor + 1) % len(items)
+        item = dict(self._next_pet_news_item(
+            digest["items"],
+            read_ids,
+            self._last_pet_news_id,
+        ))
+        self._last_pet_news_id = int(item["id"])
         item["published_at_display"] = self._news_time(item["published_at"])
         self.pet.show_ai_news(item)
 
+    @staticmethod
+    def _next_pet_news_item(
+        items: list[dict],
+        read_ids: set[int],
+        last_news_id: int | None,
+    ) -> dict:
+        """Return a diverse unread item after the item actually shown."""
+        start = 0
+        last_item = None
+        if last_news_id is not None:
+            for index, item in enumerate(items):
+                if int(item["id"]) == int(last_news_id):
+                    last_item = item
+                    start = (index + 1) % len(items)
+                    break
+
+        candidates = []
+        for offset in range(len(items)):
+            item = items[(start + offset) % len(items)]
+            if int(item["id"]) not in read_ids:
+                candidates.append(item)
+        if not candidates:
+            raise ValueError("没有可展示的未读 AI 简讯")
+
+        different_items = [
+            item for item in candidates
+            if last_news_id is None or int(item["id"]) != int(last_news_id)
+        ]
+        if not different_items:
+            return candidates[0]
+        if last_item is None:
+            return different_items[0]
+
+        for item in different_items:
+            if not BongoBridge._news_topics_are_similar(last_item, item):
+                return item
+        return different_items[0]
+
+    @staticmethod
+    def _news_topic_tokens(item: dict) -> set[str]:
+        title = str(item.get("original_title") or item.get("title") or "").lower()
+        tokens = set()
+        for token in re.findall(r"[a-z0-9]+", title):
+            if token in _NEWS_TOPIC_STOP_WORDS or len(token) < 3:
+                continue
+            if token.startswith("watermark"):
+                token = "watermark"
+            elif token.endswith("s") and len(token) > 4:
+                token = token[:-1]
+            tokens.add(token)
+        return tokens
+
+    @staticmethod
+    def _news_topics_are_similar(first: dict, second: dict) -> bool:
+        first_tokens = BongoBridge._news_topic_tokens(first)
+        second_tokens = BongoBridge._news_topic_tokens(second)
+        if not first_tokens or not second_tokens:
+            return False
+        overlap = len(first_tokens & second_tokens)
+        return overlap >= 2 and overlap / min(len(first_tokens), len(second_tokens)) >= 0.4
+
     def _show_news_detail(self, news_id: int) -> None:
+        self.navigateRequested.emit(5, news_id)
         self.show_window()
-        self.navigateRequested.emit(news_id)
 
     def _check_work_session(self) -> None:
         session = self.activity_recorder.get_current_work_session()
@@ -1053,7 +1240,6 @@ class BongoBridge(QObject):
         if (
             session is None
             or session["duration_seconds"] < 40 * 60
-            or session.get("reminder_sent")
             or self._work_break_active
             or not self.pet.can_show_break_reminder()
         ):
@@ -1075,19 +1261,19 @@ class BongoBridge(QObject):
         if not current or current.get("started_at") != session.get("started_at"):
             return
         report = result["report"]
-        self.pet.show_message(
-            f"{report['summary']}\n\n{report['activity']}\n\n{report['suggestion']}",
-            20_000,
+        self.pet.show_break_reminder(
+            self._format_duration(session["duration_seconds"]),
+            int(session["key_press_count"]),
+            report,
         )
 
     def _work_break_fallback(self, session: dict) -> None:
         current = self.activity_recorder.get_current_work_session()
         if not current or current.get("started_at") != session.get("started_at"):
             return
-        self.pet.show_message(
-            f"你已经连续工作 {self._format_duration(session['duration_seconds'])}，"
-            f"键盘敲击 {int(session['key_press_count']):,} 次。\n\n起来走动一下，让眼睛和手腕休息几分钟吧。",
-            20_000,
+        self.pet.show_break_reminder(
+            self._format_duration(session["duration_seconds"]),
+            int(session["key_press_count"]),
         )
 
     def _work_break_finished(self) -> None:

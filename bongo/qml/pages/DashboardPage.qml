@@ -233,7 +233,7 @@ Item {
                     hoverLift: 3
                     ColumnLayout {
                         anchors.fill: parent; anchors.margins: 20; spacing: 10
-                        SectionTitle { Layout.fillWidth: true; title: "今日应用敲击排行"; subtitle: "按键盘敲击次数降序 · 悬停查看详情" }
+                        SectionTitle { Layout.fillWidth: true; title: "今日应用敲击排行"; subtitle: "按键盘敲击次数降序 · 悬停突出显示" }
                         ApplicationKeystrokeBarChart { id: keystrokeChart; Layout.fillWidth: true; Layout.fillHeight: true; points: root.dashboardData.applicationKeystrokes || [] }
                     }
                 }

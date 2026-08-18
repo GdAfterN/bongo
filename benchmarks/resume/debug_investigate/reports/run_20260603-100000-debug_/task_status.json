@@ -1,0 +1,28 @@
+{
+  "run_id": "run_20260603-100000-debug_",
+  "task_id": "20260603-100000-debug_",
+  "user_request": "用户报告了接口超时问题，帮我排查",
+  "status": "running",
+  "current_action": "executing",
+  "tool_steps": 10,
+  "attempts": 10,
+  "last_tool": "read_file",
+  "tools_called": [
+    "read_file",
+    "read_file",
+    "search",
+    "read_file",
+    "patch_file",
+    "run_shell",
+    "read_file",
+    "read_file",
+    "search",
+    "read_file"
+  ],
+  "stop_reason": "",
+  "final_answer": "",
+  "checkpoint_snapshot": {},
+  "interrupted_at_step": 10,
+  "last_tool_result": "",
+  "checkpoint_created_at": ""
+}

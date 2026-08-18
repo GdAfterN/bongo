@@ -1,0 +1,258 @@
+{
+  "description": "会话恢复基准数据",
+  "interrupt_at": 10,
+  "scenarios": [
+    {
+      "scenario": "code_review",
+      "session_id": "20260603-100000-code_r",
+      "run_id": "run_20260603-100000-code_r",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "search",
+        "patch_file",
+        "run_shell",
+        "read_file",
+        "search",
+        "patch_file",
+        "run_shell",
+        "read_file",
+        "search"
+      ]
+    },
+    {
+      "scenario": "debug_investigate",
+      "session_id": "20260603-100000-debug_",
+      "run_id": "run_20260603-100000-debug_",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "search",
+        "read_file",
+        "patch_file",
+        "run_shell",
+        "read_file",
+        "read_file",
+        "search",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "error_heavy",
+      "session_id": "20260603-100000-error_",
+      "run_id": "run_20260603-100000-error_",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "growing_result",
+      "session_id": "20260603-100000-growin",
+      "run_id": "run_20260603-100000-growin",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "huge_result",
+      "session_id": "20260603-100000-huge_r",
+      "run_id": "run_20260603-100000-huge_r",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "long_file_read",
+      "session_id": "20260603-100000-long_f",
+      "run_id": "run_20260603-100000-long_f",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "mixed_tools",
+      "session_id": "20260603-100000-mixed_",
+      "run_id": "run_20260603-100000-mixed_",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "patch_file",
+        "search",
+        "run_shell",
+        "read_file",
+        "patch_file",
+        "search",
+        "run_shell",
+        "read_file",
+        "patch_file"
+      ]
+    },
+    {
+      "scenario": "realistic_dev",
+      "session_id": "20260603-100000-realis",
+      "run_id": "run_20260603-100000-realis",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "search",
+        "patch_file",
+        "run_shell",
+        "write_file",
+        "read_file",
+        "search",
+        "patch_file",
+        "run_shell",
+        "write_file"
+      ]
+    },
+    {
+      "scenario": "refactor",
+      "session_id": "20260603-100000-refact",
+      "run_id": "run_20260603-100000-refact",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "patch_file",
+        "search",
+        "run_shell",
+        "read_file",
+        "read_file",
+        "patch_file",
+        "search",
+        "run_shell"
+      ]
+    },
+    {
+      "scenario": "search_heavy",
+      "session_id": "20260603-100000-search",
+      "run_id": "run_20260603-100000-search",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "search",
+        "search",
+        "search",
+        "search",
+        "search",
+        "search",
+        "search",
+        "search",
+        "search",
+        "search"
+      ]
+    },
+    {
+      "scenario": "short_qa",
+      "session_id": "20260603-100000-short_",
+      "run_id": "run_20260603-100000-short_",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "scenario": "write_files",
+      "session_id": "20260603-100000-write_",
+      "run_id": "run_20260603-100000-write_",
+      "interrupt_at": 10,
+      "tool_steps": 10,
+      "history_entries": 32,
+      "trace_entries": 10,
+      "tools_called": [
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file",
+        "write_file"
+      ]
+    }
+  ]
+}

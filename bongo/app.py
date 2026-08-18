@@ -219,7 +219,7 @@ class MainWindow(QMainWindow):
         side_layout.addStretch()
         show_pet = QPushButton("显示桌宠")
         show_pet.setObjectName("navButton")
-        show_pet.clicked.connect(self.pet.show)
+        show_pet.clicked.connect(self.pet.show_on_active_screen)
         side_layout.addWidget(show_pet)
         outer.addWidget(sidebar)
 
@@ -757,7 +757,9 @@ class MainWindow(QMainWindow):
             lambda _checked=False: self.show_and_raise()
         )
         self.tray_pet_action = QAction("显示桌宠", self)
-        self.tray_pet_action.triggered.connect(lambda _checked=False: self.pet.show())
+        self.tray_pet_action.triggered.connect(
+            lambda _checked=False: self.pet.show_on_active_screen()
+        )
         self.tray_quit_action = QAction("退出", self)
         self.tray_quit_action.triggered.connect(
             lambda _checked=False: self.exit_application()
@@ -1086,7 +1088,6 @@ class MainWindow(QMainWindow):
         if (
             session is None
             or session["duration_seconds"] < 40 * 60
-            or session.get("reminder_sent")
             or self.work_break_worker_active
             or not self.pet.can_show_break_reminder()
         ):
@@ -1145,28 +1146,22 @@ class MainWindow(QMainWindow):
         if not self._is_current_work_session(started_at):
             return
         report = result["report"]
-        message = (
-            f"{report['summary']}\n\n"
-            f"{report['activity']}\n\n"
-            f"{report['suggestion']}"
+        session = self.activity_recorder.get_current_work_session()
+        if not session:
+            return
+        self.pet.show_break_reminder(
+            self._format_work_duration(session["duration_seconds"]),
+            int(session["key_press_count"]),
+            report,
         )
-        self.pet.show_message(message, 20_000)
 
     def _work_break_fallback(self, session: dict, started_at: str) -> None:
         if not self._is_current_work_session(started_at):
             return
-        applications = session.get("applications", [])[:3]
-        app_text = "、".join(
-            f"{display_application_name(item['application'])}（{int(item['key_press_count']):,}次）"
-            for item in applications
-        ) or "未识别应用"
-        message = (
-            f"你已经连续工作 {self._format_work_duration(session['duration_seconds'])}，"
-            f"键盘敲击 {int(session['key_press_count']):,} 次。\n\n"
-            f"主要活动应用：{app_text}。\n\n"
-            "起来走动一下，让眼睛和手腕休息几分钟吧。"
+        self.pet.show_break_reminder(
+            self._format_work_duration(session["duration_seconds"]),
+            int(session["key_press_count"]),
         )
-        self.pet.show_message(message, 20_000)
 
     def _work_break_finished(self) -> None:
         self.work_break_worker_active = False

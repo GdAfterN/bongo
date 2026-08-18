@@ -1,0 +1,99 @@
+{
+  "description": "上下文管理模块测试场景：12 组超长对话（50 轮），覆盖不同工具调用模式与结果大小。",
+  "rounds_per_scenario": 50,
+  "scenarios": [
+    {
+      "name": "short_qa",
+      "description": "短问答：每次简短问题，工具返回也很短",
+      "user_template": "问题 {i} 是什么？",
+      "tool": {"name": "read_file", "args_template": {"path": "file_{i}.txt"}, "result_template": "文件 {i} 内容内容内容内容内容"},
+      "memory_enabled": true
+    },
+    {
+      "name": "long_file_read",
+      "description": "长文件读取：每次读一个大文件（~100 行）",
+      "user_template": "读取文件 {i}",
+      "tool": {"name": "read_file", "args_template": {"path": "src/module_{i}.py"}, "result_template": "def func_{i}():\n    pass\n" * 100},
+      "memory_enabled": true
+    },
+    {
+      "name": "search_heavy",
+      "description": "搜索密集：大量 search 调用，结果含多个匹配项",
+      "user_template": "搜索关键词 {i}",
+      "tool": {"name": "search", "args_template": {"pattern": "keyword_{i}", "path": "."}, "result_template": "找到 {i} 个匹配项\nmatch\n" * 20},
+      "memory_enabled": true
+    },
+    {
+      "name": "write_files",
+      "description": "写文件：每次创建一个文件，工具结果短",
+      "user_template": "创建文件 {i}",
+      "tool": {"name": "write_file", "args_template": {"path": "src/new_{i}.py", "content": "# file {i}"}, "result_template": "写入成功"},
+      "memory_enabled": true
+    },
+    {
+      "name": "mixed_tools",
+      "description": "混合工具：交替使用 read_file 和 patch_file",
+      "user_template": "任务 {i}: 读取并修改文件",
+      "tool_alternate": [
+        {"name": "read_file", "args_template": {"path": "a_{i}.py"}, "result_template": "内容内容内容内容内容内容内容内容内容内容"},
+        {"name": "patch_file", "args_template": {"path": "a_{i}.py"}, "result_template": "修改成功"}
+      ],
+      "memory_enabled": true
+    },
+    {
+      "name": "huge_result",
+      "description": "超长结果：单次工具返回 5000 字符",
+      "user_template": "分析文件 {i}",
+      "tool": {"name": "read_file", "args_template": {"path": "huge_{i}.log"}, "result_template": "x" * 5000},
+      "memory_enabled": true
+    },
+    {
+      "name": "no_memory",
+      "description": "无 memory：不注入工作记忆",
+      "user_template": "处理 {i}",
+      "tool": {"name": "bash", "args_template": {"command": "echo {i}"}, "result_template": "{i}"},
+      "memory_enabled": false
+    },
+    {
+      "name": "frequent_compact",
+      "description": "频繁压缩：结果中等大小，容易触发 compact",
+      "user_template": "第 {i} 轮对话",
+      "tool": {"name": "read_file", "args_template": {"path": "f_{i}.py"}, "result_template": "内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容"},
+      "memory_enabled": true
+    },
+    {
+      "name": "growing_result",
+      "description": "渐进增长：工具结果随轮次线性增长",
+      "user_template": "分析 {i}",
+      "tool": {"name": "read_file", "args_template": {"path": "g_{i}.py"}, "result_template": "g" * 100, "result_scale": "i * 100"},
+      "memory_enabled": true
+    },
+    {
+      "name": "multi_file",
+      "description": "多文件操作：每次搜索返回多个文件路径",
+      "user_template": "处理文件组 {i}",
+      "tool": {"name": "search", "args_template": {"pattern": "group_{i}"}, "result_template": "file_{i}_1.py\nfile_{i}_2.py\nfile_{i}_3.py"},
+      "memory_enabled": true
+    },
+    {
+      "name": "error_heavy",
+      "description": "错误密集：1/3 工具返回错误",
+      "user_template": "尝试操作 {i}",
+      "tool": {"name": "patch_file", "args_template": {"path": "e_{i}.py"}, "result_condition": "i % 3 == 0 ? 'Error: 文件不存在' : '修改成功'"},
+      "memory_enabled": true
+    },
+    {
+      "name": "realistic",
+      "description": "真实模拟：模拟真实编码对话的 5 种操作循环",
+      "user_templates": ["帮我看看这个 bug", "修复一下", "运行测试", "提交代码", "看看日志"],
+      "tool_cycle": [
+        {"name": "read_file", "args_template": {"path": "src/real_{i}.py"}, "result_template": "代码内容代码内容代码内容代码内容代码内容代码内容代码内容代码内容代码内容代码内容"},
+        {"name": "patch_file", "args_template": {"path": "src/real_{i}.py"}, "result_template": "patched"},
+        {"name": "bash", "args_template": {"command": "pytest"}, "result_template": "2 passed"},
+        {"name": "bash", "args_template": {"command": "git commit"}, "result_template": "committed"},
+        {"name": "read_file", "args_template": {"path": "logs/app.log"}, "result_template": "日志内容日志内容日志内容日志内容日志内容"}
+      ],
+      "memory_enabled": true
+    }
+  ]
+}

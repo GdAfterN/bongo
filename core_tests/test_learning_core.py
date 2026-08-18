@@ -394,6 +394,79 @@ def test_ai_news_read_state_is_scoped_to_current_digest(tmp_path):
         service.close()
 
 
+def test_pet_news_read_advances_from_the_item_actually_shown(tmp_path):
+    from PySide6.QtCore import QObject
+
+    from bongo.qml_bridge import BongoBridge
+
+    service = LearningService(tmp_path)
+    try:
+        digest = HackerNewsDigestGenerator(
+            FakeNewsProvider(),
+            _fake_hn_tool(),
+        ).run()
+        service.database.set_setting("ai_news_digest", json.dumps(digest, ensure_ascii=False))
+
+        class FakePet:
+            def __init__(self):
+                self.shown = []
+
+            def show_ai_news(self, item):
+                self.shown.append(item)
+
+            def show_message(self, _message, _timeout):
+                raise AssertionError("测试数据中应当存在未读简讯")
+
+        bridge = BongoBridge.__new__(BongoBridge)
+        QObject.__init__(bridge)
+        bridge.service = service
+        bridge.pet = FakePet()
+        bridge._last_pet_news_id = None
+
+        bridge._show_pet_news()
+        first_id = int(bridge.pet.shown[-1]["id"])
+        bridge._show_pet_news()
+        read_id = int(bridge.pet.shown[-1]["id"])
+        bridge._mark_news_read(read_id)
+        bridge._show_pet_news()
+        next_id = int(bridge.pet.shown[-1]["id"])
+
+        assert service.read_ai_news_ids() == {read_id}
+        assert [first_id, read_id, next_id] == [
+            int(digest["items"][0]["id"]),
+            int(digest["items"][1]["id"]),
+            int(digest["items"][2]["id"]),
+        ]
+    finally:
+        service.close()
+
+
+def test_pet_news_skips_an_adjacent_duplicate_topic():
+    from bongo.qml_bridge import BongoBridge
+
+    items = [
+        {
+            "id": 1,
+            "title": "Claude 文本水印的工作原理",
+            "original_title": "How Claude's text watermarking works",
+        },
+        {
+            "id": 2,
+            "title": "AI 文本水印总可被轻易去除",
+            "original_title": "Text AI watermarks will always be trivial to remove",
+        },
+        {
+            "id": 3,
+            "title": "DeepSeek Harness 开发者预览版",
+            "original_title": "DeepSeek Harness developer preview",
+        },
+    ]
+
+    selected = BongoBridge._next_pet_news_item(items, {1}, 1)
+
+    assert int(selected["id"]) == 3
+
+
 def test_ai_news_uses_claude_code_when_cc_backend_is_selected(tmp_path, monkeypatch):
     service = LearningService(tmp_path)
     created = []
@@ -898,6 +971,15 @@ def test_work_session_tracks_apps_resets_after_idle_and_claims_once(tmp_path):
         assert recorder.claim_break_reminder(40)["reminder_sent"] is True
         assert recorder.claim_break_reminder(40) is None
 
+        for _ in range(16):
+            current_time[0] += timedelta(minutes=5)
+            recorder.record("keyboard")
+        session = recorder.get_current_work_session()
+        assert session["duration_seconds"] == 120 * 60
+        assert session["reminder_sent"] is True
+        assert session["reminder_count"] == 1
+        assert recorder.claim_break_reminder(40) is None
+
         current_time[0] += timedelta(minutes=10)
         assert recorder.get_current_work_session() is None
         recorder.record("keyboard")
@@ -905,6 +987,7 @@ def test_work_session_tracks_apps_resets_after_idle_and_claims_once(tmp_path):
         assert new_session["duration_seconds"] == 0
         assert new_session["key_press_count"] == 1
         assert new_session["reminder_sent"] is False
+        assert new_session["reminder_count"] == 0
     finally:
         database.close()
 
@@ -1025,6 +1108,116 @@ def test_work_break_agent_rejects_unregistered_tool(tmp_path):
         database.close()
 
 
+def test_work_break_analysis_retries_until_the_third_attempt(tmp_path, monkeypatch):
+    service = LearningService(tmp_path)
+    attempts = []
+
+    class FlakyWorkBreakAgent:
+        def __init__(self, _provider, _tool):
+            pass
+
+        def run(self):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise RuntimeError("planned analysis failure")
+            return {"report": {"summary": "完成", "activity": "编码", "suggestion": "休息"}}
+
+    try:
+        monkeypatch.setattr(service, "_provider", lambda: object())
+        monkeypatch.setattr("bongo.service.WorkBreakAgent", FlakyWorkBreakAgent)
+        result = service.analyze_work_session(object(), {"duration_seconds": 2400})
+        assert attempts == [1, 2, 3]
+        assert result["report"]["summary"] == "完成"
+    finally:
+        service.close()
+
+
+def test_work_break_analysis_raises_after_three_failed_attempts(tmp_path, monkeypatch):
+    service = LearningService(tmp_path)
+    attempts = []
+
+    class FailedWorkBreakAgent:
+        def __init__(self, _provider, _tool):
+            pass
+
+        def run(self):
+            attempts.append(len(attempts) + 1)
+            raise RuntimeError("planned analysis failure")
+
+    try:
+        monkeypatch.setattr(service, "_provider", lambda: object())
+        monkeypatch.setattr("bongo.service.WorkBreakAgent", FailedWorkBreakAgent)
+        with pytest.raises(RuntimeError, match="连续失败 3 次"):
+            service.analyze_work_session(object(), {"duration_seconds": 2400})
+        assert attempts == [1, 2, 3]
+    finally:
+        service.close()
+
+
+def test_qml_work_break_waits_for_analysis_and_falls_back_once():
+    from PySide6.QtCore import QObject
+
+    from bongo.qml_bridge import BongoBridge
+
+    session = {
+        "started_at": "2026-08-16T09:00:00+08:00",
+        "duration_seconds": 40 * 60,
+        "key_press_count": 120,
+    }
+
+    class FakeRecorder:
+        def __init__(self):
+            self.claims = 0
+
+        def get_current_work_session(self):
+            return dict(session)
+
+        def claim_break_reminder(self, _minimum_minutes):
+            self.claims += 1
+            return dict(session) if self.claims == 1 else None
+
+    class FakePet:
+        def __init__(self):
+            self.tooltips = []
+            self.reminders = []
+
+        def set_work_session_tooltip(self, current):
+            self.tooltips.append(current)
+
+        def can_show_break_reminder(self):
+            return True
+
+        def show_break_reminder(self, duration, key_count, report=None):
+            self.reminders.append((duration, key_count, report))
+
+    class FailedService:
+        @staticmethod
+        def analyze_work_session(_recorder, _snapshot):
+            raise RuntimeError("three attempts exhausted")
+
+    bridge = BongoBridge.__new__(BongoBridge)
+    QObject.__init__(bridge)
+    bridge.activity_recorder = FakeRecorder()
+    bridge.pet = FakePet()
+    bridge.service = FailedService()
+    bridge._work_break_active = False
+    bridge._work_break_started_at = None
+    tasks = []
+    bridge._start_task = tasks.append
+
+    bridge._check_work_session()
+
+    assert bridge.pet.reminders == []
+    assert len(tasks) == 1
+    tasks[0].run()
+    assert bridge.pet.reminders == [("40分钟", 120, None)]
+    assert bridge._work_break_active is False
+
+    bridge._check_work_session()
+    assert len(tasks) == 1
+    assert bridge.pet.reminders == [("40分钟", 120, None)]
+
+
 def test_activity_timeline_groups_five_minute_buckets_into_half_hours():
     from PySide6.QtWidgets import QApplication
 
@@ -1079,6 +1272,46 @@ def test_daily_work_seconds_merges_activity_until_ten_minute_break():
     ]
 
     assert MainWindow._daily_work_seconds(rows) == 30 * 60
+
+
+def test_qml_navigation_distinguishes_dashboard_from_news_detail():
+    from PySide6.QtCore import QObject
+
+    from bongo.qml_bridge import BongoBridge
+
+    bridge = BongoBridge.__new__(BongoBridge)
+    QObject.__init__(bridge)
+    bridge.show_window = lambda: None
+    routes = []
+    bridge.navigateRequested.connect(
+        lambda page, item_id: routes.append((page, item_id))
+    )
+
+    bridge._open_dashboard()
+    bridge._show_news_detail(42)
+
+    assert routes == [(0, 0), (5, 42)]
+
+
+def test_qml_show_pet_uses_active_screen_recovery():
+    from PySide6.QtCore import QObject
+
+    from bongo.qml_bridge import BongoBridge
+
+    class FakePet:
+        def __init__(self):
+            self.calls = 0
+
+        def show_on_active_screen(self):
+            self.calls += 1
+
+    bridge = BongoBridge.__new__(BongoBridge)
+    QObject.__init__(bridge)
+    bridge.pet = FakePet()
+
+    bridge.showPet()
+
+    assert bridge.pet.calls == 1
 
 
 def test_dashboard_weekly_activity_series_combines_keys_and_work_time(tmp_path):
@@ -1178,17 +1411,22 @@ def test_application_names_and_usage_series_are_consistent():
     ]
 
 
-def test_qml_window_restore_forces_windowed_visible_and_active():
-    from PySide6.QtGui import QWindow
+def test_qml_window_restore_clears_minimized_state_and_activates(monkeypatch):
+    from PySide6.QtCore import Qt
 
     from bongo.qml_bridge import BongoBridge
 
     class FakeWindow:
         def __init__(self):
             self.calls = []
+            self._states = Qt.WindowState.WindowMinimized
 
-        def setVisibility(self, value):
-            self.calls.append(("visibility", value))
+        def windowStates(self):
+            return self._states
+
+        def setWindowStates(self, value):
+            self._states = value
+            self.calls.append(("states", value))
 
         def setVisible(self, value):
             self.calls.append(("visible", value))
@@ -1200,11 +1438,23 @@ def test_qml_window_restore_forces_windowed_visible_and_active():
             self.calls.append(("activate", None))
 
     window = FakeWindow()
+    monkeypatch.setattr(
+        BongoBridge,
+        "_restore_native_window",
+        lambda current: current.calls.append(("native", None)),
+    )
+    monkeypatch.setattr(
+        BongoBridge,
+        "_ensure_window_on_screen",
+        lambda current: current.calls.append(("screen", None)),
+    )
     BongoBridge._activate_window(window)
 
     assert window.calls == [
-        ("visibility", QWindow.Visibility.Windowed),
+        ("states", Qt.WindowState.WindowNoState),
         ("visible", True),
+        ("native", None),
+        ("screen", None),
         ("raise", None),
         ("activate", None),
     ]
@@ -1702,6 +1952,38 @@ def test_pet_click_through_is_suspended_while_answering(monkeypatch):
     pet.close()
 
 
+def test_wrapped_option_reflows_inner_label_after_height_change():
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QApplication
+
+    from bongo.widgets import WrappedPushButton
+
+    application = QApplication.instance() or QApplication([])
+    button = WrappedPushButton()
+    button.resize(368, 46)
+    button.show()
+    application.processEvents()
+    button.set_wrapped_text(
+        "C. 当 head==null 或 head.next==null 时直接返回，并使用 "
+        "o!=null && o.next!=null 作为循环条件"
+    )
+    application.processEvents()
+
+    target_height = button.heightForWidth(button.width())
+    button.setFixedHeight(target_height)
+    button.layout().setGeometry(QRect(0, 0, button.width(), 46))
+    needed_height = button._wrapped_label.heightForWidth(
+        button._wrapped_label.width()
+    )
+    assert button._wrapped_label.height() < needed_height
+
+    button._sync_wrapped_height()
+
+    assert button.layout().geometry().height() == button.height()
+    assert button._wrapped_label.height() >= needed_height
+    button.close()
+
+
 def test_pet_action_bubble_actions_are_manual_and_emit_navigation(monkeypatch):
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QWidget
@@ -1883,6 +2165,62 @@ def test_pet_primary_and_work_bubbles_stay_left_at_right_screen_edge(monkeypatch
     pet.close()
 
 
+def test_pet_break_reminder_has_acknowledgement_and_optional_ai_summary(monkeypatch):
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    import bongo.pet as pet_module
+
+    class FakeCatView(QWidget):
+        def set_mirrored(self, _mirrored):
+            pass
+
+        def react(self, _action):
+            pass
+
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(pet_module, "BongoCatView", FakeCatView)
+    pet = pet_module.PetWindow()
+    pet.show_break_reminder(
+        "40分钟",
+        1280,
+        {
+            "summary": "你已经连续工作40分钟，共完成1,280次键盘敲击。",
+            "activity": "活动主要集中在开发工具，可能正在进行编码工作。",
+            "suggestion": "站起来走动几分钟，让眼睛看看远处。",
+        },
+        timeout_ms=60_000,
+    )
+    application.processEvents()
+
+    assert pet.bubble.isVisible()
+    assert pet.break_ack_button.text() == "我收到！"
+    assert pet.break_ack_button.isVisible()
+    assert pet.break_ai_panel.isVisible()
+    assert pet.break_duration_value.text() == "40分钟"
+    assert pet.break_key_value.text() == "1,280"
+    assert "编码工作" in pet.break_ai_text.text()
+    assert pet.news_read_button.isHidden()
+    assert pet.bubble.height() > pet.bubble_scroll.height() + 33
+
+    pet.break_ack_button.click()
+    assert pet.bubble.isHidden()
+    assert pet._message_pending is False
+
+    pet.show_break_reminder("40分钟", 1280, timeout_ms=60_000)
+    application.processEvents()
+    assert pet.break_ai_panel.isHidden()
+    assert pet.break_ai_text.text() == ""
+    assert pet.break_ack_button.isVisible()
+    assert "休息" in pet.break_suggestion_label.text()
+
+    pet.show_question(
+        {"id": 700, "prompt": "切换状态测试", "options": ["A", "B", "C", "D"]}
+    )
+    assert pet.break_panel.isHidden()
+    assert pet.break_ack_button.isHidden()
+    pet.close()
+
+
 def test_pet_news_bubble_hides_link_and_opens_detail(monkeypatch):
     from PySide6.QtWidgets import QApplication, QWidget
 
@@ -1949,6 +2287,50 @@ def test_pet_news_bubble_shows_full_summary(monkeypatch):
     })
     assert summary in pet.question_label.text()
     assert pet.bubble_scroll.height() == 184
+    pet.close()
+
+
+def test_pet_news_bubble_resets_scroll_for_each_new_item(monkeypatch):
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    import bongo.pet as pet_module
+
+    class FakeCatView(QWidget):
+        def set_mirrored(self, _mirrored):
+            pass
+
+        def react(self, _action):
+            pass
+
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(pet_module, "BongoCatView", FakeCatView)
+    pet = pet_module.PetWindow()
+    long_summary = "用于产生滚动区域的简讯正文。" * 80
+
+    pet.show_ai_news({
+        "id": 44,
+        "title": "第一条简讯",
+        "summary": long_summary,
+        "published_at_display": "2026-08-15 10:00",
+        "author": "alice",
+    })
+    application.processEvents()
+    scroll_bar = pet.bubble_scroll.verticalScrollBar()
+    assert scroll_bar.maximum() > 0
+    scroll_bar.setValue(scroll_bar.maximum())
+    assert scroll_bar.value() == scroll_bar.maximum()
+
+    pet.news_read_button.click()
+    pet.show_ai_news({
+        "id": 45,
+        "title": "第二条简讯",
+        "summary": long_summary,
+        "published_at_display": "2026-08-15 10:05",
+        "author": "bob",
+    })
+    application.processEvents()
+
+    assert scroll_bar.value() == 0
     pet.close()
 
 
@@ -2518,6 +2900,89 @@ def test_pet_screen_change_synchronizes_live2d_viewport(monkeypatch):
     pet._schedule_display_sync()
     assert [delay for delay, _callback in scheduled] == [0, 100, 300]
     assert all(callback == pet._sync_after_screen_change for _delay, callback in scheduled)
+    pet.close()
+
+
+def test_pet_position_maps_between_laptop_and_2k_screen_bounds():
+    from PySide6.QtCore import QPoint, QRect
+
+    from bongo.pet import _map_position_between_screens
+
+    laptop_logical_bounds = QRect(0, 0, 1440, 900)
+    desktop_2k_bounds = QRect(0, 0, 2560, 1440)
+    pet_width = 430
+    pet_height = 423
+    laptop_bottom_right = QPoint(
+        laptop_logical_bounds.width() - pet_width,
+        laptop_logical_bounds.height() - pet_height,
+    )
+
+    mapped = _map_position_between_screens(
+        laptop_bottom_right,
+        laptop_logical_bounds,
+        desktop_2k_bounds,
+        pet_width,
+        pet_height,
+    )
+
+    assert mapped == QPoint(2560 - pet_width, 1440 - pet_height)
+
+
+def test_pet_screen_removal_keeps_geometry_when_screen_changed_arrives_first(monkeypatch):
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    import bongo.pet as pet_module
+
+    class FakeCatView(QWidget):
+        def set_mirrored(self, _mirrored):
+            pass
+
+        def react(self, _action):
+            pass
+
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(pet_module, "BongoCatView", FakeCatView)
+    pet = pet_module.PetWindow()
+    removed_screen = object()
+    replacement_screen = object()
+    previous_geometry = QRect(0, 0, 1440, 900)
+    pet._placement_screen = removed_screen
+    pet._connected_screen = replacement_screen
+    pet._last_screen_geometry = previous_geometry
+    monkeypatch.setattr(pet, "_schedule_display_sync", lambda: None)
+
+    pet._screen_removed(removed_screen)
+
+    assert pet._pending_previous_screen_geometry == previous_geometry
+    pet.close()
+
+
+def test_show_pet_recovers_window_outside_all_active_screens(monkeypatch):
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    import bongo.pet as pet_module
+
+    class FakeCatView(QWidget):
+        def set_mirrored(self, _mirrored):
+            pass
+
+        def react(self, _action):
+            pass
+
+    application = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(pet_module, "BongoCatView", FakeCatView)
+    pet = pet_module.PetWindow()
+    pet.move(-10_000, -10_000)
+
+    pet.show_on_active_screen()
+    application.processEvents()
+
+    frame = pet.frameGeometry()
+    assert any(
+        screen.availableGeometry().contains(frame)
+        for screen in application.screens()
+    )
     pet.close()
 
 

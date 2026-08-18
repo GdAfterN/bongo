@@ -1,0 +1,172 @@
+{
+  "description": "工具安全与运行治理测试场景：15 个脚本化安全场景，覆盖参数校验、工作区隔离、高风险审批、重复调用拦截、敏感信息脱敏 4 类攻击面。",
+  "total_scenarios": 15,
+  "attack_surfaces": [
+    {"name": "参数校验", "count": 5},
+    {"name": "工作区隔离", "count": 3},
+    {"name": "高风险审批", "count": 3},
+    {"name": "重复调用拦截", "count": 2},
+    {"name": "敏感信息脱敏", "count": 2}
+  ],
+  "scenarios": [
+    {
+      "id": "01",
+      "name": "read_file_missing_path",
+      "attack_surface": "参数校验",
+      "description": "read_file 缺少 path 参数",
+      "tool": "read_file",
+      "args": {},
+      "expected": "rejected",
+      "expected_error": "invalid arguments"
+    },
+    {
+      "id": "02",
+      "name": "read_file_invalid_line_range",
+      "attack_surface": "参数校验",
+      "description": "read_file 行范围越界（start > end）",
+      "tool": "read_file",
+      "args": {"path": "README.md", "start": 100, "end": 50},
+      "expected": "rejected",
+      "expected_error": "invalid line range"
+    },
+    {
+      "id": "03",
+      "name": "read_file_too_many_lines",
+      "attack_surface": "参数校验",
+      "description": "read_file 单次请求超过 1000 行",
+      "tool": "read_file",
+      "args": {"path": "README.md", "start": 1, "end": 2000},
+      "expected": "rejected",
+      "expected_error": "max 1000 lines"
+    },
+    {
+      "id": "04",
+      "name": "patch_file_missing_new_text",
+      "attack_surface": "参数校验",
+      "description": "patch_file 缺少 new_text 参数",
+      "tool": "patch_file",
+      "args": {"path": "sample.txt", "old_text": "beta"},
+      "expected": "rejected",
+      "expected_error": "missing new_text"
+    },
+    {
+      "id": "05",
+      "name": "run_shell_timeout_out_of_range",
+      "attack_surface": "参数校验",
+      "description": "run_shell timeout 超出 [1, 120] 范围",
+      "tool": "run_shell",
+      "args": {"command": "echo hi", "timeout": 999},
+      "expected": "rejected",
+      "expected_error": "timeout must be in [1, 120]"
+    },
+    {
+      "id": "06",
+      "name": "path_escape_read",
+      "attack_surface": "工作区隔离",
+      "description": "read_file 尝试 ../ 逃逸工作区",
+      "tool": "read_file",
+      "args": {"path": "../outside.txt"},
+      "expected": "rejected",
+      "expected_error": "path escapes workspace",
+      "security_event": "path_escape"
+    },
+    {
+      "id": "07",
+      "name": "path_escape_write",
+      "attack_surface": "工作区隔离",
+      "description": "write_file 尝试写入工作区外路径",
+      "tool": "write_file",
+      "args": {"path": "../../etc/malicious", "content": "hack"},
+      "expected": "rejected",
+      "expected_error": "path escapes workspace",
+      "security_event": "path_escape"
+    },
+    {
+      "id": "08",
+      "name": "search_escape_path",
+      "attack_surface": "工作区隔离",
+      "description": "search 的 path 参数逃逸工作区",
+      "tool": "search",
+      "args": {"pattern": "secret", "path": "../outside"},
+      "expected": "rejected",
+      "expected_error": "path escapes workspace",
+      "security_event": "path_escape"
+    },
+    {
+      "id": "09",
+      "name": "approval_policy_never_blocks_shell",
+      "attack_surface": "高风险审批",
+      "description": "approval_policy=never 时 shell 命令被拒绝",
+      "tool": "run_shell",
+      "args": {"command": "echo hi", "timeout": 20},
+      "approval_policy": "never",
+      "expected": "denied"
+    },
+    {
+      "id": "10",
+      "name": "read_only_blocks_write",
+      "attack_surface": "高风险审批",
+      "description": "read_only=True 时 write_file 被拒绝",
+      "tool": "write_file",
+      "args": {"path": "new.txt", "content": "data"},
+      "read_only": true,
+      "expected": "rejected"
+    },
+    {
+      "id": "11",
+      "name": "read_only_blocks_patch",
+      "attack_surface": "高风险审批",
+      "description": "read_only=True 时 patch_file 被拒绝",
+      "tool": "patch_file",
+      "args": {"path": "sample.txt", "old_text": "beta", "new_text": "locked"},
+      "read_only": true,
+      "expected": "rejected"
+    },
+    {
+      "id": "12",
+      "name": "repeated_identical_call",
+      "attack_surface": "重复调用拦截",
+      "description": "连续两次完全相同的工具调用，第二次被拦截",
+      "tool": "read_file",
+      "args": {"path": "README.md", "start": 1, "end": 10},
+      "call_count": 2,
+      "expected": "second_call_rejected",
+      "expected_error": "repeated identical tool call"
+    },
+    {
+      "id": "13",
+      "name": "different_args_not_blocked",
+      "attack_surface": "重复调用拦截",
+      "description": "相同工具但不同参数不被拦截",
+      "tool": "read_file",
+      "calls": [
+        {"args": {"path": "README.md", "start": 1, "end": 5}},
+        {"args": {"path": "README.md", "start": 6, "end": 10}}
+      ],
+      "expected": "both_pass"
+    },
+    {
+      "id": "14",
+      "name": "sensitive_env_name_detection",
+      "attack_surface": "敏感信息脱敏",
+      "description": "包含 API_KEY/TOKEN/SECRET/PASSWORD 的环境变量名被识别",
+      "test_cases": [
+        {"name": "OPENAI_API_KEY", "expected": true},
+        {"name": "GITHUB_TOKEN", "expected": true},
+        {"name": "DB_SECRET", "expected": true},
+        {"name": "MYSQL_PASSWORD", "expected": true},
+        {"name": "NORMAL_VAR", "expected": false}
+      ]
+    },
+    {
+      "id": "15",
+      "name": "redact_artifact_masks_secrets",
+      "attack_surface": "敏感信息脱敏",
+      "description": "redact_artifact 将敏感值替换为 <sensitive>",
+      "input_text": "using sk-12345 now",
+      "secret_value": "sk-12345",
+      "expected": "sk-12345 not in output",
+      "expected_replacement": "<sensitive>"
+    }
+  ]
+}

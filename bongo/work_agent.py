@@ -6,8 +6,13 @@ from pathlib import Path
 
 
 WORK_SYSTEM_PROMPT = """你是 Bongo 的本地工作 Agent。你只能通过提供的工具在指定工作目录内完成任务。
-每轮只返回一个 JSON 决策：需要工具时 action=tool，并填写 tool 与 arguments；任务完成时 action=final，并填写 answer。
+每轮只返回一个 JSON 决策：需要工具时 action=tool，并填写 tool 与 arguments；任务完成并准备回答时 action=final，answer 留空。
 先检查再修改，避免无关改动。不要声称执行了未调用的操作。"""
+
+
+WORK_FINAL_SYSTEM_PROMPT = """你是 Bongo 的本地工作 Agent。工具调用阶段已经结束。
+请根据用户请求、已完成的工具调用和工具返回结果，直接给出清晰、准确的最终答复。
+不要再输出 JSON 决策，不要声称执行了记录中没有发生的操作。"""
 
 
 DECISION_SCHEMA = {
@@ -89,7 +94,7 @@ class DefaultWorkAgent:
         self.conversation_id = conversation_id
         self.tools = WorkspaceTools(work_dir)
 
-    def run(self, history: list[dict], request: str) -> dict:
+    def run(self, history: list[dict], request: str, on_delta=None) -> dict:
         run_id = self.database.create_agent_run(self.conversation_id, "default")
         messages = [*history, {"role": "user", "content": request}]
         try:
@@ -98,7 +103,24 @@ class DefaultWorkAgent:
                 if not isinstance(decision, dict):
                     raise RuntimeError("模型未返回结构化 Agent 决策")
                 if decision.get("action") == "final":
-                    answer = str(decision.get("answer") or "").strip()
+                    stream_text = getattr(self.provider, "stream_text", None)
+                    if callable(stream_text):
+                        final_decision = {**decision, "answer": ""}
+                        messages.append({
+                            "role": "assistant",
+                            "content": json.dumps(final_decision, ensure_ascii=False),
+                        })
+                        answer = str(stream_text(
+                            messages,
+                            WORK_FINAL_SYSTEM_PROMPT,
+                            on_delta or (lambda _delta: None),
+                        )).strip()
+                    else:
+                        answer = str(decision.get("answer") or "").strip()
+                        if answer and on_delta is not None:
+                            on_delta(answer)
+                    if not answer:
+                        raise RuntimeError("模型未返回最终回答")
                     self.database.finish_agent_run(run_id)
                     return {"answer": answer, "run_id": run_id}
                 tool = str(decision.get("tool") or "")

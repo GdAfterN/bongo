@@ -4,10 +4,11 @@ import QtQuick.Effects
 
 ComboBox {
     id: control
+    property bool showIndicator: true
     implicitHeight: 44
     implicitWidth: 190
     leftPadding: 16
-    rightPadding: 42
+    rightPadding: control.showIndicator ? 42 : 16
     hoverEnabled: true
     scale: control.hovered || control.popup.visible ? 1.012 : 1
     Behavior on scale { NumberAnimation { duration: Theme.motionNormal; easing.type: Easing.OutCubic } }
@@ -43,6 +44,7 @@ ComboBox {
     }
 
     indicator: Item {
+        visible: control.showIndicator
         x: control.width - width - 14
         y: (control.height - height) / 2
         width: 16

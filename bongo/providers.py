@@ -4,11 +4,12 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -57,6 +58,140 @@ def _request_with_transient_retry(request, provider_name: str):
     raise ProviderError(f"{provider_name} request failed without a response")
 
 
+def _stream_with_transient_retry(
+    request: Callable[[Callable[[str], None]], None],
+    provider_name: str,
+    on_delta: Callable[[str], None],
+) -> str:
+    for attempt in range(TRANSIENT_REQUEST_ATTEMPTS):
+        chunks: list[str] = []
+        emitted = False
+
+        def emit(delta: str) -> None:
+            nonlocal emitted
+            text = str(delta)
+            if not text:
+                return
+            emitted = True
+            chunks.append(text)
+            on_delta(text)
+
+        try:
+            request(emit)
+        except Exception as exc:
+            if emitted:
+                if isinstance(exc, ProviderError):
+                    raise
+                raise ProviderError(f"{provider_name} stream failed after output started: {exc}") from exc
+            if isinstance(exc, ProviderError) or not _is_transient_request_error(exc):
+                if isinstance(exc, ProviderError):
+                    raise
+                raise ProviderError(f"{provider_name} request failed: {exc}") from exc
+            if attempt == TRANSIENT_REQUEST_ATTEMPTS - 1:
+                raise ProviderError(
+                    f"{provider_name} 模型服务暂时繁忙或请求过多，"
+                    f"已自动重试 {TRANSIENT_REQUEST_ATTEMPTS} 次，请稍后再试。"
+                ) from exc
+            time.sleep(TRANSIENT_RETRY_DELAYS[attempt])
+            continue
+        answer = "".join(chunks)
+        if not answer.strip():
+            raise ProviderError(f"{provider_name} returned empty streamed output")
+        return answer
+    raise ProviderError(f"{provider_name} request failed without a response")
+
+
+def _run_jsonl_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    input_text: str,
+    environment: dict[str, str] | None,
+    timeout: int,
+    provider_name: str,
+    on_payload: Callable[[dict[str, Any]], None],
+) -> None:
+    startup = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=startup,
+            env=environment,
+        )
+    except OSError as exc:
+        raise ProviderError(f"{provider_name} could not be started: {exc}") from exc
+
+    stderr_lines: list[str] = []
+    timed_out = threading.Event()
+
+    def drain_stderr() -> None:
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            stderr_lines.append(line)
+            if len(stderr_lines) > 200:
+                del stderr_lines[:100]
+
+    def stop_process() -> None:
+        if process.poll() is None:
+            timed_out.set()
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    timeout_timer = threading.Timer(timeout, stop_process)
+    timeout_timer.daemon = True
+    timeout_timer.start()
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise ProviderError(f"{provider_name} process streams are unavailable")
+        process.stdin.write(input_text)
+        process.stdin.close()
+        for line in process.stdout:
+            value = line.strip()
+            if not value:
+                continue
+            try:
+                payload = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                on_payload(payload)
+        return_code = process.wait()
+    except Exception as exc:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        process.wait()
+        if timed_out.is_set():
+            raise ProviderError(f"{provider_name} request timed out after {timeout} seconds") from exc
+        if isinstance(exc, ProviderError):
+            raise
+        raise ProviderError(f"{provider_name} stream failed: {exc}") from exc
+    finally:
+        timeout_timer.cancel()
+        stderr_thread.join(timeout=1)
+
+    if timed_out.is_set():
+        raise ProviderError(f"{provider_name} request timed out after {timeout} seconds")
+    if return_code != 0:
+        detail = "".join(stderr_lines).strip() or f"exit code {return_code}"
+        raise ProviderError(f"{provider_name} failed: {detail[:500]}")
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     name: str
@@ -74,6 +209,20 @@ class ConversationProvider(ABC):
         response_schema: dict[str, Any] | None = None,
     ) -> str | dict:
         raise NotImplementedError
+
+    def stream_text(
+        self,
+        messages: list[dict[str, str]],
+        system: str,
+        on_delta: Callable[[str], None],
+    ) -> str:
+        result = self.complete(messages, system)
+        if isinstance(result, dict):
+            raise ProviderError("Provider returned structured output for a text stream")
+        text = str(result)
+        if text:
+            on_delta(text)
+        return text
 
 
 class OpenAIProvider(ConversationProvider):
@@ -134,6 +283,22 @@ class OpenAIProvider(ConversationProvider):
                 raise ProviderError(f"OpenAI returned invalid structured output: {exc}") from exc
         raise ProviderError("OpenAI request failed without a response")
 
+    def stream_text(self, messages, system, on_delta):
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "instructions": system,
+            "input": messages,
+            "max_output_tokens": 8192,
+        }
+
+        def request(emit):
+            with self.client.responses.stream(**kwargs) as stream:
+                for event in stream:
+                    if getattr(event, "type", "") == "response.output_text.delta":
+                        emit(getattr(event, "delta", ""))
+
+        return _stream_with_transient_retry(request, "OpenAI", on_delta)
+
 
 class AnthropicProvider(ConversationProvider):
     def __init__(self, config: ProviderConfig):
@@ -174,6 +339,20 @@ class AnthropicProvider(ConversationProvider):
             raise
         except Exception as exc:
             raise ProviderError(f"Anthropic request failed: {exc}") from exc
+
+    def stream_text(self, messages, system, on_delta):
+        def request(emit):
+            with self.client.messages.stream(
+                model=self.model,
+                max_tokens=4096,
+                temperature=0.2,
+                system=system,
+                messages=messages,
+            ) as stream:
+                for delta in stream.text_stream:
+                    emit(delta)
+
+        return _stream_with_transient_retry(request, "Anthropic", on_delta)
 
 
 class ClaudeCodeProvider(ConversationProvider):
@@ -241,6 +420,59 @@ class ClaudeCodeProvider(ConversationProvider):
         result = payload.get("result", output)
         return result if isinstance(result, dict) else _extract_json(str(result))
 
+    def stream_text(self, messages, system, on_delta):
+        transcript = []
+        for item in messages:
+            label = "用户" if item.get("role") == "user" else "助学伙伴"
+            transcript.append(f"{label}: {item.get('content', '')}")
+        prompt = "\n\n".join(transcript)
+        command = [
+            self.executable,
+            "--print",
+            "--permission-mode",
+            "acceptEdits",
+            "--system-prompt",
+            system,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]
+        if self.model:
+            command.extend(["--model", self.model])
+
+        chunks: list[str] = []
+        final_result = ""
+
+        def handle_payload(payload: dict[str, Any]) -> None:
+            nonlocal final_result
+            if payload.get("type") == "stream_event":
+                event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+                delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                if event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                    text = str(delta.get("text") or "")
+                    if text:
+                        chunks.append(text)
+                        on_delta(text)
+            elif payload.get("type") == "result":
+                final_result = str(payload.get("result") or "")
+
+        _run_jsonl_process(
+            command,
+            cwd=self.cwd,
+            input_text=prompt,
+            environment={**os.environ, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            timeout=180,
+            provider_name="Claude Code",
+            on_payload=handle_payload,
+        )
+        if chunks:
+            return "".join(chunks)
+        if final_result:
+            on_delta(final_result)
+            return final_result
+        raise ProviderError("Claude Code returned empty streamed output")
+
 
 class CodexCliProvider(ConversationProvider):
     """Codex CLI adapter using workspace-write inside the selected directory."""
@@ -301,6 +533,54 @@ class CodexCliProvider(ConversationProvider):
             raise ProviderError(f"Codex CLI failed: {detail[:500]}")
         output = completed.stdout.strip()
         return _extract_json(output) if response_schema else output
+
+    def stream_text(self, messages, system, on_delta):
+        transcript = []
+        for item in messages:
+            label = "用户" if item.get("role") == "user" else "助学伙伴"
+            transcript.append(f"{label}: {item.get('content', '')}")
+        prompt = f"{system}\n\n" + "\n\n".join(transcript)
+        command = [
+            self.executable,
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write" if self.writable else "read-only",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "-C",
+            str(self.cwd),
+        ]
+        if self.model:
+            command.extend(["--model", self.model])
+        command.append("-")
+
+        chunks: list[str] = []
+
+        def handle_payload(payload: dict[str, Any]) -> None:
+            if payload.get("type") != "item.completed":
+                return
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            if item.get("type") != "agent_message":
+                return
+            text = str(item.get("text") or "")
+            if text:
+                chunks.append(text)
+                on_delta(text)
+
+        _run_jsonl_process(
+            command,
+            cwd=self.cwd,
+            input_text=prompt,
+            environment=None,
+            timeout=180,
+            provider_name="Codex CLI",
+            on_payload=handle_payload,
+        )
+        if not chunks:
+            raise ProviderError("Codex CLI returned no agent_message events")
+        return "".join(chunks)
 
 
 def _extract_json(text: str) -> dict:

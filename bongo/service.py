@@ -4,6 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 from .database import StudyDatabase
 from .exporter import export_saved_learning_skill, learning_skill_preview
@@ -23,6 +24,9 @@ from .providers import (
 )
 from .rag import ExternalRagConnector, RagConnection, file_digest, normalize_records
 from .work_agent import DefaultWorkAgent
+
+
+WORK_BREAK_ANALYSIS_ATTEMPTS = 3
 
 
 def default_data_dir() -> Path:
@@ -142,10 +146,18 @@ class LearningService:
         self.database.delete_rag_document(document_id)
 
     def analyze_work_session(self, recorder: ActivityRecorder, snapshot: dict) -> dict:
-        return WorkBreakAgent(
-            self._provider(),
-            WorkSessionTool(recorder, snapshot),
-        ).run()
+        last_error: Exception | None = None
+        for _attempt in range(WORK_BREAK_ANALYSIS_ATTEMPTS):
+            try:
+                return WorkBreakAgent(
+                    self._provider(),
+                    WorkSessionTool(recorder, snapshot),
+                ).run()
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(
+            f"久坐提醒 AI 分析连续失败 {WORK_BREAK_ANALYSIS_ATTEMPTS} 次"
+        ) from last_error
 
     def cached_ai_news(self) -> dict | None:
         raw = self.database.get_setting("ai_news_digest", "")
@@ -256,6 +268,9 @@ class LearningService:
         conversation_or_source_id: int | None,
         message_or_conversation_id: str | int | None,
         legacy_message: str | None = None,
+        *,
+        on_started: Callable[[int], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> dict:
         if legacy_message is not None:
             return self._legacy_local_chat(
@@ -284,13 +299,20 @@ class LearningService:
         if conversation.get("mode") != "chat":
             raise ValueError("所选会话不是 Chat 会话")
         connection_id = conversation.get("rag_connection_id")
+        user_message_id = self.database.add_message(conversation_id, "user", message)
+        if on_started is not None:
+            on_started(conversation_id)
         payload = self._rag_connector(connection_id).retrieve(message)
         records = normalize_records(payload)
         citations = [
             {"index": item["index"], "source": item["title"], "score": item["score"], "metadata": item["metadata"]}
             for item in records
         ]
-        history = self.database.get_messages(conversation_id, limit=16)
+        history = [
+            item
+            for item in self.database.get_messages(conversation_id, limit=17)
+            if int(item["id"]) != user_message_id
+        ][-16:]
         messages = [{"role": item["role"], "content": item["content"]} for item in history if item["role"] in {"user", "assistant"}]
         context = "\n\n".join(f"[来源{item['index']}：{item['title']}]\n{item['content']}" for item in records)[:16000]
         messages.append({"role": "user", "content": message + (f"\n\n外部 RAG 检索结果：\n{context}" if context else "")})
@@ -298,10 +320,12 @@ class LearningService:
             "你是 Bongo 本地助学伙伴。优先依据外部 RAG 返回的资料回答，并以 [来源N] 标注依据。"
             "资料不足时明确说明，不要虚构。回答清晰、适合学习复盘。"
         )
-        user_message_id = self.database.add_message(conversation_id, "user", message)
         resolved_backend = "default"
         provider = self._provider()
-        answer = str(provider.complete(messages, system)).strip()
+        if on_delta is None:
+            answer = str(provider.complete(messages, system)).strip()
+        else:
+            answer = str(provider.stream_text(messages, system, on_delta)).strip()
         if not answer:
             raise RuntimeError("模型返回了空回答")
         assistant_message_id = self.database.add_message(conversation_id, "assistant", answer, citations)
@@ -341,7 +365,16 @@ class LearningService:
         self._compact_if_needed(conversation_id)
         return {"conversation_id": conversation_id, "source_id": source_id, "backend": backend, "answer": answer, "citations": citations}
 
-    def work(self, conversation_id: int | None, user_message: str, work_dir: str = "", backend: str = "default") -> dict:
+    def work(
+        self,
+        conversation_id: int | None,
+        user_message: str,
+        work_dir: str = "",
+        backend: str = "default",
+        *,
+        on_started: Callable[[int], None] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict:
         message = user_message.strip()
         if not message:
             raise ValueError("消息不能为空")
@@ -366,16 +399,34 @@ class LearningService:
             if item["role"] in {"user", "assistant"}
         ]
         self.database.add_message(conversation_id, "user", message)
+        if on_started is not None:
+            on_started(conversation_id)
         if selected_backend == "cc":
             provider = ClaudeCodeProvider(ProviderConfig(name="cc"), cwd=directory)
-            answer = str(provider.complete([*history, {"role": "user", "content": message}], "在当前目录完成用户任务并简要报告结果。"))
+            request_messages = [*history, {"role": "user", "content": message}]
+            system = "在当前目录完成用户任务并简要报告结果。"
+            answer = str(
+                provider.complete(request_messages, system)
+                if on_delta is None
+                else provider.stream_text(request_messages, system, on_delta)
+            )
             run_id = 0
         elif selected_backend == "codex":
             provider = CodexCliProvider(ProviderConfig(name="codex"), cwd=directory, writable=True)
-            answer = str(provider.complete([*history, {"role": "user", "content": message}], "在当前目录完成用户任务并简要报告结果。"))
+            request_messages = [*history, {"role": "user", "content": message}]
+            system = "在当前目录完成用户任务并简要报告结果。"
+            answer = str(
+                provider.complete(request_messages, system)
+                if on_delta is None
+                else provider.stream_text(request_messages, system, on_delta)
+            )
             run_id = 0
         else:
-            result = DefaultWorkAgent(self._provider(), self.database, conversation_id, directory).run(history, message)
+            result = DefaultWorkAgent(self._provider(), self.database, conversation_id, directory).run(
+                history,
+                message,
+                on_delta=on_delta,
+            )
             answer, run_id = result["answer"], result["run_id"]
         if not answer.strip():
             raise RuntimeError("Agent 返回了空结果")

@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QPoint,
     Property,
     QPropertyAnimation,
+    QRect,
     Qt,
     QTimer,
     QUrl,
@@ -92,6 +93,51 @@ def _windows_native_window_rect(
     if rect.right <= rect.left or rect.bottom <= rect.top:
         return None
     return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _map_position_between_screens(
+    position: QPoint,
+    previous_bounds: QRect,
+    target_bounds: QRect,
+    window_width: int,
+    window_height: int,
+) -> QPoint:
+    """Preserve a window's relative desktop position across screen changes."""
+    previous_x_span = max(0, previous_bounds.width() - window_width)
+    previous_y_span = max(0, previous_bounds.height() - window_height)
+    target_x_span = max(0, target_bounds.width() - window_width)
+    target_y_span = max(0, target_bounds.height() - window_height)
+
+    relative_x = (
+        (position.x() - previous_bounds.x()) / previous_x_span
+        if previous_x_span
+        else 0.5
+    )
+    relative_y = (
+        (position.y() - previous_bounds.y()) / previous_y_span
+        if previous_y_span
+        else 0.5
+    )
+    relative_x = max(0.0, min(1.0, relative_x))
+    relative_y = max(0.0, min(1.0, relative_y))
+    return QPoint(
+        target_bounds.x() + round(relative_x * target_x_span),
+        target_bounds.y() + round(relative_y * target_y_span),
+    )
+
+
+def _clamp_position_to_screen(
+    position: QPoint,
+    bounds: QRect,
+    window_width: int,
+    window_height: int,
+) -> QPoint:
+    maximum_x = bounds.x() + max(0, bounds.width() - window_width)
+    maximum_y = bounds.y() + max(0, bounds.height() - window_height)
+    return QPoint(
+        min(max(position.x(), bounds.x()), maximum_x),
+        min(max(position.y(), bounds.y()), maximum_y),
+    )
 
 
 class InputSignals(QObject):
@@ -723,6 +769,10 @@ class PetWindow(QWidget):
         self._last_pointer_position: tuple[float, float] | None = None
         self._screen_signal_connected = False
         self._connected_screen = None
+        self._placement_screen = None
+        self._last_screen_geometry: QRect | None = None
+        self._pending_previous_screen_geometry: QRect | None = None
+        self._screen_topology_signals_connected = False
         self.pet_settings = PetSettings()
         self._drag_offset = QPoint()
         self._global_drag_offset = QPoint()
@@ -758,7 +808,7 @@ class PetWindow(QWidget):
         )
         bubble_layout = QVBoxLayout(self.bubble)
         bubble_layout.setContentsMargins(8, 8, 8, 25)
-        bubble_layout.setSpacing(0)
+        bubble_layout.setSpacing(6)
         self.bubble_scroll = BubbleScrollArea()
         self.bubble_scroll.setObjectName("bubbleScroll")
         self.bubble_scroll.setWidgetResizable(True)
@@ -793,6 +843,103 @@ class PetWindow(QWidget):
         self.news_read_button.clicked.connect(self._mark_current_news_read)
         self.news_read_button.hide()
         content_layout.addWidget(self.news_read_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.break_panel = QWidget()
+        break_layout = QVBoxLayout(self.break_panel)
+        break_layout.setContentsMargins(2, 2, 2, 2)
+        break_layout.setSpacing(8)
+        break_badge = QLabel("休息提醒")
+        break_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        break_badge.setFixedWidth(74)
+        break_badge.setStyleSheet(
+            "background:#fff0dc;color:#bd5b18;border:1px solid #efc28f;"
+            "border-radius:8px;padding:3px 7px;font-size:11px;font-weight:700;"
+        )
+        break_layout.addWidget(break_badge, 0, Qt.AlignmentFlag.AlignLeft)
+        break_title = QLabel("该休息一下啦")
+        break_title.setStyleSheet(
+            "color:#2c3532;font-size:18px;font-weight:700;"
+        )
+        break_layout.addWidget(break_title)
+        self.break_summary_label = QLabel()
+        self.break_summary_label.setWordWrap(True)
+        self.break_summary_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.break_summary_label.setStyleSheet(
+            "color:#68716e;font-size:12px;line-height:1.45;"
+        )
+        break_layout.addWidget(self.break_summary_label)
+        break_metrics = QHBoxLayout()
+        break_metrics.setContentsMargins(0, 2, 0, 2)
+        break_metrics.setSpacing(8)
+
+        def break_metric(caption: str, accent: str) -> QLabel:
+            frame = QFrame()
+            frame.setStyleSheet(
+                "QFrame{background:#f8f4ec;border:1px solid #e8dfd1;"
+                "border-radius:9px;}"
+            )
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(8, 7, 8, 7)
+            frame_layout.setSpacing(1)
+            value = QLabel("-")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setStyleSheet(
+                f"color:{accent};font-size:17px;font-weight:700;border:none;"
+                "background:transparent;"
+            )
+            label = QLabel(caption)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet(
+                "color:#7b827f;font-size:10px;border:none;background:transparent;"
+            )
+            frame_layout.addWidget(value)
+            frame_layout.addWidget(label)
+            break_metrics.addWidget(frame, 1)
+            return value
+
+        self.break_duration_value = break_metric("连续工作", "#c76520")
+        self.break_key_value = break_metric("键盘敲击 / 次", "#315f7c")
+        break_layout.addLayout(break_metrics)
+        self.break_ai_panel = QFrame()
+        self.break_ai_panel.setStyleSheet(
+            "QFrame{background:#f2f6f4;border:1px solid #d7e3de;"
+            "border-radius:9px;}"
+        )
+        break_ai_layout = QVBoxLayout(self.break_ai_panel)
+        break_ai_layout.setContentsMargins(10, 8, 10, 8)
+        break_ai_layout.setSpacing(3)
+        break_ai_title = QLabel("Bongo 的工作小结")
+        break_ai_title.setStyleSheet(
+            "color:#167a55;font-size:11px;font-weight:700;border:none;"
+            "background:transparent;"
+        )
+        self.break_ai_text = QLabel()
+        self.break_ai_text.setWordWrap(True)
+        self.break_ai_text.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.break_ai_text.setStyleSheet(
+            "color:#46504d;font-size:12px;border:none;background:transparent;"
+        )
+        break_ai_layout.addWidget(break_ai_title)
+        break_ai_layout.addWidget(self.break_ai_text)
+        break_layout.addWidget(self.break_ai_panel)
+        self.break_suggestion_label = QLabel()
+        self.break_suggestion_label.setWordWrap(True)
+        self.break_suggestion_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.break_suggestion_label.setStyleSheet(
+            "background:#fff3e4;color:#9b4d18;border:1px solid #f0d0aa;"
+            "border-radius:8px;padding:8px;font-size:12px;font-weight:600;"
+        )
+        break_layout.addWidget(self.break_suggestion_label)
+        self.break_panel.hide()
+        content_layout.addWidget(self.break_panel)
         self.statistics_panel = QWidget()
         statistics_layout = QVBoxLayout(self.statistics_panel)
         statistics_layout.setContentsMargins(0, 0, 0, 0)
@@ -862,6 +1009,22 @@ class PetWindow(QWidget):
         content_layout.addStretch(1)
         self.bubble_scroll.setWidget(bubble_content)
         bubble_layout.addWidget(self.bubble_scroll)
+        self.break_ack_button = QPushButton("我收到！")
+        self.break_ack_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.break_ack_button.setMinimumHeight(38)
+        self.break_ack_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.break_ack_button.setStyleSheet(
+            "QPushButton{background:#d8732a;color:white;border:none;border-radius:9px;"
+            "padding:8px 18px;text-align:center;font-size:13px;font-weight:700;}"
+            "QPushButton:hover{background:#bd5b18;}"
+            "QPushButton:pressed{background:#a94c12;}"
+        )
+        self.break_ack_button.clicked.connect(self._acknowledge_break_reminder)
+        self.break_ack_button.hide()
+        bubble_layout.addWidget(self.break_ack_button)
         self.bubble.hide()
         self.question_timer = QTimer(self)
         self.question_timer.setSingleShot(True)
@@ -899,6 +1062,7 @@ class PetWindow(QWidget):
         self.signals.context_requested.connect(self._show_context_menu_at_native)
         self.signals.global_click.connect(self._handle_native_global_click)
         self.monitor = GlobalInputMonitor(self.signals, activity_callback)
+        self._connect_application_screen_signals()
 
     def start_input_monitor(self) -> None:
         self.monitor.start()
@@ -1006,7 +1170,15 @@ class PetWindow(QWidget):
         _, bounds = self._canvas_screen_geometry()
         available_width = bounds.width() - 8 if bounds is not None else 414
         bubble_width = max(280, min(414, available_width))
-        bubble_height = self.bubble_scroll.height() + 33
+        footer_height = (
+            max(
+                self.break_ack_button.minimumHeight(),
+                self.break_ack_button.sizeHint().height(),
+            ) + 6
+            if not self.break_ack_button.isHidden()
+            else 0
+        )
+        bubble_height = self.bubble_scroll.height() + 33 + footer_height
         self.bubble.setFixedSize(bubble_width, bubble_height)
         self._position_left_overlay(
             self.bubble,
@@ -1099,6 +1271,8 @@ class PetWindow(QWidget):
                 self._global_drag_offset = QPoint()
                 if self.pet_settings.keep_in_screen:
                     self.keep_inside_screen()
+                else:
+                    self._remember_current_screen_placement()
                 self.position_changed.emit(self.x(), self.y())
             return
         if self.action_bubble.isVisible():
@@ -1192,14 +1366,104 @@ class PetWindow(QWidget):
         if hasattr(self, "action_bubble") and self.action_bubble.isVisible():
             self._position_action_bubble()
 
+    def show_on_active_screen(self) -> None:
+        self.ensure_on_active_screen(preserve_relative=True)
+        self.show()
+        self.ensure_on_active_screen(preserve_relative=True)
+        self.raise_()
+        QTimer.singleShot(0, self._finish_show_on_active_screen)
+
+    def _finish_show_on_active_screen(self) -> None:
+        self.ensure_on_active_screen(preserve_relative=True)
+        self.raise_()
+
     def keep_inside_screen(self) -> None:
-        screen = self.screen()
-        if not screen:
+        self.ensure_on_active_screen(
+            preserve_relative=False,
+            prefer_previous_screen=False,
+        )
+
+    def ensure_on_active_screen(
+        self,
+        *,
+        preserve_relative: bool = True,
+        prefer_previous_screen: bool = True,
+    ) -> bool:
+        screens = list(QGuiApplication.screens())
+        if not screens:
+            return False
+
+        frame = self.frameGeometry()
+        target_screen = None
+        if prefer_previous_screen and self._placement_screen in screens:
+            target_screen = self._placement_screen
+        elif prefer_previous_screen and self._connected_screen in screens:
+            target_screen = self._connected_screen
+        if target_screen not in screens:
+            target_screen = QGuiApplication.screenAt(frame.center())
+        if target_screen not in screens:
+            intersections = []
+            for screen in screens:
+                intersection = frame.intersected(screen.availableGeometry())
+                intersections.append(
+                    (max(0, intersection.width()) * max(0, intersection.height()), screen)
+                )
+            intersection_area, intersecting_screen = max(
+                intersections,
+                key=lambda item: item[0],
+            )
+            target_screen = intersecting_screen if intersection_area > 0 else None
+        if target_screen not in screens:
+            target_screen = QGuiApplication.primaryScreen() or screens[0]
+
+        target_bounds = QRect(target_screen.availableGeometry())
+        previous_bounds = (
+            self._pending_previous_screen_geometry
+            or self._last_screen_geometry
+        )
+        desired_position = self.pos()
+        if (
+            preserve_relative
+            and previous_bounds is not None
+            and previous_bounds != target_bounds
+        ):
+            desired_position = _map_position_between_screens(
+                desired_position,
+                previous_bounds,
+                target_bounds,
+                self.width(),
+                self.height(),
+            )
+        desired_position = _clamp_position_to_screen(
+            desired_position,
+            target_bounds,
+            self.width(),
+            self.height(),
+        )
+
+        moved = desired_position != self.pos()
+        if moved:
+            self.move(desired_position)
+        self._pending_previous_screen_geometry = None
+        self._last_screen_geometry = target_bounds
+        self._placement_screen = target_screen
+        self._bind_screen(target_screen)
+        if moved:
+            self.position_changed.emit(self.x(), self.y())
+        return moved
+
+    def _remember_current_screen_placement(self) -> None:
+        screens = list(QGuiApplication.screens())
+        if not screens:
             return
-        bounds = screen.availableGeometry()
-        x = min(max(self.x(), bounds.left()), max(bounds.left(), bounds.right() - self.width() + 1))
-        y = min(max(self.y(), bounds.top()), max(bounds.top(), bounds.bottom() - self.height() + 1))
-        self.move(x, y)
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen not in screens and self._connected_screen in screens:
+            screen = self._connected_screen
+        if screen not in screens:
+            screen = QGuiApplication.primaryScreen() or screens[0]
+        self._placement_screen = screen
+        self._last_screen_geometry = QRect(screen.availableGeometry())
+
 
     def _set_key(self, key: str, pressed: bool) -> None:
         if self.pet_settings.keyboard_enabled:
@@ -1276,6 +1540,8 @@ class PetWindow(QWidget):
         self._question_pending = True
         self.statistics_panel.hide()
         self.news_read_button.hide()
+        self.break_panel.hide()
+        self.break_ack_button.hide()
         self.question_label.unsetCursor()
         self.question_label.show()
         self.bubble_scroll.setFixedHeight(184)
@@ -1322,6 +1588,9 @@ class PetWindow(QWidget):
         )
         self.question_label.setText(message)
         self.statistics_panel.hide()
+        self.news_read_button.hide()
+        self.break_panel.hide()
+        self.break_ack_button.hide()
         self.question_label.unsetCursor()
         self.question_label.show()
         self.bubble_scroll.setFixedHeight(166)
@@ -1362,6 +1631,8 @@ class PetWindow(QWidget):
         self.statistics_application.setToolTip(display_application)
         self.statistics_panel.show()
         self.news_read_button.hide()
+        self.break_panel.hide()
+        self.break_ack_button.hide()
         self.question_label.unsetCursor()
         for button in self.option_buttons:
             button.hide()
@@ -1377,6 +1648,65 @@ class PetWindow(QWidget):
         self.bubble_scroll.sync_content_width()
         QTimer.singleShot(0, self.bubble_scroll.sync_content_width)
         self.message_timer.start(max(1, timeout_ms))
+
+    def show_break_reminder(
+        self,
+        duration_text: str,
+        key_count: int,
+        report: dict | None = None,
+        timeout_ms: int = 30_000,
+    ) -> None:
+        if self._question_pending:
+            self._expire_question()
+        self.question_timer.stop()
+        self.message_timer.stop()
+        self.current_question = None
+        self._current_news_id = None
+        self._feedback_pending = False
+        self._message_pending = True
+        self._explanation_question = None
+        self.question_label.hide()
+        self.news_read_button.hide()
+        self.statistics_panel.hide()
+        for button in self.option_buttons:
+            button.hide()
+        self.feedback_label.clear()
+        self.work_session_badge.hide()
+
+        self.break_duration_value.setText(str(duration_text))
+        self.break_key_value.setText(f"{int(key_count):,}")
+        if report:
+            self.break_summary_label.setText(str(report.get("summary") or ""))
+            self.break_ai_text.setText(str(report.get("activity") or ""))
+            self.break_suggestion_label.setText(
+                str(report.get("suggestion") or "站起来活动几分钟，让眼睛和手腕休息一下。")
+            )
+            self.break_ai_panel.show()
+        else:
+            self.break_summary_label.setText(
+                "你已经保持了较长时间的连续工作，给身体留一点切换节奏的时间吧。"
+            )
+            self.break_ai_text.clear()
+            self.break_ai_panel.hide()
+            self.break_suggestion_label.setText(
+                "站起来走动几分钟，看看远处，也让眼睛和手腕休息一下。"
+            )
+        self.break_panel.show()
+        self.break_ack_button.show()
+        self.bubble_scroll.setFixedHeight(238)
+        self.bubble_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._sync_input_transparency()
+        self._show_primary_bubble()
+        self.bubble_scroll.verticalScrollBar().setValue(0)
+        self.bubble_scroll.sync_content_width()
+        QTimer.singleShot(0, self.bubble_scroll.sync_content_width)
+        self.message_timer.start(max(1, timeout_ms))
+
+    def _acknowledge_break_reminder(self) -> None:
+        self.message_timer.stop()
+        self._hide_message_bubble()
 
     def show_ai_news(self, item: dict, timeout_ms: int = 30_000) -> None:
         if not item:
@@ -1401,6 +1731,12 @@ class PetWindow(QWidget):
         self.bubble_scroll.setFixedHeight(184)
         self.bubble_scroll.sync_content_width()
         self._show_primary_bubble()
+        self._reset_news_scroll_position()
+        QTimer.singleShot(0, self._reset_news_scroll_position)
+
+    def _reset_news_scroll_position(self) -> None:
+        scroll_bar = self.bubble_scroll.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.minimum())
 
     def _request_news_detail(self) -> None:
         if self._current_news_id is not None:
@@ -1446,6 +1782,9 @@ class PetWindow(QWidget):
     def _hide_message_bubble(self) -> None:
         self._feedback_pending = False
         self._message_pending = False
+        self.news_read_button.hide()
+        self.break_panel.hide()
+        self.break_ack_button.hide()
         self.bubble.hide()
         self._sync_input_transparency()
         if self._last_pointer_position is not None:
@@ -1579,6 +1918,30 @@ class PetWindow(QWidget):
         if self._question_pending or self._feedback_pending or self._message_pending:
             QTimer.singleShot(0, self._show_primary_bubble)
 
+    def _connect_application_screen_signals(self) -> None:
+        if self._screen_topology_signals_connected:
+            return
+        application = QGuiApplication.instance()
+        if application is None:
+            return
+        application.screenAdded.connect(self._screen_added)
+        application.screenRemoved.connect(self._screen_removed)
+        application.primaryScreenChanged.connect(self._primary_screen_changed)
+        self._screen_topology_signals_connected = True
+
+    def _screen_added(self, _screen) -> None:
+        self._schedule_display_sync()
+
+    def _screen_removed(self, screen) -> None:
+        if screen is self._placement_screen and self._last_screen_geometry is not None:
+            self._pending_previous_screen_geometry = QRect(
+                self._last_screen_geometry
+            )
+        self._schedule_display_sync()
+
+    def _primary_screen_changed(self, _screen) -> None:
+        self._schedule_display_sync()
+
     def _bind_screen(self, screen) -> None:
         if screen is self._connected_screen:
             return
@@ -1597,6 +1960,10 @@ class PetWindow(QWidget):
         self._connected_screen = screen
         if screen is None:
             return
+        if self._placement_screen is None:
+            self._placement_screen = screen
+        if self._last_screen_geometry is None:
+            self._last_screen_geometry = QRect(screen.availableGeometry())
         for signal_name in (
             "logicalDotsPerInchChanged",
             "physicalDotsPerInchChanged",
@@ -1610,6 +1977,13 @@ class PetWindow(QWidget):
         self._schedule_display_sync()
 
     def _screen_metrics_changed(self, *_args) -> None:
+        if (
+            self._pending_previous_screen_geometry is None
+            and self._last_screen_geometry is not None
+        ):
+            self._pending_previous_screen_geometry = QRect(
+                self._last_screen_geometry
+            )
         self._schedule_display_sync()
 
     def _schedule_display_sync(self) -> None:
@@ -1623,8 +1997,7 @@ class PetWindow(QWidget):
 
     def _sync_after_screen_change(self) -> None:
         self._sync_canvas_display()
-        if self.pet_settings.keep_in_screen:
-            self.keep_inside_screen()
+        self.ensure_on_active_screen(preserve_relative=True)
         if hasattr(self, "work_session_badge"):
             self._position_work_session_badge()
         if hasattr(self, "bubble") and self.bubble.isVisible():
@@ -1690,6 +2063,8 @@ class PetWindow(QWidget):
         self._drag_offset = QPoint()
         if self.pet_settings.keep_in_screen:
             self.keep_inside_screen()
+        else:
+            self._remember_current_screen_placement()
         self.position_changed.emit(self.x(), self.y())
         if was_dragging:
             event.accept()

@@ -1,0 +1,28 @@
+{
+  "run_id": "run_20260603-100000-error_",
+  "task_id": "20260603-100000-error_",
+  "user_request": "读取文件 src/missing_0.py",
+  "status": "running",
+  "current_action": "executing",
+  "tool_steps": 10,
+  "attempts": 10,
+  "last_tool": "read_file",
+  "tools_called": [
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file",
+    "read_file"
+  ],
+  "stop_reason": "",
+  "final_answer": "",
+  "checkpoint_snapshot": {},
+  "interrupted_at_step": 10,
+  "last_tool_result": "",
+  "checkpoint_created_at": ""
+}

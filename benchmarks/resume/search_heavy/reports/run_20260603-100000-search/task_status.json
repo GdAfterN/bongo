@@ -1,0 +1,28 @@
+{
+  "run_id": "run_20260603-100000-search",
+  "task_id": "20260603-100000-search",
+  "user_request": "搜索项目中所有使用了 `import` 的地方",
+  "status": "running",
+  "current_action": "executing",
+  "tool_steps": 10,
+  "attempts": 10,
+  "last_tool": "search",
+  "tools_called": [
+    "search",
+    "search",
+    "search",
+    "search",
+    "search",
+    "search",
+    "search",
+    "search",
+    "search",
+    "search"
+  ],
+  "stop_reason": "",
+  "final_answer": "",
+  "checkpoint_snapshot": {},
+  "interrupted_at_step": 10,
+  "last_tool_result": "",
+  "checkpoint_created_at": ""
+}
